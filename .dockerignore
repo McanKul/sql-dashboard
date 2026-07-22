@@ -1,0 +1,9 @@
+.git
+.env
+node_modules
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+backups
+runtime/collector/sources/*.pgpass
+*.pass

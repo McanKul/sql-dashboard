@@ -1,0 +1,16 @@
+.env
+.DS_Store
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+*.py[cod]
+*.log
+backups/*.dump
+backups/*.sql
+runtime/collector/sources/*
+!runtime/collector/sources/.gitkeep
+*.pass
+*.pgpass
