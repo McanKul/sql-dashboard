@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import {
   Activity,
   AlertCircle,
@@ -32,20 +32,31 @@ import {
 import { advisorApi, ApiClientError, demoModeEnabled } from './api'
 import type {
   ApiList,
+  DatabaseOption,
+  OperationsData,
   OverviewStats,
   PageId,
   QueryDetail,
+  QueryListParams,
   QuerySummary,
+  ServerOption,
   Severity,
   SystemHealth,
+  TimeWindow,
   TrendPoint,
 } from './types'
 import {
   chartPoints,
+  formatBytes,
+  formatCacheHit,
   formatDateTime,
   formatDuration,
+  formatLargeNumber,
   formatNumber,
+  formatScoreContribution,
+  formatVolumeFactor,
   severityLabels,
+  windowLabels,
 } from './utils'
 import './styles.css'
 
@@ -60,12 +71,14 @@ const navItems: Array<{ id: PageId; label: string; description: string; icon: ty
   { id: 'overview', label: 'Genel Bakış', description: 'Performans özeti', icon: LayoutDashboard },
   { id: 'queries', label: 'Sorgular', description: 'Analiz ve bulgular', icon: Code2 },
   { id: 'health', label: 'Sistem Sağlığı', description: 'PostgreSQL metrikleri', icon: HeartPulse },
+  { id: 'operations', label: 'Operasyonlar', description: 'Repository ve telemetri', icon: Network },
 ]
 
 const pageTitles: Record<PageId, string> = {
   overview: 'Genel Bakış',
   queries: 'Sorgu Analizi',
   health: 'Sistem Sağlığı',
+  operations: 'Operasyonlar',
 }
 
 const getInitialPage = (): PageId => {
@@ -101,6 +114,19 @@ function PageHeading({ eyebrow, title, description, children }: {
         <p>{description}</p>
       </div>
       {children && <div className="heading-actions">{children}</div>}
+    </div>
+  )
+}
+
+const timeWindows: TimeWindow[] = ['1h', '24h', '7d', '30d']
+
+function WindowPicker({ value, onChange }: { value: TimeWindow; onChange: (window: TimeWindow) => void }) {
+  return (
+    <div className="window-picker" aria-label="Analiz zaman aralığı">
+      <span>Zaman aralığı</span>
+      <div>
+        {timeWindows.map((window) => <button type="button" key={window} className={value === window ? 'active' : ''} onClick={() => onChange(window)} aria-pressed={value === window}>{window}</button>)}
+      </div>
     </div>
   )
 }
@@ -202,9 +228,10 @@ function StatCard({ icon: Icon, label, value, unit, delta, tone, helper }: {
   )
 }
 
-function OverviewPage({ state, queries, onRetry, onOpenQuery, onNavigate }: {
+function OverviewPage({ state, queries, window, onRetry, onOpenQuery, onNavigate }: {
   state: Loadable<OverviewStats>
   queries?: ApiList<QuerySummary>
+  window: TimeWindow
   onRetry: () => void
   onOpenQuery: (id: string) => void
   onNavigate: (page: PageId) => void
@@ -216,7 +243,7 @@ function OverviewPage({ state, queries, onRetry, onOpenQuery, onNavigate }: {
 
   return (
     <section className="page-section" aria-labelledby="overview-title">
-      <PageHeading eyebrow={`${data.environment} · ${data.databaseName}`} title="Veritabanınız bugün nasıl?" description={`Son toplama ${formatDateTime(data.lastCollectedAt)} tarihinde tamamlandı.`}>
+      <PageHeading eyebrow={`${data.environment} · ${data.databaseName} · ${windowLabels[window]}`} title="Veritabanınız nasıl?" description={`Son toplama ${formatDateTime(data.lastCollectedAt)} tarihinde tamamlandı.`}>
         <button type="button" className="primary-button" onClick={() => onNavigate('queries')}><Sparkles size={16} /> Bulguları incele</button>
       </PageHeading>
 
@@ -291,72 +318,129 @@ function OverviewPage({ state, queries, onRetry, onOpenQuery, onNavigate }: {
   )
 }
 
-function QueriesPage({ state, onRetry, onOpenQuery }: {
+function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQuery }: {
   state: Loadable<ApiList<QuerySummary>>
+  params: QueryListParams
+  window: TimeWindow
+  onParamsChange: (params: QueryListParams) => void
   onRetry: () => void
   onOpenQuery: (id: string) => void
 }) {
-  const [search, setSearch] = useState('')
-  const [severity, setSeverity] = useState<'all' | Severity>('all')
-  const [sort, setSort] = useState<'impact' | 'regression' | 'latency'>('impact')
+  const [draft, setDraft] = useState<QueryListParams>(params)
+  const [servers, setServers] = useState<ServerOption[]>([])
+  const [databases, setDatabases] = useState<DatabaseOption[]>([])
 
-  const filtered = useMemo(() => {
-    const items = [...(state.data?.items ?? [])]
-    return items.filter((query) => {
-      const term = search.trim().toLocaleLowerCase('tr')
-      const matchesSearch = !term || `${query.title} ${query.sqlPreview} ${query.fingerprint} ${query.database}`.toLocaleLowerCase('tr').includes(term)
-      return matchesSearch && (severity === 'all' || query.severity === severity)
-    }).sort((a, b) => {
-      if (sort === 'regression') return b.changePercent - a.changePercent
-      if (sort === 'latency') return b.avgDurationMs - a.avgDurationMs
-      return b.impactScore - a.impactScore
-    })
-  }, [search, severity, sort, state.data])
+  useEffect(() => {
+    const controller = new AbortController()
+    Promise.all([advisorApi.getServers(controller.signal), advisorApi.getDatabases(undefined, controller.signal)])
+      .then(([serverResult, databaseResult]) => { setServers(serverResult.data); setDatabases(databaseResult.data) })
+      .catch(() => { /* Filtre meta verisi yoksa sorgu listesi kullanılmaya devam eder. */ })
+    return () => controller.abort()
+  }, [])
 
-  if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel label="Sorgular analiz ediliyor" />
-  if (state.status === 'error' || !state.data) return <ErrorPanel message={state.error ?? 'Sorgu listesi alınamadı.'} onRetry={onRetry} />
+  useEffect(() => setDraft(params), [params])
+
+  const filteredDatabases = draft.serverId === undefined ? databases : databases.filter((database) => database.serverId === draft.serverId)
+  const selectedDatabaseKey = draft.serverId !== undefined && draft.databaseId !== undefined ? `${draft.serverId}:${draft.databaseId}` : ''
+  const selectDatabase = (key: string) => {
+    if (!key) {
+      setDraft((value) => ({ ...value, databaseId: undefined }))
+      return
+    }
+    const [serverId, databaseId] = key.split(':').map(Number)
+    setDraft((value) => ({ ...value, serverId, databaseId }))
+  }
+  const hasFilters = Boolean(params.search || params.priority || params.serverId !== undefined || params.databaseId !== undefined || params.minCalls || params.minDurationMs)
+  const totalPages = Math.max(1, Math.ceil((state.data?.total || 0) / params.pageSize))
+  const applyFilters = () => onParamsChange({ ...draft, page: 1 })
+  const clearFilters = () => {
+    const cleared: QueryListParams = { page: 1, pageSize: params.pageSize, sort: 'impact' }
+    setDraft(cleared)
+    onParamsChange(cleared)
+  }
 
   return (
     <section className="page-section" aria-labelledby="queries-title">
-      <PageHeading eyebrow="Sorgu envanteri" title="Etkiyi bulun, nedeni anlayın" description={`${formatNumber(state.data.total)} benzersiz sorgu; toplam etkisine göre sıralanır.`} />
+      <PageHeading eyebrow={`Sorgu envanteri · ${windowLabels[window]}`} title="Etkiyi bulun, nedeni anlayın" description={`${formatNumber(state.data?.total || 0)} benzersiz sorgu; repository telemetrisiyle sunucu tarafında filtrelenir.`} />
 
-      <ReadingGuide>Etki puanı yükseldikçe sorgu daha önce incelenmelidir. Değişim değeri pozitifse sorgu önceki döneme göre yavaşlamış, negatifse hızlanmıştır.</ReadingGuide>
+      <ReadingGuide>Etki puanı seçili penceredeki diğer sorgulara göre inceleme önceliğini gösterir. Ham DB yükü, süre, blok, temp ve WAL değerlerini birlikte okuyun; göreli puan tek başına mutlak bir sorun kanıtı değildir.</ReadingGuide>
 
-      <div className="query-toolbar" role="search">
-        <label className="search-field"><Search size={18} aria-hidden="true" /><span className="sr-only">Sorgularda ara</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="SQL, sorgu kimliği veya veritabanı ara…" /></label>
-        <label className="select-field"><span className="sr-only">Etki düzeyi</span><CircleDot size={15} /><select value={severity} onChange={(event) => setSeverity(event.target.value as typeof severity)}><option value="all">Tüm etki düzeyleri</option><option value="critical">Kritik etki</option><option value="warning">Orta-yüksek etki</option><option value="healthy">Düşük etki</option></select><ChevronDown size={14} /></label>
-        <label className="select-field sort-field"><span>Sırala:</span><select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="impact">En yüksek etki</option><option value="regression">En çok yavaşlayan</option><option value="latency">En yüksek gecikme</option></select><ChevronDown size={14} /></label>
+      <div className="query-toolbar query-toolbar-expanded" role="search" onKeyDown={(event) => { if (event.key === 'Enter' && (event.target as HTMLElement).tagName === 'INPUT') applyFilters() }}>
+        <label className="search-field"><Search size={18} aria-hidden="true" /><span className="sr-only">Sorgularda ara</span><input value={draft.search || ''} onChange={(event) => setDraft((value) => ({ ...value, search: event.target.value || undefined }))} placeholder="SQL veya sorgu kimliği ara…" /></label>
+        <label className="select-field"><Network size={15} /><span className="sr-only">Sunucu</span><select value={draft.serverId ?? ''} onChange={(event) => setDraft((value) => ({ ...value, serverId: event.target.value ? Number(event.target.value) : undefined, databaseId: undefined }))}><option value="">Tüm sunucular</option>{servers.map((server) => <option key={server.id} value={server.id}>{server.alias || server.hostname || `server-${server.id}`}</option>)}</select><ChevronDown size={14} /></label>
+        <label className="select-field"><Database size={15} /><span className="sr-only">Veritabanı</span><select value={selectedDatabaseKey} onChange={(event) => selectDatabase(event.target.value)}><option value="">Tüm veritabanları</option>{filteredDatabases.map((database) => <option key={`${database.serverId}:${database.databaseId}`} value={`${database.serverId}:${database.databaseId}`}>{database.name}{draft.serverId === undefined ? ` · ${servers.find((server) => server.id === database.serverId)?.alias || `server-${database.serverId}`}` : ''}</option>)}</select><ChevronDown size={14} /></label>
+        <label className="select-field"><CircleDot size={15} /><span className="sr-only">Öncelik</span><select value={draft.priority || ''} onChange={(event) => setDraft((value) => ({ ...value, priority: event.target.value || undefined }))}><option value="">Tüm öncelikler</option><option value="CRITICAL">Kritik</option><option value="HIGH">Yüksek</option><option value="MEDIUM">Orta</option><option value="LOW">Düşük</option></select><ChevronDown size={14} /></label>
+        <label className="number-field"><span>Min. çağrı</span><input type="number" min="0" value={draft.minCalls ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minCalls: event.target.value ? Number(event.target.value) : undefined }))} /></label>
+        <label className="number-field"><span>Min. toplam süre</span><input type="number" min="0" step="10" value={draft.minDurationMs ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minDurationMs: event.target.value ? Number(event.target.value) : undefined }))} /><small>ms</small></label>
+        <label className="select-field sort-field"><span>Sırala:</span><select value={draft.sort || 'impact'} onChange={(event) => setDraft((value) => ({ ...value, sort: event.target.value as QueryListParams['sort'] }))}><option value="impact">Etki</option><option value="totalTime">Toplam süre</option><option value="meanTime">Ortalama süre</option><option value="calls">Çağrı</option><option value="reads">Fiziksel okuma</option><option value="regression">Regresyon</option></select><ChevronDown size={14} /></label>
+        <button type="button" className="primary-button filter-button" onClick={applyFilters}>Uygula</button>
       </div>
 
-      <div className="query-results-summary"><span><b>{filtered.length}</b> sonuç gösteriliyor</span>{(search || severity !== 'all') && <button type="button" onClick={() => { setSearch(''); setSeverity('all') }}>Filtreleri temizle <X size={13} /></button>}</div>
+      <div className="query-results-summary"><span><b>{state.data?.items.length || 0}</b> satır · toplam <b>{formatNumber(state.data?.total || 0)}</b> sonuç · sayfa {params.page}/{totalPages}</span>{hasFilters && <button type="button" onClick={clearFilters}>Filtreleri temizle <X size={13} /></button>}</div>
 
-      <div className="query-table-card">
-        <table className="query-table">
-          <caption className="sr-only">Analiz edilen PostgreSQL sorguları</caption>
-          <thead><tr><th scope="col">Sorgu</th><th scope="col">Etki</th><th scope="col">Ort. süre</th><th scope="col">Çağrı</th><th scope="col">Değişim</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
-          <tbody>
-            {filtered.map((query) => (
-              <tr key={query.id} onClick={() => onOpenQuery(query.id)}>
-                <td><button type="button" className="query-name-button" onClick={() => onOpenQuery(query.id)}><span><strong>{query.title}</strong><code>{query.sqlPreview}</code></span><small>{query.database} · {query.fingerprint}</small></button></td>
-                <td><div className="table-score"><ImpactRing impact={query.impactScore} severity={query.severity} size="small" /><QueryImpactBadge severity={query.severity} /></div></td>
-                <td><strong className="tabular">{formatDuration(query.avgDurationMs)}</strong><small>p/ çağrı</small></td>
-                <td><strong className="tabular">{formatNumber(query.calls, true)}</strong><small>son 24 saat</small></td>
-                <td>{query.hasComparison
-                  ? <span className={`change ${query.changePercent > 0 ? 'negative' : 'positive'}`}>{query.changePercent > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}%{formatNumber(Math.abs(query.changePercent))}</span>
-                  : <span className="change unavailable">Yeterli geçmiş yok</span>}
-                </td>
-                <td><button type="button" className="icon-button row-open" onClick={() => onOpenQuery(query.id)} aria-label={`${query.title} detayını aç`}><ChevronRight size={17} /></button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {!filtered.length && <div className="empty-state"><Search size={28} /><strong>Eşleşen sorgu yok</strong><p>Arama ifadesini veya filtreleri değiştirin.</p></div>}
-      </div>
+      {state.status === 'loading' || state.status === 'idle' ? <LoadingPanel label="Sorgular analiz ediliyor" /> : state.status === 'error' || !state.data ? <ErrorPanel message={state.error ?? 'Sorgu listesi alınamadı.'} onRetry={onRetry} /> : <>
+        <div className="query-table-card">
+          <table className="query-table query-metrics-table">
+            <caption className="sr-only">Analiz edilen PostgreSQL sorguları ve ham performans metrikleri</caption>
+            <thead><tr><th scope="col">Sorgu</th><th scope="col">Göreli etki</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
+            <tbody>
+              {state.data.items.map((query) => (
+                <tr key={query.id} onClick={() => onOpenQuery(query.id)}>
+                  <td><button type="button" className="query-name-button" onClick={() => onOpenQuery(query.id)}><span><strong>{query.title}</strong><code>{query.sqlPreview}</code></span><small>{query.database} · {query.fingerprint}</small></button></td>
+                  <td><div className="table-score"><ImpactRing impact={query.impactScore} severity={query.severity} size="small" /><QueryImpactBadge severity={query.severity} /></div></td>
+                  <td><strong className="tabular">%{formatNumber(query.dbLoadPercent)}</strong><small>ölçülen DB zamanı</small></td>
+                  <td><strong className="tabular">{formatDuration(query.totalTimeMs)}</strong><small>{formatDuration(query.avgDurationMs)} ortalama</small></td>
+                  <td><strong className="tabular">{formatLargeNumber(query.sharedBlocksRead)} okuma</strong><small>{formatLargeNumber(query.sharedBlocksHit)} cache hit</small></td>
+                  <td><strong className="tabular">{formatLargeNumber(query.tempBlocksWritten)} temp blok</strong><small>{formatBytes(query.walBytes)} WAL</small></td>
+                  <td><strong className="tabular">{formatLargeNumber(query.calls)} çağrı</strong>{query.hasComparison
+                    ? <span className={`change ${query.changePercent > 0 ? 'negative' : 'positive'}`}>{query.changePercent > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}%{formatNumber(Math.abs(query.changePercent))}</span>
+                    : <small>Karşılaştırma yok</small>}
+                  </td>
+                  <td><button type="button" className="icon-button row-open" onClick={() => onOpenQuery(query.id)} aria-label={`${query.title} detayını aç`}><ChevronRight size={17} /></button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!state.data.items.length && <div className="empty-state"><Search size={28} /><strong>Eşleşen sorgu yok</strong><p>Arama ifadesini veya filtreleri değiştirin.</p></div>}
+        </div>
+        {state.data.total > params.pageSize && <div className="pagination"><button type="button" className="secondary-button" disabled={params.page <= 1} onClick={() => onParamsChange({ ...params, page: params.page - 1 })}><ArrowLeft size={15} /> Önceki</button><span>{params.page}. sayfa · {totalPages} sayfa</span><button type="button" className="secondary-button" disabled={params.page >= totalPages} onClick={() => onParamsChange({ ...params, page: params.page + 1 })}>Sonraki <ArrowRight size={15} /></button></div>}
+      </>}
     </section>
   )
 }
 
-function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () => void }) {
+function scoreMetricValue(item: QueryDetail['scoreBreakdown'][number], query: QueryDetail): string {
+  if (item.key === 'regression' && !query.hasComparison) return 'Karşılaştırma yok'
+  let value = item.absoluteValue
+  let unit = item.unit || ''
+  if (value === undefined) {
+    const fallback: Record<string, [number, string]> = {
+      totalTime: [query.totalTimeMs, 'ms'], physicalRead: [query.sharedBlocksRead, 'blocks'],
+      callFrequency: [query.calls, 'calls'], tempWrite: [query.tempBlocksWritten, 'blocks'],
+      regression: [query.changePercent, 'percent'], wal: [query.walBytes, 'bytes'],
+    }
+    ;[value, unit] = fallback[item.key] || [0, '']
+  }
+  if (unit.toLowerCase().includes('byte')) return formatBytes(value)
+  if (unit.toLowerCase().includes('ms')) return formatDuration(value)
+  if (unit.toLowerCase().includes('percent') || unit === '%') return `%${formatNumber(value)}`
+  if (unit.toLowerCase().includes('block')) return `${formatLargeNumber(value)} blok`
+  if (unit.toLowerCase().includes('call')) return `${formatLargeNumber(value)} çağrı`
+  return `${formatLargeNumber(value)}${unit ? ` ${unit}` : ''}`
+}
+
+function scoreThresholdValue(item: QueryDetail['scoreBreakdown'][number]): string | null {
+  if (item.fullScoreAt === undefined) return null
+  const unit = item.unit || ''
+  if (unit.toLowerCase().includes('byte')) return formatBytes(item.fullScoreAt)
+  if (unit.toLowerCase().includes('ms')) return formatDuration(item.fullScoreAt)
+  if (unit.toLowerCase().includes('percent') || unit === '%') return `%${formatNumber(item.fullScoreAt)}`
+  if (unit.toLowerCase().includes('block')) return `${formatLargeNumber(item.fullScoreAt)} blok`
+  if (unit.toLowerCase().includes('call')) return `${formatLargeNumber(item.fullScoreAt)} çağrı`
+  return `${formatLargeNumber(item.fullScoreAt)}${unit ? ` ${unit}` : ''}`
+}
+
+function QueryDetailModal({ queryId, window, onClose }: { queryId: string; window: TimeWindow; onClose: () => void }) {
   const [state, setState] = useState<Loadable<QueryDetail>>({ status: 'loading' })
   const [copied, setCopied] = useState(false)
   const closeRef = useRef<HTMLButtonElement>(null)
@@ -364,10 +448,10 @@ function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () =
   const load = () => {
     const controller = new AbortController()
     setState({ status: 'loading' })
-    advisorApi.getQuery(queryId, controller.signal).then(({ data }) => {
+    advisorApi.getQuery(queryId, window, controller.signal).then(({ data }) => {
       setState({ status: 'success', data })
     }).catch((error: unknown) => {
-      if (error instanceof DOMException && error.name === 'AbortError') return
+      if (controller.signal.aborted) return
       setState({ status: 'error', error: error instanceof Error ? error.message : 'Sorgu detayı alınamadı.' })
     })
     return controller
@@ -386,17 +470,18 @@ function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () =
     }
     // queryId değiştiğinde yeni detay yüklenir; onClose kimliği modal ömründe sabittir.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryId])
+  }, [queryId, window])
 
   const copySql = async () => {
     if (!state.data) return
     await navigator.clipboard.writeText(state.data.fullSql)
     setCopied(true)
-    window.setTimeout(() => setCopied(false), 1800)
+    globalThis.setTimeout(() => setCopied(false), 1800)
   }
 
   const totalSharedBlocks = (state.data?.sharedBlocksHit ?? 0) + (state.data?.sharedBlocksRead ?? 0)
   const cacheHitPercent = totalSharedBlocks > 0 ? ((state.data?.sharedBlocksHit ?? 0) / totalSharedBlocks) * 100 : null
+  const cacheHitLabel = state.data ? formatCacheHit(state.data.sharedBlocksHit, state.data.sharedBlocksRead) : '—'
 
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
@@ -414,7 +499,7 @@ function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () =
               <div className="query-detail-title">
                 <div className="query-title-meta"><QueryImpactBadge severity={state.data.severity} /><code>{state.data.fingerprint}</code><span>{state.data.database}</span></div>
                 <h1 id="query-modal-title">{state.data.title}</h1>
-                <p>Pencerenin ilk örneği {formatDateTime(state.data.firstSeenAt)} · Son örnek {formatDateTime(state.data.lastSeenAt)}</p>
+                <p>{windowLabels[window]} · İlk örnek {formatDateTime(state.data.firstSeenAt)} · Son örnek {formatDateTime(state.data.lastSeenAt)}</p>
               </div>
               <div className="hero-score"><ImpactRing impact={state.data.impactScore} severity={state.data.severity} /><div><strong>Etki puanı</strong><span>Yükseldikçe inceleme önceliği artar</span></div></div>
             </div>
@@ -431,12 +516,13 @@ function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () =
                 </article>
 
                 <article className="detail-card">
-                  <div className="detail-card-heading"><div><span className="panel-kicker">Son 24 saat</span><h2>Çalışma süresi eğilimi</h2></div>{state.data.hasComparison
+                  <div className="detail-card-heading"><div><span className="panel-kicker">{windowLabels[window]}</span><h2>Çalışma süresi eğilimi</h2></div>{state.data.hasComparison
                     ? <span className={`change ${state.data.changePercent > 0 ? 'negative' : 'positive'}`}>{state.data.changePercent > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />} %{formatNumber(Math.abs(state.data.changePercent))}</span>
                     : <span className="change unavailable">Yeterli geçmiş yok</span>}
                   </div>
-                  <MiniTrend points={state.data.trend.map((point) => ({ label: point.label.replace(' Tem', ''), value: point.durationMs }))} tone={!state.data.hasComparison ? 'blue' : state.data.changePercent > 0 ? 'red' : 'green'} height={142} label="Sorgunun son 24 saatteki çalışma süresi" />
-                  <div className="trend-metrics"><div><span>Ortalama</span><strong>{formatDuration(state.data.avgDurationMs)}</strong></div><div><span>Çağrı</span><strong>{formatNumber(state.data.calls, true)}</strong></div><div><span>Okunan shared blok</span><strong>{formatNumber(state.data.sharedBlocksRead, true)}</strong></div><div><span>Toplam süre</span><strong>{formatDuration(state.data.totalTimeMs)}</strong></div></div>
+                  <MiniTrend points={state.data.trend.map((point) => ({ label: point.label.replace(' Tem', ''), value: point.durationMs }))} tone={!state.data.hasComparison ? 'blue' : state.data.changePercent > 0 ? 'red' : 'green'} height={142} label={`Sorgunun ${windowLabels[window].toLocaleLowerCase('tr')} çalışma süresi`} />
+                  <div className="trend-metrics"><div><span>Ortalama</span><strong>{formatDuration(state.data.avgDurationMs)}</strong></div><div><span>Çağrı</span><strong>{formatLargeNumber(state.data.calls)}</strong></div><div><span>Okunan shared blok</span><strong>{formatLargeNumber(state.data.sharedBlocksRead)}</strong></div><div><span>Toplam süre</span><strong>{formatDuration(state.data.totalTimeMs)}</strong></div>{state.data.rowsPerCall !== undefined && <div><span>Satır / çağrı</span><strong>{formatNumber(state.data.rowsPerCall)}</strong></div>}{state.data.p95DurationMs !== undefined && <div><span>Gerçek p95</span><strong>{formatDuration(state.data.p95DurationMs)}</strong></div>}</div>
+                  {state.data.p95DurationMs === undefined && state.data.durationDistribution?.available === false && <div className="metric-unavailable"><Info size={15} /><span><strong>p95 gösterilemiyor.</strong> {state.data.durationDistribution.reason || 'PoWA yürütme süresi dağılımını saklamıyor.'}</span></div>}
                 </article>
 
                 <article className="detail-card">
@@ -468,13 +554,15 @@ function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () =
 
               <aside className="query-detail-aside">
                 <article className="detail-card score-breakdown-card">
-                  <div className="detail-card-heading"><div><span className="panel-kicker">Puanlama modeli</span><h2>Etki kırılımı</h2></div></div>
+                  <div className="detail-card-heading"><div><span className="panel-kicker">Göreli puanlama modeli</span><h2>Etki kırılımı</h2></div></div>
+                  <p className="score-model-note"><Info size={14} /> Katkılar seçili penceredeki sorgulara göre öncelik sırasını gösterir; ham yük değerleri aşağıda ayrıca verilir.</p>
                   <div className="score-breakdown-list">
                     {state.data.scoreBreakdown.map((item) => (
                       <div key={item.key} className="breakdown-item">
-                        <div><strong>{item.label}</strong><span>{formatNumber(item.contribution)}/{item.maxContribution}</span></div>
+                        <div><strong>{item.label}</strong><span>{formatScoreContribution(item.contribution)}/{item.maxContribution} puan</span></div>
                         <div className="breakdown-bar"><i style={{ width: `${item.maxContribution ? Math.min(100, (item.contribution / item.maxContribution) * 100) : 0}%` }} /></div>
-                        <small>{item.hint}</small>
+                        <small>{item.hint}</small><div className="breakdown-raw"><b>Ham değer</b><span>{scoreMetricValue(item, state.data!)}</span></div>
+                        {(item.percentileScore !== undefined || item.volumeFactor !== undefined || item.fullScoreAt !== undefined) && <div className="score-factors">{item.percentileScore !== undefined && <span>Göreli sıra %{formatNumber(item.percentileScore)}</span>}{item.volumeFactor !== undefined && <span>Hacim katsayısı {formatVolumeFactor(item.volumeFactor)}</span>}{scoreThresholdValue(item) && <span>Tam hacim eşiği {scoreThresholdValue(item)}</span>}</div>}
                       </div>
                     ))}
                   </div>
@@ -482,8 +570,8 @@ function QueryDetailModal({ queryId, onClose }: { queryId: string; onClose: () =
 
                 <article className="detail-card io-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">Buffer kullanımı</span><h2>I/O özeti</h2></div></div>
-                  <div className="io-visual"><div style={{ '--hit-ratio': `${cacheHitPercent ?? 0}%` } as React.CSSProperties}><span /></div><strong>{cacheHitPercent === null ? '—' : `%${formatNumber(cacheHitPercent)}`}</strong><small>{cacheHitPercent === null ? 'ölçüm yok' : 'cache hit'}</small></div>
-                  <div className="io-stats"><span><i className="hit" />Cache hit <b>{formatNumber(state.data.sharedBlocksHit, true)}</b></span><span><i className="read" />Okunan shared blok <b>{formatNumber(state.data.sharedBlocksRead, true)}</b></span></div>
+                  <div className="io-visual"><div style={{ '--hit-ratio': `${cacheHitPercent ?? 0}%` } as React.CSSProperties}><span /></div><strong>{cacheHitLabel}</strong><small>{cacheHitPercent === null ? 'ölçüm yok' : 'cache hit'}</small></div>
+                  <div className="io-stats"><span><i className="hit" />Cache hit <b>{formatLargeNumber(state.data.sharedBlocksHit)} blok</b></span><span><i className="read" />Okunan shared blok <b>{formatLargeNumber(state.data.sharedBlocksRead)} blok</b></span></div>
                 </article>
               </aside>
             </div>
@@ -543,6 +631,103 @@ function SystemHealthPage({ state, onRetry }: { state: Loadable<SystemHealth>; o
   )
 }
 
+function statusSeverity(status?: string): Severity {
+  const value = (status || '').toUpperCase()
+  if (['HEALTHY', 'RUNNING', 'UP', 'OK'].includes(value)) return 'healthy'
+  if (['FAILED', 'ERROR', 'DOWN', 'CRITICAL'].includes(value)) return 'critical'
+  return 'warning'
+}
+
+function indexSignalLabel(signal?: string): string {
+  const labels: Record<string, string> = {
+    INSUFFICIENT_DATA: 'Yetersiz gözlem',
+    NO_SCANS_OBSERVED: 'Tarama gözlenmedi',
+    LOW_USAGE_OBSERVED: 'Düşük kullanım gözlendi',
+    HEALTHY: 'Belirgin sinyal yok',
+  }
+  return labels[(signal || '').toUpperCase()] || signal || 'Bilgi'
+}
+
+function OperationsPage({ state, window, onRetry }: { state: Loadable<OperationsData>; window: TimeWindow; onRetry: () => void }) {
+  if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel label="Operasyon telemetrisi yükleniyor" />
+  if (state.status === 'error' || !state.data) return <ErrorPanel message={state.error ?? 'Operasyon telemetrisi alınamadı.'} onRetry={onRetry} />
+  const data = state.data
+  const io = data.io.summary
+  const indexSummary = data.indexes.summary
+  const databaseBlocksRead = data.io.items.reduce((total, item) => total + item.sharedBlocksRead, 0)
+  const databaseBlocksHit = data.io.items.reduce((total, item) => total + item.sharedBlocksHit, 0)
+  const operationsCacheHitLabel = formatCacheHit(databaseBlocksHit, databaseBlocksRead)
+
+  return (
+    <section className="page-section operations-page" aria-labelledby="operations-title">
+      <PageHeading eyebrow={`Repository görünürlüğü · ${windowLabels[window]}`} title="Operasyonlar ve telemetri" description="Collector, saklama kapasitesi, index kullanımı ve veritabanı I/O akışını tek yerde izleyin.">
+        <button type="button" className="secondary-button" onClick={onRetry}><RefreshCw size={15} /> Yenile</button>
+      </PageHeading>
+
+      <ReadingGuide>Bu ekran repository’ye zaten kaydedilen sunucu düzeyi verileri görünür kılar. Index gözlemleri otomatik silme önerisi değildir; tablo yazma yükü ve sorgu planlarıyla doğrulanmalıdır.</ReadingGuide>
+
+      <div className="stats-grid operations-stats">
+        <StatCard icon={Database} label="Repository boyutu" value={formatBytes(data.repository.sizeBytes)} tone="blue" helper={`PostgreSQL ${data.repository.postgresVersion || '—'} · PoWA ${data.repository.powaVersion || '—'}`} />
+        <StatCard icon={Clock3} label="Saklama hedefi" value={formatNumber(data.repository.retentionDays)} unit="gün" tone="green" helper={`Collector kaydı: ${data.collector.retention || 'henüz yok'}`} />
+        <StatCard icon={Activity} label="Collector gecikmesi" value={data.collector.lagSeconds == null ? '—' : formatDuration(data.collector.lagSeconds * 1000)} tone={statusSeverity(data.collector.status) === 'healthy' ? 'green' : 'orange'} helper={`Durum: ${data.collector.status || 'bilinmiyor'} · sıklık ${data.collector.frequencySeconds ?? '—'} sn`} />
+        <StatCard icon={Network} label="İzlenen kaynak" value={formatNumber(data.architecture.sourceCount)} tone="blue" helper={`${data.collectors.length} collector kaydı repository'de görünür`} />
+      </div>
+
+      <div className="operations-top-grid">
+        <article className="panel architecture-panel">
+          <div className="panel-heading"><div><span className="panel-kicker">Veri yolu</span><h2>Repository-only mimari</h2></div><Network size={20} className="panel-accent-icon" /></div>
+          <div className="operations-flow">{data.architecture.dataFlow.map((step, index) => <div key={`${step}-${index}`}><span>{index + 1}</span><strong>{step}</strong>{index < data.architecture.dataFlow.length - 1 && <ArrowRight size={17} />}</div>)}</div>
+          <p className="architecture-note"><ShieldAlert size={15} /> API’nin kaynak PostgreSQL’e doğrudan bağlantısı {data.architecture.apiSourceConnection ? 'açık' : 'kapalı'}; analiz repository üzerinden yapılır.</p>
+        </article>
+        <article className="panel service-panel">
+          <div className="panel-heading"><div><span className="panel-kicker">Çalışma durumu</span><h2>Servisler</h2></div><Activity size={19} className="panel-accent-icon" /></div>
+          <div className="service-status-list">{data.services.map((service) => <div key={service.service}><span className={`service-dot ${statusSeverity(service.status)}`}><i /></span><div><strong>{service.name}</strong><small>{service.service}</small></div><SeverityBadge severity={statusSeverity(service.status)} label={service.status} /></div>)}</div>
+        </article>
+      </div>
+
+      {data.collectors.length > 0 && <article className="panel telemetry-panel collector-telemetry-panel">
+        <div className="panel-heading"><div><span className="panel-kicker">Kaynak bazında</span><h2>Collector ve retention kayıtları</h2></div><Activity size={19} className="panel-accent-icon" /></div>
+        <div className="database-health-table-wrap telemetry-table-wrap"><table className="database-health-table"><thead><tr><th>Kaynak</th><th>Bağlantı</th><th>Snapshot sıklığı</th><th>Retention</th><th>Son snapshot</th><th>Gecikme</th><th>Durum</th></tr></thead><tbody>{data.collectors.map((collector, index) => <tr key={collector.serverId ?? `${collector.alias}-${index}`}><td><span className="index-name"><strong>{collector.alias || `server-${collector.serverId || '—'}`}</strong><small>server id {collector.serverId ?? '—'}</small></span></td><td>{collector.hostname || '—'}{collector.port ? `:${collector.port}` : ''}</td><td>{collector.frequencySeconds == null ? '—' : `${formatNumber(collector.frequencySeconds)} sn`}</td><td>{collector.retention || '—'}</td><td>{collector.lastSnapshotAt ? formatDateTime(collector.lastSnapshotAt) : '—'}</td><td>{collector.lagSeconds == null ? '—' : formatDuration(collector.lagSeconds * 1000)}</td><td><SeverityBadge severity={statusSeverity(collector.status)} label={collector.status || 'UNKNOWN'} /></td></tr>)}</tbody></table></div>
+      </article>}
+
+      <article className="panel telemetry-panel">
+        <div className="panel-heading"><div><span className="panel-kicker">PostgreSQL I/O · {windowLabels[window]}</span><h2>Okuma, yazma ve WAL özeti</h2></div><Gauge size={20} className="panel-accent-icon" /></div>
+        {data.io.available && io ? <>
+          <div className="telemetry-metric-grid">
+            <div><span>Okunan veri</span><strong>{formatBytes(io.readBytes)}</strong><small>{formatLargeNumber(io.reads)} okuma</small></div>
+            <div><span>Yazılan veri</span><strong>{formatBytes(io.writeBytes)}</strong><small>{formatLargeNumber(io.writes)} yazma</small></div>
+            <div><span>Extend</span><strong>{formatBytes(io.extendBytes)}</strong><small>ilişki genişletme I/O'su</small></div>
+            <div><span>Cache hit</span><strong>{operationsCacheHitLabel}</strong><small>{formatLargeNumber(io.cacheHits)} hit</small></div>
+            <div><span>Temp / WAL</span><strong>{formatBytes(io.tempBytes)} / {formatBytes(io.walBytes)}</strong><small>geçici veri / WAL</small></div>
+            <div><span>Checkpoint</span><strong>{formatLargeNumber(io.checkpoints)}</strong><small>{formatDuration(io.checkpointWriteTimeMs)} yazma süresi</small></div>
+            <div><span>Backend yazması</span><strong>{formatLargeNumber(io.backendWrites)}</strong><small>buffer yazma yükü</small></div>
+          </div>
+
+          {data.io.capabilities.length > 0 && <div className="telemetry-capability-grid">{data.io.capabilities.map((capability) => <div key={capability.key}><strong>{capability.source}</strong><span>{capability.available ? 'Kullanılabilir' : 'Kullanılamıyor'} · {capability.resetEpochAware ? 'reset-aware' : 'reset sınırlı'}</span></div>)}</div>}
+          {data.io.capabilities.filter((capability) => capability.limitation).map((capability) => <p className="telemetry-caveat" key={`${capability.key}-limitation`}><ShieldAlert size={15} /> <span><b>{capability.source}:</b> {capability.limitation}</span></p>)}
+
+          <div className="database-health-table-wrap telemetry-table-wrap"><table className="database-health-table"><thead><tr><th>Veritabanı</th><th>Bağlantı</th><th>Commit / rollback</th><th>Blok read / hit</th><th>Satır return / fetch</th><th>Satır insert / update / delete</th><th>Temp</th><th>Deadlock</th><th>I/O süresi</th></tr></thead><tbody>{data.io.items.map((item) => <tr key={`${item.serverId}:${item.databaseId}`}><td><span className="db-name"><Database size={14} />{item.serverAlias ? `${item.serverAlias} / ` : ''}{item.databaseName}</span></td><td>{formatNumber(item.currentBackends || 0)}</td><td>{formatLargeNumber(item.transactionsCommitted || 0)} / {formatLargeNumber(item.transactionsRolledBack || 0)}</td><td>{formatLargeNumber(item.sharedBlocksRead)} / {formatLargeNumber(item.sharedBlocksHit)}<small>{formatCacheHit(item.sharedBlocksHit, item.sharedBlocksRead)} cache hit</small></td><td>{formatLargeNumber(item.tuplesReturned || 0)} / {formatLargeNumber(item.tuplesFetched || 0)}</td><td>{formatLargeNumber(item.tuplesInserted || 0)} / {formatLargeNumber(item.tuplesUpdated || 0)} / {formatLargeNumber(item.tuplesDeleted || 0)}</td><td>{formatBytes(item.tempBytes || 0)}<small>{formatLargeNumber(item.tempFiles || 0)} dosya</small></td><td>{formatNumber(item.deadlocks || 0)}</td><td>{formatDuration((item.readTimeMs || 0) + (item.writeTimeMs || 0))}<small>read {formatDuration(item.readTimeMs || 0)} · write {formatDuration(item.writeTimeMs || 0)}</small></td></tr>)}</tbody></table></div>
+          <div className="telemetry-subsection"><span className="panel-kicker">Cluster düzeyi · pg_stat_io</span><h3>I/O bağlamları</h3><p>Bu değerler veritabanına dağıtılmaz; PostgreSQL backend türü ve buffer bağlamı düzeyindedir.</p></div>
+          <div className="database-health-table-wrap telemetry-table-wrap telemetry-scroll-table"><table className="database-health-table"><thead><tr><th>Backend / nesne</th><th>Bağlam</th><th>Okuma</th><th>Yazma</th><th>Writeback</th><th>Extend</th><th>Hit</th><th>Eviction / reuse</th><th>Fsync / toplam süre</th></tr></thead><tbody>{data.io.contexts.map((item, index) => <tr key={`${item.serverId}:${item.backendType}:${item.object}:${item.context}:${index}`}><td><span className="index-name"><strong>{item.backendType || '—'}</strong><small>{item.serverAlias || `server-${item.serverId || '—'}`} · {item.object || '—'}</small></span></td><td>{item.context || '—'}</td><td>{formatBytes(item.readBytes || 0)}<small>{formatLargeNumber(item.reads || 0)} işlem · {formatDuration(item.readTimeMs || 0)}</small></td><td>{formatBytes(item.writeBytes || 0)}<small>{formatLargeNumber(item.writes || 0)} işlem · {formatDuration(item.writeTimeMs || 0)}</small></td><td>{formatLargeNumber(item.writebacks || 0)}<small>{formatDuration(item.writebackTimeMs || 0)}</small></td><td>{formatBytes(item.extendBytes || 0)}<small>{formatLargeNumber(item.extends || 0)} işlem · {formatDuration(item.extendTimeMs || 0)}</small></td><td>{formatLargeNumber(item.hits || 0)}</td><td>{formatLargeNumber(item.evictions || 0)} / {formatLargeNumber(item.reuses || 0)}</td><td>{formatLargeNumber(item.fsyncs || 0)}<small>{formatDuration((item.fsyncTimeMs || 0) + (item.readTimeMs || 0) + (item.writeTimeMs || 0) + (item.writebackTimeMs || 0) + (item.extendTimeMs || 0))}</small></td></tr>)}</tbody></table></div>
+          <div className="telemetry-subsection"><span className="panel-kicker">Sunucu düzeyi</span><h3>WAL, checkpoint ve bgwriter</h3></div>
+          <div className="database-health-table-wrap telemetry-table-wrap"><table className="database-health-table"><thead><tr><th>Sunucu</th><th>WAL</th><th>WAL record / FPI</th><th>Checkpoint timed / requested</th><th>Checkpoint süre / buffer</th><th>Clean / backend / allocated</th><th>WAL write / sync</th></tr></thead><tbody>{data.io.servers.map((item, index) => <tr key={`${item.serverId}:${index}`}><td>{item.serverAlias || `server-${item.serverId || '—'}`}</td><td>{formatBytes(item.walBytes || 0)}<small>{formatLargeNumber(item.walBuffersFull || 0)} buffer-full</small></td><td>{formatLargeNumber(item.walRecords || 0)} / {formatLargeNumber(item.walFpi || 0)}</td><td>{formatLargeNumber(item.timedCheckpoints || 0)} / {formatLargeNumber(item.requestedCheckpoints || 0)}</td><td>{formatDuration((item.checkpointWriteTimeMs || 0) + (item.checkpointSyncTimeMs || 0))}<small>write {formatDuration(item.checkpointWriteTimeMs || 0)} · sync {formatDuration(item.checkpointSyncTimeMs || 0)} · {formatLargeNumber(item.checkpointBuffersWritten || 0)} buffer</small></td><td>{formatLargeNumber(item.buffersClean || 0)} / {formatLargeNumber(item.buffersBackend || 0)} / {formatLargeNumber(item.buffersAllocated || 0)}<small>maxwritten {formatLargeNumber(item.maxwrittenClean || 0)} · backend fsync {formatLargeNumber(item.buffersBackendFsync || 0)}</small></td><td>{formatLargeNumber(item.walWrites || 0)} / {formatLargeNumber(item.walSyncs || 0)}<small>{formatDuration((item.walWriteTimeMs || 0) + (item.walSyncTimeMs || 0))}</small></td></tr>)}</tbody></table></div>
+        </> : <div className="telemetry-unavailable"><Info size={20} /><div><strong>I/O telemetrisi henüz kullanılamıyor</strong><p>{data.io.message || 'Collector yeterli örnek oluşturduğunda bu alan dolacak.'}</p></div></div>}
+      </article>
+
+      <article className="panel telemetry-panel">
+        <div className="panel-heading"><div><span className="panel-kicker">Index geçmişi · {windowLabels[window]}</span><h2>Index kullanım sinyalleri</h2></div><span className="index-disclaimer"><Info size={13} /> DROP önerisi değildir</span></div>
+        {data.indexes.available ? <>
+          <p className="telemetry-caveat"><ShieldAlert size={15} /> Repository PK, unique ve constraint-backed index rollerini güvenilir biçimde ayıramaz. Sıfır tarama yalnız seçili penceredeki gözlemdir; silmeden önce daha uzun trafik, replica ve dönemsel işleri doğrulayın.</p>
+          {indexSummary && <div className="index-summary"><span><b>{formatLargeNumber(indexSummary.indexesObserved)}</b> index izlendi</span><span><b>{formatLargeNumber(data.indexes.items.length)}</b> listede</span><span><b>{formatLargeNumber(indexSummary.candidateSignals)}</b> gözlemsel sinyal</span><span><b>{formatBytes(indexSummary.totalSizeBytes)}</b> toplam</span><span><b>{formatBytes(indexSummary.noScanSizeBytes)}</b> tarama gözlenmeyen alan</span></div>}
+          <div className="database-health-table-wrap telemetry-table-wrap telemetry-scroll-table"><table className="database-health-table"><thead><tr><th>Index</th><th>Tablo</th><th>Boyut</th><th>Tarama / tuple</th><th>Blok read / hit</th><th>Son tarama</th><th>Sinyal / açıklama</th></tr></thead><tbody>{data.indexes.items.map((item) => <tr key={`${item.serverId}:${item.databaseId}:${item.indexId ?? item.indexName}`}><td><span className="index-name"><strong>{item.indexName}</strong><small>{item.serverAlias ? `${item.serverAlias} / ` : ''}{item.databaseName} · OID {item.indexId ?? '—'}</small></span></td><td><span className="index-name"><strong>{item.schemaName ? `${item.schemaName}.` : ''}{item.tableName}</strong><small>relation OID {item.relationId ?? '—'}</small></span></td><td>{formatBytes(item.indexSizeBytes)}</td><td>{formatLargeNumber(item.indexScans)}<small>read {formatLargeNumber(item.tuplesRead || 0)} · fetch {formatLargeNumber(item.tuplesFetched || 0)}</small></td><td>{formatLargeNumber(item.blocksRead || 0)} / {formatLargeNumber(item.blocksHit || 0)}<small>{formatCacheHit(item.blocksHit || 0, item.blocksRead || 0)} cache hit</small></td><td>{item.lastUsedAt ? formatDateTime(item.lastUsedAt) : 'Gözlenmedi'}</td><td><SeverityBadge severity={statusSeverity(item.signalLevel)} label={indexSignalLabel(item.signal || item.signalLevel)} />{item.recommendation && <small className="signal-detail">{item.recommendation}</small>}</td></tr>)}</tbody></table>{!data.indexes.items.length && <div className="empty-state"><Info size={26} /><strong>Index telemetrisi yok</strong><p>Seçili pencerede henüz index gözlemi oluşmadı.</p></div>}</div>
+        </> : <div className="telemetry-unavailable"><Info size={20} /><div><strong>Index telemetrisi henüz kullanılamıyor</strong><p>{data.indexes.message || 'Collector yeterli örnek oluşturduğunda bu alan dolacak.'}</p></div></div>}
+      </article>
+
+      {data.collector.errors.length > 0 && <div className="error-panel collector-errors"><span className="error-panel-icon"><ShieldAlert size={24} /></span><div><strong>Collector uyarıları</strong>{data.collector.errors.map((error) => <p key={error}>{error}</p>)}</div></div>}
+    </section>
+  )
+}
+
 function Sidebar({ page, onNavigate, collapsed, onToggle, sourceName, connectionState }: { page: PageId; onNavigate: (page: PageId) => void; collapsed: boolean; onToggle: () => void; sourceName: string; connectionState: 'connected' | 'loading' | 'error' }) {
   return (
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
@@ -562,7 +747,6 @@ function Sidebar({ page, onNavigate, collapsed, onToggle, sourceName, connection
       </nav>
       <div className="sidebar-footer">
         <div className={`connection-card ${connectionState}`}><span className="connection-icon"><Network size={17} /></span><div><strong>{sourceName}</strong><span><i /> {connectionState === 'connected' ? 'PoWA bağlı' : connectionState === 'loading' ? 'Bağlanıyor' : 'API erişilemiyor'}</span></div></div>
-        <div className="user-card"><span className="avatar">DB</span><div><strong>Advisor analisti</strong><small>SQL görüntüleme rolü</small></div></div>
       </div>
     </aside>
   )
@@ -570,11 +754,14 @@ function Sidebar({ page, onNavigate, collapsed, onToggle, sourceName, connection
 
 function App() {
   const [page, setPage] = useState<PageId>(getInitialPage)
+  const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [collapsed, setCollapsed] = useState(false)
   const [selectedQuery, setSelectedQuery] = useState<string | null>(null)
+  const [queryParams, setQueryParams] = useState<QueryListParams>({ page: 1, pageSize: 50, sort: 'impact' })
   const [overview, setOverview] = useState<Loadable<OverviewStats>>({ status: 'idle' })
   const [queries, setQueries] = useState<Loadable<ApiList<QuerySummary>>>({ status: 'idle' })
   const [health, setHealth] = useState<Loadable<SystemHealth>>({ status: 'idle' })
+  const [operations, setOperations] = useState<Loadable<OperationsData>>({ status: 'idle' })
 
   const navigate = (next: PageId) => {
     setPage(next)
@@ -589,31 +776,50 @@ function App() {
 
   const loadOverview = () => {
     const controller = new AbortController(); setOverview({ status: 'loading' })
-    advisorApi.getOverview(controller.signal).then(({ data }) => setOverview({ status: 'success', data })).catch((error) => { if (!(error instanceof DOMException && error.name === 'AbortError')) setOverview({ status: 'error', error: errorMessage(error) }) })
+    advisorApi.getOverview(timeWindow, controller.signal).then(({ data }) => setOverview({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOverview({ status: 'error', error: errorMessage(error) }) })
     return controller
   }
   const loadQueries = () => {
     const controller = new AbortController(); setQueries({ status: 'loading' })
-    advisorApi.getQueries(controller.signal).then(({ data }) => setQueries({ status: 'success', data })).catch((error) => { if (!(error instanceof DOMException && error.name === 'AbortError')) setQueries({ status: 'error', error: errorMessage(error) }) })
+    advisorApi.getQueries(timeWindow, queryParams, controller.signal).then(({ data }) => setQueries({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setQueries({ status: 'error', error: errorMessage(error) }) })
     return controller
   }
   const loadHealth = () => {
     const controller = new AbortController(); setHealth({ status: 'loading' })
-    advisorApi.getSystemHealth(controller.signal).then(({ data }) => setHealth({ status: 'success', data })).catch((error) => { if (!(error instanceof DOMException && error.name === 'AbortError')) setHealth({ status: 'error', error: errorMessage(error) }) })
+    advisorApi.getSystemHealth(controller.signal).then(({ data }) => setHealth({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setHealth({ status: 'error', error: errorMessage(error) }) })
+    return controller
+  }
+  const loadOperations = () => {
+    const controller = new AbortController(); setOperations({ status: 'loading' })
+    advisorApi.getOperations(timeWindow, controller.signal).then(({ data }) => setOperations({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOperations({ status: 'error', error: errorMessage(error) }) })
     return controller
   }
 
   useEffect(() => {
-    const controllers = [loadOverview(), loadQueries(), loadHealth()]
+    const controller = loadHealth()
     const onHashChange = () => setPage(getInitialPage())
     window.addEventListener('hashchange', onHashChange)
-    return () => { controllers.forEach((controller) => controller.abort()); window.removeEventListener('hashchange', onHashChange) }
-    // İlk yüklemede tüm panolar paralel hazırlanır.
+    return () => { controller.abort(); window.removeEventListener('hashchange', onHashChange) }
+    // Sistem sağlığı pencere bağımsızdır ve ilk yüklemede hazırlanır.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const hasError = [overview, queries, health].some((state) => state.status === 'error')
-  const isConnecting = [overview, queries, health].some((state) => state.status === 'loading' || state.status === 'idle')
+  useEffect(() => {
+    const controllers = [loadOverview(), loadOperations()]
+    return () => controllers.forEach((controller) => controller.abort())
+    // Zaman aralığı değiştiğinde pencereye bağlı özet ve operasyon telemetrisi yenilenir.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeWindow])
+
+  useEffect(() => {
+    const controller = loadQueries()
+    return () => controller.abort()
+    // Sorgu filtresi veya zaman aralığı değiştiğinde sunucu tarafında yeni sayfa alınır.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeWindow, queryParams])
+
+  const hasError = [overview, queries, health, operations].some((state) => state.status === 'error')
+  const isConnecting = [overview, queries, health, operations].some((state) => state.status === 'loading' || state.status === 'idle')
 
   return (
     <div className={`app-shell ${collapsed ? 'sidebar-is-collapsed' : ''}`}>
@@ -624,6 +830,7 @@ function App() {
           <div className="mobile-brand"><span className="brand-mark"><Database size={18} /><i /></span><strong>PG Advisor</strong></div>
           <div className="breadcrumb"><span>PG Advisor</span><ChevronRight size={14} /><strong>{pageTitles[page]}</strong></div>
           <div className="topbar-actions">
+            {page !== 'health' && <WindowPicker value={timeWindow} onChange={(nextWindow) => { setTimeWindow(nextWindow); setQueryParams((value) => ({ ...value, page: 1 })) }} />}
             <div className={`api-indicator ${demoModeEnabled ? 'demo' : hasError ? 'error' : isConnecting ? 'loading' : 'connected'}`} title={hasError ? 'Bazı API istekleri başarısız' : 'API bağlantı durumu'}>
               <i />{demoModeEnabled ? 'Demo modu' : hasError ? 'API sorunu' : isConnecting ? 'Bağlanıyor' : 'Canlı veri'}
             </div>
@@ -631,12 +838,13 @@ function App() {
         </header>
         {demoModeEnabled && <div className="demo-banner" role="status"><Info size={15} /><span><strong>Demo verisi gösteriliyor.</strong> Bu veri API hatası nedeniyle otomatik açılmadı; <code>VITE_DEMO_MODE=true</code> ile bilinçli olarak etkinleştirildi.</span></div>}
         <main id="main-content" tabIndex={-1}>
-          {page === 'overview' && <OverviewPage state={overview} queries={queries.data} onRetry={loadOverview} onOpenQuery={setSelectedQuery} onNavigate={navigate} />}
-          {page === 'queries' && <QueriesPage state={queries} onRetry={loadQueries} onOpenQuery={setSelectedQuery} />}
+          {page === 'overview' && <OverviewPage state={overview} queries={queries.data} window={timeWindow} onRetry={loadOverview} onOpenQuery={setSelectedQuery} onNavigate={navigate} />}
+          {page === 'queries' && <QueriesPage state={queries} params={queryParams} window={timeWindow} onParamsChange={setQueryParams} onRetry={loadQueries} onOpenQuery={setSelectedQuery} />}
           {page === 'health' && <SystemHealthPage state={health} onRetry={loadHealth} />}
+          {page === 'operations' && <OperationsPage state={operations} window={timeWindow} onRetry={loadOperations} />}
         </main>
       </div>
-      {selectedQuery && <QueryDetailModal queryId={selectedQuery} onClose={() => setSelectedQuery(null)} />}
+      {selectedQuery && <QueryDetailModal queryId={selectedQuery} window={timeWindow} onClose={() => setSelectedQuery(null)} />}
     </div>
   )
 }

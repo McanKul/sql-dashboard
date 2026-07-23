@@ -3,10 +3,19 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+import app.api.router as router_module
 from app.config import Settings
-from app.api.router import _summarize_collectors
-from app.repositories.powa import findings_for, interval_for, score_breakdown, serialize_query
-from app.schemas import AnnotationUpdate
+from app.api.router import (
+    _cache_hit_percent,
+    _database_io_payload,
+    _index_payload,
+    _summarize_collectors,
+    io_telemetry,
+    overview,
+    queries,
+)
+from app.repositories.powa import findings_for, interval_for, repository, score_breakdown, serialize_query
+from app.schemas import AnnotationUpdate, IndexResponse
 from app.security import can_view_sql, mask_sql
 
 
@@ -49,6 +58,28 @@ def test_impact_score_breakdown_uses_documented_weights() -> None:
     assert contribution == pytest.approx(80.5)
 
 
+def test_score_breakdown_explains_absolute_volume_gate() -> None:
+    row = {
+        **BASE_ROW,
+        "physical_read_score": 0.6,
+        "score_details": {
+            "physicalRead": {
+                "percentileScore": 100,
+                "volumeFactor": 0.006,
+                "absoluteValue": 6,
+                "volumeValue": 6,
+                "fullScoreAt": 1000,
+                "unit": "blocks",
+            }
+        },
+    }
+    part = score_breakdown(row)["physicalRead"]
+    assert part["score"] == 0.6
+    assert part["percentileScore"] == 100
+    assert part["volumeFactor"] == 0.006
+    assert part["contribution"] == pytest.approx(0.12)
+
+
 def test_unauthorized_sql_is_masked() -> None:
     item = serialize_query(BASE_ROW, sql_visible=False)
     assert item["queryId"] == "42"
@@ -57,6 +88,15 @@ def test_unauthorized_sql_is_masked() -> None:
     assert item["sql"].startswith("SELECT")
     assert can_view_sql("viewer") is False
     assert can_view_sql("analyst") is True
+
+
+def test_query_rows_per_call_is_real_and_p95_is_not_fabricated() -> None:
+    item = serialize_query({**BASE_ROW, "rows": 250, "rows_per_call": 2.5}, sql_visible=True)
+    assert item["rows"] == 250
+    assert item["rowsPerCall"] == 2.5
+    assert item["p95ExecTimeMs"] is None
+    assert item["durationDistribution"]["available"] is False
+    assert "p95" in item["durationDistribution"]["reason"]
 
 
 def test_findings_are_explainable() -> None:
@@ -127,3 +167,176 @@ def test_collector_summary_exposes_worst_source() -> None:
     assert summary["lag_seconds"] == 63.0
     assert summary["alias"] == "2 PostgreSQL kaynağı"
     assert summary["errors"] == ["reporting: timeout"]
+
+
+def test_index_contract_never_calls_no_scan_signal_unused() -> None:
+    payload = _index_payload(
+        {
+            "server_id": 1,
+            "database_id": 16384,
+            "relation_id": 10,
+            "index_id": 11,
+            "size_bytes": 2_000_000,
+            "scans": 0,
+            "signal_level": "WARNING",
+            "signal": "NO_SCANS_OBSERVED",
+            "recommendation": "Bu bir DROP onerisi degildir.",
+        }
+    )
+    response = IndexResponse.model_validate(
+        {
+            "window": "24h",
+            "summary": {
+                "indexesObserved": 1,
+                "candidateSignals": 1,
+                "totalSizeBytes": 2_000_000,
+                "noScanSizeBytes": 2_000_000,
+            },
+            "items": [payload],
+        }
+    )
+    assert response.items[0].signal == "NO_SCANS_OBSERVED"
+    assert "DROP" in response.items[0].recommendation
+
+
+def test_empty_io_ratios_are_reported_as_unavailable() -> None:
+    index_payload = _index_payload(
+        {
+            "server_id": 1,
+            "database_id": 16384,
+            "relation_id": 10,
+            "index_id": 11,
+            "cache_hit_percent": None,
+        }
+    )
+    database_payload = _database_io_payload(
+        {
+            "server_id": 1,
+            "database_id": 16384,
+            "cache_hit_percent": None,
+        }
+    )
+
+    assert index_payload["cacheHitPercent"] is None
+    assert database_payload["cacheHitPercent"] is None
+
+
+def test_cache_ratio_never_claims_exact_hundred_with_physical_reads() -> None:
+    ratio = _cache_hit_percent(1_448_474_149, 6)
+
+    assert ratio is not None
+    assert 99.99 < ratio < 100
+    assert _cache_hit_percent(0, 0) is None
+
+
+def test_insufficient_index_history_is_not_reported_as_healthy() -> None:
+    response = IndexResponse.model_validate(
+        {
+            "window": "1h",
+            "summary": {
+                "indexesObserved": 1,
+                "candidateSignals": 0,
+                "totalSizeBytes": 2_000_000,
+                "noScanSizeBytes": 0,
+            },
+            "items": [
+                _index_payload(
+                    {
+                        "server_id": 1,
+                        "database_id": 16384,
+                        "relation_id": 10,
+                        "index_id": 11,
+                        "signal_level": "UNKNOWN",
+                        "signal": "INSUFFICIENT_DATA",
+                        "recommendation": "Yeterli gozlem suresi yok.",
+                    }
+                )
+            ],
+        }
+    )
+
+    assert response.items[0].signalLevel == "UNKNOWN"
+    assert response.items[0].signal == "INSUFFICIENT_DATA"
+    assert response.summary.candidateSignals == 0
+
+
+@pytest.mark.asyncio
+async def test_overview_cards_use_unpaginated_aggregate(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def query_rows(**kwargs: object) -> tuple[list[dict[str, object]], int]:
+        captured.update(kwargs)
+        return [BASE_ROW], 999
+
+    async def overview_summary(*, window: str) -> dict[str, object]:
+        assert window == "24h"
+        return {
+            "total_db_time_ms": 987654.0,
+            "tracked_queries": 999,
+            "critical_queries": 321,
+            "regressions": 123,
+        }
+
+    async def collector_health() -> list[dict[str, object]]:
+        return []
+
+    async def trend(**kwargs: object) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(repository, "query_rows", query_rows)
+    monkeypatch.setattr(repository, "overview_summary", overview_summary)
+    monkeypatch.setattr(repository, "collector_health", collector_health)
+    monkeypatch.setattr(repository, "trend", trend)
+
+    result = await overview(role="analyst", window="24h")
+
+    assert captured["page_size"] == 10
+    assert result["cards"]["trackedQueries"] == 999
+    assert result["cards"]["criticalQueries"] == 321
+    assert result["cards"]["totalDbTimeMs"] == 987654.0
+
+
+@pytest.mark.asyncio
+async def test_queries_echoes_effective_page_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def query_rows(**kwargs: object) -> tuple[list[dict[str, object]], int]:
+        captured.update(kwargs)
+        return [], 0
+
+    monkeypatch.setattr(repository, "query_rows", query_rows)
+    monkeypatch.setattr(router_module.settings, "max_query_page_size", 2)
+
+    result = await queries(
+        role="analyst",
+        window="24h",
+        page=1,
+        page_size=50,
+        search=None,
+        priority=None,
+        server_id=None,
+        database_id=None,
+        min_calls=0,
+        min_duration_ms=0,
+        sort_by="impact",
+    )
+
+    assert captured["page_size"] == 2
+    assert result["pageSize"] == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_io_route_keeps_reset_limitations_and_null_ratio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def io_rows(**_: object) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+        return [], [], []
+
+    monkeypatch.setattr(repository, "io_telemetry", io_rows)
+
+    result = await io_telemetry(window="24h", server_id=None, database_id=None)
+
+    assert result["summary"]["cacheHitPercent"] is None
+    limitation = next(item for item in result["capabilities"] if item["key"] == "checkpointAndBgwriter")
+    assert limitation["resetEpochAware"] is False
+    assert limitation["limitation"]

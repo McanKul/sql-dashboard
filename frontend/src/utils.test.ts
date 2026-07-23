@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { chartPoints, comparisonAvailable, formatDuration } from './utils'
+import { chartPoints, comparisonAvailable, formatCacheHit, formatDuration, formatLargeNumber, formatScoreContribution, formatVolumeFactor } from './utils'
 
 describe('formatDuration', () => {
   it('uses useful units for query timings', () => {
@@ -17,6 +17,23 @@ describe('comparisonAvailable', () => {
     expect(comparisonAvailable(4)).toBe(false)
     expect(comparisonAvailable(5)).toBe(true)
     expect(comparisonAvailable(Number.NaN)).toBe(false)
+  })
+})
+
+describe('telemetry formatting', () => {
+  it('does not round a near-perfect cache ratio to exact 100 percent', () => {
+    expect(formatCacheHit(1_448_474_149, 6)).toBe('>%99,99')
+    expect(formatCacheHit(0, 0)).toBe('—')
+  })
+
+  it('uses readable Turkish scale names instead of compact abbreviations', () => {
+    expect(formatLargeNumber(1_400_000_000)).toContain('milyar')
+    expect(formatLargeNumber(2_400_000)).toContain('milyon')
+  })
+
+  it('keeps small non-zero score factors visible', () => {
+    expect(formatScoreContribution(0.03)).toBe('0,03')
+    expect(formatVolumeFactor(0.0003)).toBe('%0,03')
   })
 })
 

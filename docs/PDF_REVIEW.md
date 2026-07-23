@@ -43,7 +43,7 @@ PDF'nin native tek-host örneklerinde `localhost` doğrudur; Docker'da değildir
 - Collector repository DSN: `repository-db:5433/powa_repository`
 - API DSN: `repository-db:5433/powa_repository`
 
-Hosttan kullanıcı erişimi için `127.0.0.1:5432/5433/8000` ayrı port publish katmanıdır.
+Hosttan kullanıcı erişimi için varsayılan `127.0.0.1:15432/15433/8000` ayrı port publish katmanıdır; container içi PostgreSQL portları `5432/5433` olarak kalır.
 
 ### 3. `.pgpass` kaynak database alanı wildcard olmalıdır
 
@@ -121,9 +121,9 @@ PDF'deki tek hard-coded source örneği demo için yeterlidir, fakat ürün ente
 | Sorgu detay/trend | Var | Uygulandı |
 | Sistem sağlığı | Var | PG17'de mümkün sinyaller uygulandı; lock açıkça sınırlı |
 | Annotation/audit | Var | API'de uygulandı ve acceptance testte doğrulanır; tek kullanıcılı kurulumda takım iş akışı UI'dan kaldırıldı |
-| Collector/retention ekranı | Var | UI'dan kaldırıldı; collector durumu Genel Bakış özetinde, ayrıntı `/operations` API'sinde |
+| Collector/retention ekranı | Var | Operasyonlar ekranında repository kapasitesi, collector/retention, I/O, WAL/checkpoint ve index telemetrisiyle uygulandı |
 | Kurulum anlatımı | Kullanıcı ek talebi | Dashboard'dan çıkarıldı; platform ve dış kaynak adımları `docs/INSTALLATION.md` içinde |
-| Otomatik index/SQL rewrite | Kapsam dışı | Uygulanmadı; analiz ekranına gereksiz kapsam uyarısı eklenmez |
+| Otomatik index/SQL rewrite | Kapsam dışı | Uygulanmadı; Operasyonlar ekranı index gözlemlerinin DROP önerisi olmadığını ve PK/unique bilgisinin repository'de doğrulanamadığını açıkça belirtir |
 | Native distro kurulumu | Ayrıntılı runbook | Tasarım referansı; doğrulanmış rota Compose |
 
 ## Güvenlik açısından ek notlar
@@ -149,7 +149,7 @@ Aşağıdakiler sağlanırsa PDF'deki ilk iterasyon amacı karşılanır:
 5. API yalnız repository bağlantısına sahiptir.
 6. Sorgular gerçek PoWA fark metrikleriyle sıralanır ve SQL yetkisiz rolde maskelenir.
 7. Annotation değişikliği audit kaydı oluşturur.
-8. UI Genel Bakış, Sorgular ve Sistem Sağlığı ekranlarını açar. (Operasyonlar ve takım iş akışı ekranları tek kullanıcılı kurulum kararıyla kaldırıldı; `/operations` ve annotation API'leri backend'de durur.)
+8. UI Genel Bakış, Sorgular, Sistem Sağlığı ve Operasyonlar ekranlarını açar. Takım iş akışı tek kullanıcılı kurulum kararıyla UI kapsamı dışında kalır; annotation API'leri backend'de durur.
 9. 24 saatlik sorgu listesi kabul ortamında 2 saniyenin altında yanıt verir.
 
 Bu kontroller `bash scripts/verify.sh` ile otomatikleştirilmiştir. Sonuç olarak PDF'nin ilk iterasyon mimarisi **doğru**, yukarıdaki sürüm/container/capability düzeltmeleri ise uygulama için **gerekli**dir.

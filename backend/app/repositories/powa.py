@@ -5,8 +5,6 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from psycopg import sql
-
 from app.config import WINDOW_BUCKETS, WINDOW_INTERVALS
 from app.db import pool
 
@@ -36,7 +34,13 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return float(value)
 
 
-def score_breakdown(row: Mapping[str, Any]) -> dict[str, dict[str, float]]:
+P95_UNAVAILABLE_REASON = (
+    "PoWA/pg_stat_statements kümülatif toplam ve çağrı sayısı tutar; "
+    "tekil çalışma süresi dağılımı olmadığı için güvenilir p95 hesaplanamaz."
+)
+
+
+def score_breakdown(row: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     definitions = {
         "totalTime": ("total_time_score", 0.40),
         "physicalRead": ("physical_read_score", 0.20),
@@ -45,14 +49,28 @@ def score_breakdown(row: Mapping[str, Any]) -> dict[str, dict[str, float]]:
         "regression": ("regression_score", 0.10),
         "wal": ("wal_score", 0.05),
     }
-    return {
-        key: {
+    details = row.get("score_details")
+    result: dict[str, dict[str, Any]] = {}
+    for key, (column, weight) in definitions.items():
+        component = {
             "score": round(_as_float(row.get(column)), 2),
             "weight": weight,
             "contribution": round(_as_float(row.get(column)) * weight, 2),
         }
-        for key, (column, weight) in definitions.items()
-    }
+        detail = details.get(key) if isinstance(details, Mapping) else None
+        if isinstance(detail, Mapping):
+            component.update(
+                {
+                    "percentileScore": round(_as_float(detail.get("percentileScore")), 2),
+                    "volumeFactor": round(_as_float(detail.get("volumeFactor")), 4),
+                    "absoluteValue": round(_as_float(detail.get("absoluteValue")), 2),
+                    "volumeValue": round(_as_float(detail.get("volumeValue")), 2),
+                    "fullScoreAt": round(_as_float(detail.get("fullScoreAt")), 2),
+                    "unit": str(detail.get("unit") or ""),
+                }
+            )
+        result[key] = component
+    return result
 
 
 def findings_for(row: Mapping[str, Any]) -> list[str]:
@@ -86,6 +104,13 @@ def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, A
         "sql": raw_sql if sql_visible else _mask_sql(raw_sql),
         "sqlVisible": sql_visible,
         "calls": int(row.get("calls") or 0),
+        "rows": int(row.get("rows") or 0),
+        "rowsPerCall": round(_as_float(row.get("rows_per_call")), 2),
+        "p95ExecTimeMs": None,
+        "durationDistribution": {
+            "available": False,
+            "reason": P95_UNAVAILABLE_REASON,
+        },
         "totalExecTimeMs": round(_as_float(row.get("total_exec_time_ms")), 2),
         "meanExecTimeMs": round(_as_float(row.get("mean_exec_time_ms")), 2),
         "dbLoadPercent": round(_as_float(row.get("db_load_percent")), 2),
@@ -194,8 +219,9 @@ class PowaRepository:
         filters: list[Any] = [min_calls, min_duration_ms]
 
         if search:
-            conditions.append("sql_text ILIKE %s")
-            filters.append(f"%{search}%")
+            conditions.append("(sql_text ILIKE %s OR query_id::text ILIKE %s)")
+            search_pattern = f"%{search}%"
+            filters.extend([search_pattern, search_pattern])
         if priority:
             conditions.append("priority = %s")
             filters.append(priority.upper())
@@ -233,6 +259,26 @@ class PowaRepository:
                 await cursor.execute(data_query, [interval, *filters, page_size, offset])
                 rows = [dict(row) for row in await cursor.fetchall()]
         return rows, total
+
+    async def overview_summary(self, *, window: str) -> dict[str, Any]:
+        """Aggregate every tracked query; pagination must never affect cards."""
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT
+                        COALESCE(sum(total_exec_time_ms), 0)::double precision AS total_db_time_ms,
+                        count(*)::bigint AS tracked_queries,
+                        count(*) FILTER (WHERE priority = 'CRITICAL')::bigint AS critical_queries,
+                        count(*) FILTER (
+                            WHERE regression_percent > 0 AND previous_calls >= 5
+                        )::bigint AS regressions
+                    FROM advisor.query_metrics(%s::interval)
+                    """,
+                    (interval,),
+                )
+                return dict(await cursor.fetchone())
 
     async def query_by_id(
         self,
@@ -278,7 +324,7 @@ class PowaRepository:
         interval = interval_for(window)
         bucket = WINDOW_BUCKETS[window]
         clauses = ["sample_at >= now() - %s::interval"]
-        params: list[Any] = [bucket, interval]
+        params: list[Any] = [bucket, interval, interval]
         if query_id is not None:
             clauses.append("query_id = %s")
             params.append(query_id)
@@ -295,7 +341,7 @@ class PowaRepository:
                     SELECT date_bin(%s::interval, sample_at, timestamptz '2000-01-01') AS timestamp,
                            sum(total_exec_time_ms)::double precision AS total_exec_time_ms,
                            sum(calls)::bigint AS calls
-                    FROM advisor.v_query_deltas AS deltas
+                    FROM advisor.query_deltas(now() - %s::interval) AS deltas
                     JOIN "PoWA".powa_databases AS db
                       ON db.srvid = deltas.server_id AND db.oid = deltas.database_id
                     WHERE db.datname <> 'powa' AND {' AND '.join(clauses)}
@@ -305,6 +351,128 @@ class PowaRepository:
                     params,
                 )
                 return [dict(row) for row in await cursor.fetchall()]
+
+    async def index_rows(
+        self,
+        *,
+        window: str,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        interval = interval_for(window)
+        clauses = ["TRUE"]
+        filters: list[Any] = []
+        if server_id is not None:
+            clauses.append("server_id = %s")
+            filters.append(server_id)
+        if database_id is not None:
+            clauses.append("database_id = %s")
+            filters.append(database_id)
+        where_sql = " AND ".join(clauses)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT
+                        count(*)::bigint AS indexes_observed,
+                        count(*) FILTER (WHERE signal IN (
+                            'NO_SCANS_OBSERVED', 'LOW_USAGE_OBSERVED'
+                        ))::bigint AS candidate_signals,
+                        COALESCE(sum(size_bytes), 0)::bigint AS total_size_bytes,
+                        COALESCE(sum(size_bytes) FILTER (
+                            WHERE signal = 'NO_SCANS_OBSERVED'
+                        ), 0)::bigint AS no_scan_size_bytes
+                    FROM advisor.index_metrics(%s::interval)
+                    WHERE {where_sql}
+                    """,
+                    [interval, *filters],
+                )
+                summary = dict(await cursor.fetchone())
+                await cursor.execute(
+                    f"""
+                    SELECT metrics.*, servers.alias AS server_alias
+                    FROM advisor.index_metrics(%s::interval) AS metrics
+                    LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
+                    WHERE {where_sql}
+                    ORDER BY
+                        CASE signal_level
+                            WHEN 'WARNING' THEN 1 WHEN 'NOTICE' THEN 2 ELSE 3 END,
+                        size_bytes DESC,
+                        index_id
+                    LIMIT 500
+                    """,
+                    [interval, *filters],
+                )
+                rows = [dict(row) for row in await cursor.fetchall()]
+        return rows, summary
+
+    async def io_telemetry(
+        self,
+        *,
+        window: str,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        interval = interval_for(window)
+        database_clauses = ["TRUE"]
+        database_filters: list[Any] = []
+        if server_id is not None:
+            database_clauses.append("metrics.server_id = %s")
+            database_filters.append(server_id)
+        if database_id is not None:
+            database_clauses.append("metrics.database_id = %s")
+            database_filters.append(database_id)
+
+        server_clauses = ["TRUE"]
+        server_filters: list[Any] = []
+        if server_id is not None:
+            server_clauses.append("metrics.server_id = %s")
+            server_filters.append(server_id)
+        if database_id is not None:
+            server_clauses.append(
+                "metrics.server_id IN ("
+                "SELECT srvid FROM \"PoWA\".powa_databases "
+                "WHERE oid = %s AND dropped IS NULL)"
+            )
+            server_filters.append(database_id)
+
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT metrics.*, servers.alias AS server_alias
+                    FROM advisor.database_io_metrics(%s::interval) AS metrics
+                    LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
+                    WHERE {' AND '.join(database_clauses)}
+                    ORDER BY metrics.server_id, metrics.database_name
+                    """,
+                    [interval, *database_filters],
+                )
+                databases = [dict(row) for row in await cursor.fetchall()]
+                await cursor.execute(
+                    f"""
+                    SELECT metrics.*, servers.alias AS server_alias
+                    FROM advisor.io_metrics(%s::interval) AS metrics
+                    LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
+                    WHERE {' AND '.join(server_clauses)}
+                    ORDER BY metrics.read_bytes + metrics.write_bytes DESC,
+                             metrics.backend_type, metrics.object, metrics.context
+                    """,
+                    [interval, *server_filters],
+                )
+                contexts = [dict(row) for row in await cursor.fetchall()]
+                await cursor.execute(
+                    f"""
+                    SELECT metrics.*, servers.alias AS server_alias
+                    FROM advisor.operation_metrics(%s::interval) AS metrics
+                    LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
+                    WHERE {' AND '.join(server_clauses)}
+                    ORDER BY metrics.server_id
+                    """,
+                    [interval, *server_filters],
+                )
+                servers = [dict(row) for row in await cursor.fetchall()]
+        return databases, contexts, servers
 
     async def table_health(self) -> list[dict[str, Any]]:
         async with pool.connection() as connection:

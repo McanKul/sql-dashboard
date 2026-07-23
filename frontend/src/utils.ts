@@ -1,4 +1,4 @@
-import type { Severity, TrendPoint } from './types'
+import type { Severity, TimeWindow, TrendPoint } from './types'
 
 export const numberFormatter = new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 1 })
 export const compactNumberFormatter = new Intl.NumberFormat('tr-TR', {
@@ -8,6 +8,44 @@ export const compactNumberFormatter = new Intl.NumberFormat('tr-TR', {
 
 export function formatNumber(value: number, compact = false): string {
   return (compact ? compactNumberFormatter : numberFormatter).format(value)
+}
+
+export function formatLargeNumber(value: number): string {
+  const absolute = Math.abs(value)
+  if (absolute >= 1_000_000_000) return `${formatNumber(value / 1_000_000_000)} milyar`
+  if (absolute >= 1_000_000) return `${formatNumber(value / 1_000_000)} milyon`
+  if (absolute >= 1_000) return `${formatNumber(value / 1_000)} bin`
+  return formatNumber(value)
+}
+
+export function formatScoreContribution(value: number): string {
+  return new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 3 }).format(value)
+}
+
+export function formatVolumeFactor(value: number): string {
+  return `%${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 4 }).format(value * 100)}`
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${formatNumber(bytes / (1024 ** index))} ${units[index]}`
+}
+
+export function formatCacheHit(hit: number, read: number): string {
+  const total = hit + read
+  if (!Number.isFinite(total) || total <= 0) return '—'
+  const percent = (hit / total) * 100
+  if (percent < 100 && percent > 99.99) return '>%99,99'
+  return `%${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 2 }).format(percent)}`
+}
+
+export const windowLabels: Record<TimeWindow, string> = {
+  '1h': 'Son 1 saat',
+  '24h': 'Son 24 saat',
+  '7d': 'Son 7 gün',
+  '30d': 'Son 30 gün',
 }
 
 export function formatDuration(milliseconds: number): string {

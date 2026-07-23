@@ -6,8 +6,8 @@ Bu rehber ilk iterasyonu macOS/OrbStack veya Docker Engine çalıştırabilen Li
 
 Bu repo varsayılan olarak tek bir fiziksel/virtual host üzerinde iki PostgreSQL container'ı açar:
 
-1. Kaynak PostgreSQL: host loopback `5432`, container `5432`
-2. Repository PostgreSQL: host loopback `5433`, container `5433`
+1. Kaynak PostgreSQL: host loopback `15432`, container `5432`
+2. Repository PostgreSQL: host loopback `15433`, container `5433`
 
 Bunlara collector, API ve web container'ları eklenir. Sürekli sentetik trafik üreten `workload` container'ı yalnız isteğe bağlı `demo` profiliyle açılır. Bu ayrım PDF'deki “tek test sunucusu, iki PostgreSQL instance” kararının çalıştırılabilir halidir.
 
@@ -203,13 +203,13 @@ Bu init ayarı yalnız boş `repository_data` volume'ü bootstrap edilirken okun
 
 ### Adım 3 — Portları kontrol edin
 
-Varsayılan host portları `5432`, `5433`, `8000` ve `5173`'tür. Kullanımdaysa yalnız host tarafını `.env` içinde değiştirin; container içi portlar sabittir.
+Varsayılan host portları `15432`, `15433`, `8000` ve `5173`'tür. Kullanımdaysa yalnız host tarafını `.env` içinde değiştirin; container içi portlar `5432` ve `5433` olarak sabittir.
 
 macOS/Linux örneği:
 
 ```bash
-lsof -nP -iTCP:5432 -sTCP:LISTEN || true
-lsof -nP -iTCP:5433 -sTCP:LISTEN || true
+lsof -nP -iTCP:15432 -sTCP:LISTEN || true
+lsof -nP -iTCP:15433 -sTCP:LISTEN || true
 lsof -nP -iTCP:8000 -sTCP:LISTEN || true
 lsof -nP -iTCP:5173 -sTCP:LISTEN || true
 ```

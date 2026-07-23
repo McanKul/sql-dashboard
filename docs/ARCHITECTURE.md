@@ -93,11 +93,11 @@ Sorgu analiz listesi `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE` ve `MERGE` i
 | `postgres` | Yönetici | Yönetici | Yalnız bootstrap/test |
 | `powa_collector` | Etkin `CONNECT`, `pg_read_all_stats`, PoWA snapshot/execute | PoWA read/write/snapshot | Snapshot taşıma |
 | `advisor_api` | Bağlantı yok | PoWA read + advisor kontrollü write | API sorguları ve not/audit |
-| UI `viewer` | Yok | API üzerinden maskeli SQL | Varsayılan görüntüleme |
-| UI `analyst` | Yok | API üzerinden tam SQL | Analiz |
-| UI `admin` | Yok | Tam SQL + CSV export | Yönetim demonstrasyonu |
+| API isteği `viewer` | Yok | API üzerinden maskeli SQL | Varsayılan görüntüleme |
+| API isteği `analyst` | Yok | API üzerinden tam SQL | Analiz istemcisi |
+| API isteği `admin` | Yok | Tam SQL + CSV export | API yönetim demonstrasyonu |
 
-UI rollerinin `X-Advisor-Role` header'ı ile seçildiğini unutmayın. Header göndermeyen API isteği `viewer` olur; referans web istemcisi analiz ekranlarını göstermek için `analyst` gönderir. Bu, davranışı ve maskeleme politikasını doğrulamak içindir; gerçek kimlik doğrulama değildir.
+API rollerinin `X-Advisor-Role` header'ı ile seçildiğini unutmayın. Header göndermeyen API isteği `viewer` olur; tek kullanıcılı referans web istemcisi ayrı bir kullanıcı/rol arayüzü göstermeden analiz verisini almak için sabit `analyst` isteği gönderir. Bu, davranışı ve maskeleme politikasını doğrulamak içindir; gerçek kimlik doğrulama değildir.
 
 ## Bilinen ilk iterasyon sınırları
 

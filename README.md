@@ -47,16 +47,17 @@ Başarılı sonuç `İlk iterasyon çalışma zamanı kabul kontrolleri tamamlan
 | Web üzerinden API | <http://localhost:5173/api/v1/health> | Nginx proxy üzerinden |
 | FastAPI | <http://localhost:8000/api/v1/health> | Yalnız loopback (`127.0.0.1`) |
 | OpenAPI | <http://localhost:8000/docs> | Yalnız loopback |
-| Kaynak PostgreSQL | `127.0.0.1:5432/appdb` | Yalnız loopback |
-| PoWA repository | `127.0.0.1:5433/powa_repository` | Yalnız loopback |
+| Kaynak PostgreSQL | `127.0.0.1:15432/appdb` | Yalnız loopback; container içinde `5432` |
+| PoWA repository | `127.0.0.1:15433/powa_repository` | Yalnız loopback; container içinde `5433` |
 
-Başka bir bilgisayardan yalnız `http://SUNUCU_IP:5173` adresini açın. API çağrıları arayüzün Nginx `/api` proxy'sinden geçer; `5432`, `5433` ve `8000` portlarını dış ağa açmayın.
+Başka bir bilgisayardan yalnız `http://SUNUCU_IP:5173` adresini açın. API çağrıları arayüzün Nginx `/api` proxy'sinden geçer; `15432`, `15433` ve `8000` portlarını dış ağa açmayın.
 
 Arayüzde şu analiz ekranları bulunur:
 
 - Genel Bakış: yük özeti, en yüksek etkili sorgular ve trend
 - Sorgular: arama, filtreleme, sıralama, sorgu detayı ve dönem karşılaştırması
-- Sistem Sağlığı: seq scan, dead tuple, autovacuum ve uzun transaction sinyalleri
+- Sistem Sağlığı: son repository snapshot'ındaki seq scan, dead tuple, autovacuum ve uzun transaction sinyalleri; dönem seçici bu snapshot ekranında gösterilmez
+- Operasyonlar: collector/retention görünürlüğü, repository kapasitesi, veritabanı ve cluster I/O, WAL/checkpoint ile güvenli index kullanım sinyalleri
 
 ## Kontrollü test yükü
 

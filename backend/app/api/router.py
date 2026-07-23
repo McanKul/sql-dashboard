@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 
 from app.config import WINDOW_INTERVALS, get_settings
 from app.repositories.powa import repository, serialize_query
-from app.schemas import AnnotationUpdate
+from app.schemas import AnnotationUpdate, IndexResponse, IoResponse
 from app.security import can_view_sql, request_role, require_admin
 
 
@@ -26,6 +26,16 @@ COLLECTOR_STATUS_RANK = {
     "STALE": 3,
     "DEGRADED": 4,
 }
+
+
+def _cache_hit_percent(blocks_hit: int, blocks_read: int) -> float | None:
+    total = blocks_hit + blocks_read
+    if total <= 0:
+        return None
+    percent = 100.0 * blocks_hit / total
+    # Büyük sayaçlarda floating-point yuvarlaması fiziksel okuma varken 100
+    # üretebilir. API bu durumda kesin yüzde yüz iddiasında bulunmamalı.
+    return min(percent, 99.999999) if blocks_read > 0 else percent
 
 
 def _collector_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +114,114 @@ def _table_payload(row: dict[str, Any]) -> dict[str, Any]:
         "signalLevel": row.get("signal_level"),
         "recommendation": row.get("recommendation"),
     }
+
+
+def _index_payload(row: dict[str, Any]) -> dict[str, Any]:
+    blocks_read = int(row.get("blocks_read") or 0)
+    blocks_hit = int(row.get("blocks_hit") or 0)
+    return {
+        "serverId": row["server_id"],
+        "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
+        "databaseId": row["database_id"],
+        "databaseName": row.get("database_name"),
+        "relationId": row["relation_id"],
+        "tableName": row.get("table_name"),
+        "indexId": row["index_id"],
+        "indexName": row.get("index_name"),
+        "sizeBytes": int(row.get("size_bytes") or 0),
+        "scans": int(row.get("scans") or 0),
+        "tuplesRead": int(row.get("tuples_read") or 0),
+        "tuplesFetched": int(row.get("tuples_fetched") or 0),
+        "blocksRead": blocks_read,
+        "blocksHit": blocks_hit,
+        "cacheHitPercent": _cache_hit_percent(blocks_hit, blocks_read),
+        "lastScanAt": row.get("last_scan_at"),
+        "signalLevel": row.get("signal_level"),
+        "signal": row.get("signal"),
+        "recommendation": row.get("recommendation"),
+    }
+
+
+def _database_io_payload(row: dict[str, Any]) -> dict[str, Any]:
+    blocks_read = int(row.get("blocks_read") or 0)
+    blocks_hit = int(row.get("blocks_hit") or 0)
+    return {
+        "serverId": row["server_id"],
+        "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
+        "databaseId": row["database_id"],
+        "databaseName": row.get("database_name"),
+        "currentBackends": int(row.get("current_backends") or 0),
+        "transactionsCommitted": int(row.get("transactions_committed") or 0),
+        "transactionsRolledBack": int(row.get("transactions_rolled_back") or 0),
+        "blocksRead": blocks_read,
+        "blocksHit": blocks_hit,
+        "cacheHitPercent": _cache_hit_percent(blocks_hit, blocks_read),
+        "tempFiles": int(row.get("temp_files") or 0),
+        "tempBytes": int(row.get("temp_bytes") or 0),
+        "deadlocks": int(row.get("deadlocks") or 0),
+        "blockReadTimeMs": round(float(row.get("block_read_time_ms") or 0), 2),
+        "blockWriteTimeMs": round(float(row.get("block_write_time_ms") or 0), 2),
+        "tuplesReturned": int(row.get("tuples_returned") or 0),
+        "tuplesFetched": int(row.get("tuples_fetched") or 0),
+        "tuplesInserted": int(row.get("tuples_inserted") or 0),
+        "tuplesUpdated": int(row.get("tuples_updated") or 0),
+        "tuplesDeleted": int(row.get("tuples_deleted") or 0),
+    }
+
+
+def _io_context_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "serverId": row["server_id"],
+        "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
+        "backendType": row.get("backend_type"),
+        "object": row.get("object"),
+        "context": row.get("context"),
+        "reads": int(row.get("reads") or 0),
+        "readBytes": int(row.get("read_bytes") or 0),
+        "readTimeMs": round(float(row.get("read_time_ms") or 0), 2),
+        "writes": int(row.get("writes") or 0),
+        "writeBytes": int(row.get("write_bytes") or 0),
+        "writeTimeMs": round(float(row.get("write_time_ms") or 0), 2),
+        "writebacks": int(row.get("writebacks") or 0),
+        "writebackTimeMs": round(float(row.get("writeback_time_ms") or 0), 2),
+        "extends": int(row.get("extends") or 0),
+        "extendBytes": int(row.get("extend_bytes") or 0),
+        "extendTimeMs": round(float(row.get("extend_time_ms") or 0), 2),
+        "hits": int(row.get("hits") or 0),
+        "evictions": int(row.get("evictions") or 0),
+        "reuses": int(row.get("reuses") or 0),
+        "fsyncs": int(row.get("fsyncs") or 0),
+        "fsyncTimeMs": round(float(row.get("fsync_time_ms") or 0), 2),
+    }
+
+
+def _operation_payload(row: dict[str, Any]) -> dict[str, Any]:
+    integer_fields = {
+        "walRecords": "wal_records",
+        "walFpi": "wal_fpi",
+        "walBytes": "wal_bytes",
+        "walBuffersFull": "wal_buffers_full",
+        "walWrites": "wal_writes",
+        "walSyncs": "wal_syncs",
+        "timedCheckpoints": "timed_checkpoints",
+        "requestedCheckpoints": "requested_checkpoints",
+        "checkpointBuffersWritten": "checkpoint_buffers_written",
+        "buffersClean": "buffers_clean",
+        "maxwrittenClean": "maxwritten_clean",
+        "buffersBackend": "buffers_backend",
+        "buffersBackendFsync": "buffers_backend_fsync",
+        "buffersAllocated": "buffers_allocated",
+    }
+    payload: dict[str, Any] = {
+        "serverId": row["server_id"],
+        "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
+        "walWriteTimeMs": round(float(row.get("wal_write_time_ms") or 0), 2),
+        "walSyncTimeMs": round(float(row.get("wal_sync_time_ms") or 0), 2),
+        "checkpointWriteTimeMs": round(float(row.get("checkpoint_write_time_ms") or 0), 2),
+        "checkpointSyncTimeMs": round(float(row.get("checkpoint_sync_time_ms") or 0), 2),
+    }
+    payload.update({key: int(row.get(column) or 0) for key, column in integer_fields.items()})
+    return payload
 
 
 @router.get("/health")
@@ -189,10 +307,11 @@ async def queries(
     min_duration_ms: float = Query(default=0, ge=0, alias="minDurationMs"),
     sort_by: str = Query(default="impact", alias="sort"),
 ) -> dict[str, Any]:
+    effective_page_size = min(page_size, settings.max_query_page_size)
     rows, total = await repository.query_rows(
         window=window,
         page=page,
-        page_size=min(page_size, settings.max_query_page_size),
+        page_size=effective_page_size,
         search=search,
         priority=priority,
         server_id=server_id,
@@ -205,7 +324,7 @@ async def queries(
     return {
         "items": [serialize_query(row, sql_visible=visible) for row in rows],
         "page": page,
-        "pageSize": page_size,
+        "pageSize": effective_page_size,
         "total": total,
         "window": window,
     }
@@ -310,26 +429,21 @@ async def overview(
     role: Annotated[str, Depends(request_role)],
     window: Window = "24h",
 ) -> dict[str, Any]:
-    rows, total = await repository.query_rows(window=window, page_size=200, sort_by="impact")
+    rows, _ = await repository.query_rows(window=window, page_size=10, sort_by="impact")
+    summary = await repository.overview_summary(window=window)
     collectors = await repository.collector_health()
     collector_summary = _summarize_collectors(collectors)
     trend = await repository.trend(window=window)
-    top = rows[:10]
     return {
         "window": window,
         "cards": {
-            "totalDbTimeMs": round(sum(float(row.get("total_exec_time_ms") or 0) for row in rows), 2),
-            "trackedQueries": total,
-            "criticalQueries": sum(1 for row in rows if row.get("priority") == "CRITICAL"),
-            "regressions": sum(
-                1
-                for row in rows
-                if float(row.get("regression_percent") or 0) > 0
-                and int(row.get("previous_calls") or 0) >= 5
-            ),
+            "totalDbTimeMs": round(float(summary.get("total_db_time_ms") or 0), 2),
+            "trackedQueries": int(summary.get("tracked_queries") or 0),
+            "criticalQueries": int(summary.get("critical_queries") or 0),
+            "regressions": int(summary.get("regressions") or 0),
             "collectorLagSeconds": collector_summary.get("lag_seconds"),
         },
-        "topQueries": [serialize_query(row, sql_visible=can_view_sql(role)) for row in top],
+        "topQueries": [serialize_query(row, sql_visible=can_view_sql(role)) for row in rows],
         "trend": [
             {
                 "timestamp": point["timestamp"],
@@ -340,6 +454,101 @@ async def overview(
         ],
         "collector": _collector_payload(collector_summary),
         "collectors": [_collector_payload(row) for row in collectors],
+    }
+
+
+@router.get("/indexes", response_model=IndexResponse)
+async def indexes(
+    window: Window = "24h",
+    server_id: int | None = Query(default=None, alias="serverId"),
+    database_id: int | None = Query(default=None, alias="databaseId"),
+) -> dict[str, Any]:
+    rows, summary = await repository.index_rows(
+        window=window,
+        server_id=server_id,
+        database_id=database_id,
+    )
+    return {
+        "window": window,
+        "summary": {
+            "indexesObserved": int(summary.get("indexes_observed") or 0),
+            "candidateSignals": int(summary.get("candidate_signals") or 0),
+            "totalSizeBytes": int(summary.get("total_size_bytes") or 0),
+            "noScanSizeBytes": int(summary.get("no_scan_size_bytes") or 0),
+        },
+        "items": [_index_payload(row) for row in rows],
+    }
+
+
+@router.get("/io", response_model=IoResponse)
+async def io_telemetry(
+    window: Window = "24h",
+    server_id: int | None = Query(default=None, alias="serverId"),
+    database_id: int | None = Query(default=None, alias="databaseId"),
+) -> dict[str, Any]:
+    database_rows, context_rows, server_rows = await repository.io_telemetry(
+        window=window,
+        server_id=server_id,
+        database_id=database_id,
+    )
+    databases = [_database_io_payload(row) for row in database_rows]
+    contexts = [_io_context_payload(row) for row in context_rows]
+    servers = [_operation_payload(row) for row in server_rows]
+    blocks_read = sum(row["blocksRead"] for row in databases)
+    blocks_hit = sum(row["blocksHit"] for row in databases)
+    return {
+        "window": window,
+        "summary": {
+            "reads": sum(row["reads"] for row in contexts),
+            "writes": sum(row["writes"] for row in contexts),
+            "readBytes": sum(row["readBytes"] for row in contexts),
+            "writeBytes": sum(row["writeBytes"] for row in contexts),
+            "extendBytes": sum(row["extendBytes"] for row in contexts),
+            "cacheHits": blocks_hit,
+            "cacheHitPercent": _cache_hit_percent(blocks_hit, blocks_read),
+            "tempBytes": sum(row["tempBytes"] for row in databases),
+            "walBytes": sum(row["walBytes"] for row in servers),
+            "checkpoints": sum(
+                row["timedCheckpoints"] + row["requestedCheckpoints"] for row in servers
+            ),
+            "checkpointWriteTimeMs": round(
+                sum(row["checkpointWriteTimeMs"] for row in servers), 2
+            ),
+            "backendWrites": sum(row["buffersBackend"] for row in servers),
+        },
+        "capabilities": [
+            {
+                "key": "databaseStats",
+                "available": True,
+                "resetEpochAware": True,
+                "source": "PoWA pg_stat_database",
+            },
+            {
+                "key": "statIo",
+                "available": True,
+                "resetEpochAware": True,
+                "source": "PoWA pg_stat_io",
+            },
+            {
+                "key": "wal",
+                "available": True,
+                "resetEpochAware": True,
+                "source": "PoWA pg_stat_wal",
+            },
+            {
+                "key": "checkpointAndBgwriter",
+                "available": True,
+                "resetEpochAware": False,
+                "source": "PoWA pg_stat_checkpointer + pg_stat_bgwriter",
+                "limitation": (
+                    "Kaynak kayit tipleri stats_reset zamani tasimiyor; sayac azalmasi olan "
+                    "snapshot sifir katkili kabul edilir."
+                ),
+            },
+        ],
+        "databases": databases,
+        "contexts": contexts,
+        "servers": servers,
     }
 
 
