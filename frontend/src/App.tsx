@@ -55,6 +55,9 @@ import {
   formatNumber,
   formatScoreContribution,
   formatVolumeFactor,
+  scoreContributionLabel,
+  scoreRelativeLabel,
+  scoreVolumeLabel,
   severityLabels,
   windowLabels,
 } from './utils'
@@ -91,9 +94,9 @@ function SeverityBadge({ severity, label }: { severity: Severity; label?: string
 }
 
 const queryImpactLabels: Record<Severity, string> = {
-  critical: 'Kritik etki',
-  warning: 'Orta/yüksek etki',
-  healthy: 'Düşük etki',
+  critical: 'Öncelik çok yüksek',
+  warning: 'İnceleme önceliği',
+  healthy: 'Öncelik düşük',
 }
 
 function QueryImpactBadge({ severity }: { severity: Severity }) {
@@ -382,7 +385,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
         <div className="query-table-card">
           <table className="query-table query-metrics-table">
             <caption className="sr-only">Analiz edilen PostgreSQL sorguları ve ham performans metrikleri</caption>
-            <thead><tr><th scope="col">Sorgu</th><th scope="col">Göreli etki</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
+            <thead><tr><th scope="col">Sorgu</th><th scope="col">İnceleme puanı</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
             <tbody>
               {state.data.items.map((query) => (
                 <tr key={query.id} onClick={() => onOpenQuery(query.id)}>
@@ -501,11 +504,11 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                 <h1 id="query-modal-title">{state.data.title}</h1>
                 <p>{windowLabels[window]} · İlk örnek {formatDateTime(state.data.firstSeenAt)} · Son örnek {formatDateTime(state.data.lastSeenAt)}</p>
               </div>
-              <div className="hero-score"><ImpactRing impact={state.data.impactScore} severity={state.data.severity} /><div><strong>Etki puanı</strong><span>Yükseldikçe inceleme önceliği artar</span></div></div>
+              <div className="hero-score"><ImpactRing impact={state.data.impactScore} severity={state.data.severity} /><div><strong>İnceleme puanı</strong><span>Yükseldikçe önce bakılma sırası artar</span></div></div>
             </div>
 
             <div className="modal-reading-guide">
-              <ReadingGuide>Yüksek etki puanı önce bakılması gereken sorguyu, pozitif değişim ise yavaşlamayı gösterir. Shared blok okuması veya geçici yazma yükseliyorsa sorgu planını, bellek kullanımını ve veri erişim biçimini birlikte inceleyin.</ReadingGuide>
+              <ReadingGuide>Yüksek inceleme puanı önce bakılması gereken sorguyu, pozitif değişim ise yavaşlamayı gösterir. Bu puan yalnızca sıralama yapar; SQL üzerinde otomatik değişiklik yapmaz. Shared blok okuması veya geçici yazma yükseliyorsa sorgu planını, bellek kullanımını ve veri erişim biçimini birlikte inceleyin.</ReadingGuide>
             </div>
 
             <div className="query-detail-layout">
@@ -554,15 +557,15 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
 
               <aside className="query-detail-aside">
                 <article className="detail-card score-breakdown-card">
-                  <div className="detail-card-heading"><div><span className="panel-kicker">Göreli puanlama modeli</span><h2>Etki kırılımı</h2></div></div>
-                  <p className="score-model-note"><Info size={14} /> Katkılar seçili penceredeki sorgulara göre öncelik sırasını gösterir; ham yük değerleri aşağıda ayrıca verilir.</p>
+                  <div className="detail-card-heading"><div><span className="panel-kicker">İnceleme önceliği</span><h2>Puanın nedenleri</h2></div></div>
+                  <p className="score-model-note"><Info size={14} /> Bu bölüm yalnızca puan hesaplar ve sorguları öncelik sırasına dizer; veritabanında otomatik değişiklik yapmaz.</p>
                   <div className="score-breakdown-list">
                     {state.data.scoreBreakdown.map((item) => (
                       <div key={item.key} className="breakdown-item">
-                        <div><strong>{item.label}</strong><span>{formatScoreContribution(item.contribution)}/{item.maxContribution} puan</span></div>
+                        <div><strong>{item.label}</strong><span>{formatScoreContribution(item.contribution)} puan · en fazla {item.maxContribution}</span></div>
                         <div className="breakdown-bar"><i style={{ width: `${item.maxContribution ? Math.min(100, (item.contribution / item.maxContribution) * 100) : 0}%` }} /></div>
-                        <small>{item.hint}</small><div className="breakdown-raw"><b>Ham değer</b><span>{scoreMetricValue(item, state.data!)}</span></div>
-                        {(item.percentileScore !== undefined || item.volumeFactor !== undefined || item.fullScoreAt !== undefined) && <div className="score-factors">{item.percentileScore !== undefined && <span>Göreli sıra %{formatNumber(item.percentileScore)}</span>}{item.volumeFactor !== undefined && <span>Hacim katsayısı {formatVolumeFactor(item.volumeFactor)}</span>}{scoreThresholdValue(item) && <span>Tam hacim eşiği {scoreThresholdValue(item)}</span>}</div>}
+                        <small>{item.hint}</small><small className="score-effect">{item.key === 'regression' && !state.data!.hasComparison ? 'Önceki dönem verisi olmadığı için bu başlık puanlanmadı.' : scoreContributionLabel(item.contribution, item.maxContribution)}</small><div className="breakdown-raw"><b>Ölçülen yük</b><span>{scoreMetricValue(item, state.data!)}</span></div>
+                        {item.key === 'regression' && !state.data!.hasComparison ? <div className="score-factors"><span>Karşılaştırma için yeterli geçmiş yok</span></div> : (item.percentileScore !== undefined || item.volumeFactor !== undefined || item.fullScoreAt !== undefined) && <div className="score-factors">{item.percentileScore !== undefined && <span title={'Teknik göreli sıra: %' + formatNumber(item.percentileScore)}>{scoreRelativeLabel(item.percentileScore)}</span>}{item.volumeFactor !== undefined && <span title={'Teknik hacim katsayısı: ' + formatVolumeFactor(item.volumeFactor)}>{scoreVolumeLabel(item.volumeFactor)}</span>}{scoreThresholdValue(item) && <span>Bu başlıktan tam puan için: {scoreThresholdValue(item)}</span>}</div>}
                       </div>
                     ))}
                   </div>

@@ -370,6 +370,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .breakdown-bar { height: 5px; margin-top: 7px; overflow: hidden; border-radius: 5px; background: #edf0f4; }
 .breakdown-bar i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #7185ed, #4c64df); }
 .breakdown-item small { display: block; margin-top: 5px; color: #a0a7b5; font-size: 8px; }
+.breakdown-item .score-effect { color: #69758b; font-weight: 650; }
 .breakdown-raw { display: flex; align-items: center; justify-content: space-between; margin-top: 7px; padding: 6px 7px; border-radius: 6px; background: #f5f6f9; }
 .breakdown-raw b { color: #8d96a7; font-size: 9px; font-weight: 620; }
 .breakdown-raw span { color: #465269; font-size: 10px; }

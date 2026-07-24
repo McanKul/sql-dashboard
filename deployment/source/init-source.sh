@@ -42,6 +42,15 @@ CREATE TABLE events (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE workload_mutations (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    worker_pid integer NOT NULL,
+    mutation_value integer NOT NULL,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 INSERT INTO customers (name, region)
 SELECT 'Musteri ' || g, (ARRAY['TR','EU','MENA','US'])[1 + (g % 4)]
 FROM generate_series(1, 1200) AS g;
@@ -75,6 +84,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     i integer;
+    mutation_id bigint;
     row_count bigint := 0;
     started_at timestamptz := clock_timestamp();
 BEGIN
@@ -92,6 +102,27 @@ BEGIN
         PERFORM count(*) FROM events WHERE metadata ->> 'device' = CASE WHEN i % 2 = 0 THEN 'mobile' ELSE 'desktop' END;
         row_count := row_count + 4;
     END LOOP;
+
+    -- Her fonksiyon cagrisi bir INSERT / UPDATE / DELETE deseni uretir.
+    -- Eklenen satir ayni cagri icinde silindigi icin test tablosu sinirsiz buyumez.
+    INSERT INTO workload_mutations (worker_pid, mutation_value, payload)
+    VALUES (
+        pg_backend_pid(),
+        iterations,
+        jsonb_build_object('source', 'run_advisor_test_workload')
+    )
+    RETURNING id INTO mutation_id;
+
+    UPDATE workload_mutations
+       SET mutation_value = mutation_value + 1,
+           payload = payload || jsonb_build_object('updated', true),
+           updated_at = clock_timestamp()
+     WHERE id = mutation_id;
+
+    DELETE FROM workload_mutations
+     WHERE id = mutation_id;
+
+    row_count := row_count + 3;
 
     RETURN jsonb_build_object(
         'ok', true,

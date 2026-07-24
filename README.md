@@ -61,7 +61,7 @@ Arayüzde şu analiz ekranları bulunur:
 
 ## Kontrollü test yükü
 
-Kaynak veritabanındaki `run_advisor_test_workload(iterations integer)` fonksiyonu dört tekrarlanabilir sorgu desenini çalıştırır. Fonksiyonu sarmalayan komut:
+Kaynak veritabanındaki `run_advisor_test_workload(iterations integer)` fonksiyonu dört tekrarlanabilir `SELECT` deseniyle birlikte kontrollü bir `INSERT` / `UPDATE` / `DELETE` döngüsü çalıştırır. DML döngüsü eklediği satırı aynı çağrı içinde sildiği için test tablosu sınırsız büyümez. Fonksiyonu sarmalayan komut:
 
 ```bash
 bash scripts/run-test-workload.sh 20

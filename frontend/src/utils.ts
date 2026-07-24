@@ -26,6 +26,30 @@ export function formatVolumeFactor(value: number): string {
   return `%${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 4 }).format(value * 100)}`
 }
 
+export function scoreRelativeLabel(percentile: number): string {
+  if (percentile >= 90) return 'Listedeki en yüksek değerlerden'
+  if (percentile >= 70) return 'Listenin üst sıralarında'
+  if (percentile >= 40) return 'Listenin orta sıralarında'
+  return 'Listenin alt sıralarında'
+}
+
+export function scoreVolumeLabel(factor: number): string {
+  if (factor <= 0) return 'Gerçek yük yok'
+  if (factor < 0.01) return 'Gerçek yük çok düşük'
+  if (factor < 0.25) return 'Gerçek yük düşük'
+  if (factor < 0.75) return 'Gerçek yük orta'
+  if (factor < 1) return 'Gerçek yük yüksek'
+  return 'Gerçek yük tam puan eşiğinde'
+}
+
+export function scoreContributionLabel(contribution: number, maximum: number): string {
+  if (contribution <= 0) return 'Toplam puanı etkilemiyor'
+  const ratio = maximum > 0 ? contribution / maximum : 0
+  if (ratio < 0.1) return 'Toplam puana etkisi çok düşük'
+  if (ratio < 0.5) return 'Toplam puanı bir miktar yükseltiyor'
+  return 'Toplam puanı güçlü biçimde yükseltiyor'
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']

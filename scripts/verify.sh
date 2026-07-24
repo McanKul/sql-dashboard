@@ -62,6 +62,15 @@ bash scripts/run-test-workload.sh 5 >/tmp/advisor-workload-result.txt
 grep -q '"ok": true' /tmp/advisor-workload-result.txt || fail "Test fonksiyonu basarisiz"
 pass "run_advisor_test_workload fonksiyonu calisti"
 
+dml_pattern_count="$(docker compose exec -T source-db psql -U postgres -d powa -Atqc \
+  "SELECT count(*) FROM pg_stat_statements
+    WHERE query ~* '^[[:space:]]*(INSERT INTO|UPDATE|DELETE FROM)[[:space:]]+workload_mutations'")"
+mutation_rows="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
+  'SELECT count(*) FROM workload_mutations')"
+[[ "$dml_pattern_count" == "3" && "$mutation_rows" == "0" ]] \
+  || fail "Kontrollu DML desenleri hatali: patterns=$dml_pattern_count, rows=$mutation_rows"
+pass "INSERT/UPDATE/DELETE desenleri olculuyor ve test tablosu birikmiyor"
+
 for attempt in $(seq 1 12); do
   snapshots="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
     "SELECT count(DISTINCT (record).ts) FROM \"PoWA\".powa_statements_history_current WHERE srvid = ${demo_server_id}")"
