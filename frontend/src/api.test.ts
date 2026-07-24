@@ -46,7 +46,15 @@ describe('advisor API contracts', () => {
   })
 
   it('preserves honest p95 unavailability and low non-zero score contributions', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse({
+    vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/predicates')) return Promise.resolve(jsonResponse({
+        window: '24h',
+        queryId: '-42',
+        capability: { available: true, version: '2.1.4', dataAvailable: true, coverage: 'WHERE_FILTER_ONLY', joinsAvailable: false, ddlGenerated: false, reason: 'Yalnız WHERE/filter geçmişi.' },
+        items: [{ qualId: '99', relationId: 10, schemaName: 'public', tableName: 'orders', columns: ['status'], operatorOids: [98], evalType: 'FILTER', occurrences: 12, rowsProcessed: 1000, rowsFiltered: 750, filterRatio: .75, observedFrom: '2026-07-23T07:00:00Z', observedTo: '2026-07-23T08:00:00Z', sampleCount: 4, signal: 'REVIEW', recommendation: 'Planla doğrulayın.' }],
+      }))
+      return Promise.resolve(jsonResponse({
       serverId: 1,
       databaseId: 2,
       databaseName: 'app',
@@ -75,7 +83,8 @@ describe('advisor API contracts', () => {
       scoreBreakdown: { physicalRead: { weight: 0.2, contribution: 0.03, percentileScore: 100, volumeFactor: 0.006, absoluteValue: 6, fullScoreAt: 1000, unit: 'blocks' } },
       trend: [{ timestamp: '2026-07-23T08:00:00Z', totalExecTimeMs: 20, calls: 10 }],
       comparison: { currentMeanMs: 2, previousMeanMs: 0, regressionPercent: 0, currentCalls: 10, previousCalls: 0 },
-    }))))
+      }))
+    }))
 
     const { data } = await advisorApi.getQuery('1:2:-42', '24h')
 
@@ -83,5 +92,31 @@ describe('advisor API contracts', () => {
     expect(data.durationDistribution).toEqual({ available: false, reason: 'Dağılım verisi yok.' })
     expect(data.rowsPerCall).toBe(3)
     expect(data.scoreBreakdown[0]).toMatchObject({ contribution: 0.03, volumeFactor: 0.006, fullScoreAt: 1000 })
+    expect(data.predicates.capability).toMatchObject({ available: true, coverage: 'WHERE_FILTER_ONLY', joinsAvailable: false, ddlGenerated: false })
+    expect(data.predicates.items[0]).toMatchObject({ tableName: 'orders', columns: ['status'], occurrences: 12, rowsProcessed: 1000, rowsFiltered: 750, signal: 'REVIEW' })
+  })
+
+  it('requests on-demand HypoPG validation with identifiers only', async () => {
+    const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toContain('/queries/-42/index-evaluations?window=24h')
+      expect(init?.method).toBe('POST')
+      expect(JSON.parse(String(init?.body))).toEqual({ serverId: 1, databaseId: 2, qualId: '99', relationId: 10 })
+      return Promise.resolve(jsonResponse({
+        status: 'VALIDATED',
+        reasonCode: 'COST_REDUCTION_CONFIRMED',
+        message: 'Sanal index planda kullanildi.',
+        candidate: { method: 'btree', columns: ['status'], createIndexSql: 'CREATE INDEX CONCURRENTLY idx ON public.orders (status);', copyable: true },
+        validation: { mode: 'GENERIC_PLAN', hypopgVersion: '1.4.3', baselineTotalCost: 460, hypotheticalTotalCost: 120, costReductionPercent: 73.91, hypotheticalIndexUsed: true, estimatedIndexSizeBytes: 1024, tableSizeBytes: 4096, evaluatedAt: '2026-07-24T14:00:00Z' },
+        confidence: { level: 'HIGH', reasons: ['Sanal index kullanildi.'] },
+        ddlExecuted: false,
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { data } = await advisorApi.evaluateIndex('1:2:-42', '24h', {
+      qualId: '99', relationId: 10, schemaName: 'public', tableName: 'orders', columns: ['status'], operatorOids: [98], evalType: 'FILTER', occurrences: 12, rowsProcessed: 1000, rowsFiltered: 750, filterRatio: .75, observedFrom: '2026-07-24T13:00:00Z', observedTo: '2026-07-24T14:00:00Z', sampleCount: 4, signal: 'REVIEW', recommendation: 'Planla dogrulayin.',
+    })
+
+    expect(data).toMatchObject({ status: 'VALIDATED', ddlExecuted: false, candidate: { columns: ['status'], copyable: true } })
   })
 })

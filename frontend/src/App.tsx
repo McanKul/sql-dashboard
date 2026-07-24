@@ -37,7 +37,9 @@ import type {
   OverviewStats,
   PageId,
   QueryDetail,
+  QueryIndexAdvice,
   QueryListParams,
+  QueryPredicate,
   QuerySummary,
   ServerOption,
   Severity,
@@ -443,14 +445,104 @@ function scoreThresholdValue(item: QueryDetail['scoreBreakdown'][number]): strin
   return `${formatLargeNumber(item.fullScoreAt)}${unit ? ` ${unit}` : ''}`
 }
 
+function predicateSignalLabel(signal: QueryDetail['predicates']['items'][number]['signal']): string {
+  const labels = {
+    INDEX_CANDIDATE: 'Index adayı gözlemi',
+    REVIEW: 'Planla birlikte incele',
+    INDEX_CONDITION_OBSERVED: 'Index koşulu gözlendi',
+    OBSERVED: 'Filtre gözlendi',
+    INSUFFICIENT_DATA: 'Yetersiz örnek',
+  }
+  return labels[signal]
+}
+
+function predicateSignalSeverity(signal: QueryDetail['predicates']['items'][number]['signal']): Severity {
+  return signal === 'INDEX_CANDIDATE' || signal === 'REVIEW' || signal === 'INSUFFICIENT_DATA'
+    ? 'warning'
+    : 'healthy'
+}
+
+function predicateAdviceKey(predicate: QueryPredicate): string {
+  return `${predicate.qualId}:${predicate.relationId}:${predicate.evalType}`
+}
+
+function indexAdviceLabel(status: QueryIndexAdvice['status']): string {
+  return {
+    VALIDATED: 'HypoPG doğruladı',
+    NO_IMPROVEMENT: 'Plan iyileşmedi',
+    UNAVAILABLE: 'Doğrulama kullanılamıyor',
+    UNSAFE: 'Güvenle planlanamadı',
+    INSUFFICIENT: 'Daha fazla örnek gerekli',
+  }[status]
+}
+
+function PredicateIndexEvaluation({
+  predicate,
+  state,
+  copied,
+  onEvaluate,
+  onCopy,
+}: {
+  predicate: QueryPredicate
+  state?: Loadable<QueryIndexAdvice>
+  copied: boolean
+  onEvaluate: () => void
+  onCopy: (statement: string) => void
+}) {
+  const eligible = predicate.evalType === 'FILTER'
+    && (predicate.signal === 'INDEX_CANDIDATE' || predicate.signal === 'REVIEW')
+    && predicate.schemaName !== 'unknown'
+    && predicate.columns.length === 1
+  if (!eligible) return null
+
+  const advice = state?.data
+  return (
+    <div className="index-evaluation" aria-live="polite">
+      {!state && (
+        <div className="index-evaluation-start">
+          <div><strong>Gerçek SQL önerisi henüz doğrulanmadı</strong><span>HypoPG kaynakta sanal index kurup yalnız EXPLAIN maliyetini karşılaştırır.</span></div>
+          <button type="button" className="hypopg-button" onClick={onEvaluate}><Sparkles size={15} /> HypoPG ile doğrula</button>
+        </div>
+      )}
+      {state?.status === 'loading' && <div className="index-evaluation-loading"><LoaderCircle className="spin" size={17} /> Baseline ve sanal index planları karşılaştırılıyor…</div>}
+      {state?.status === 'error' && <div className="index-evaluation-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
+      {state?.status === 'success' && advice && (
+        <div className={`index-evaluation-result ${advice.status.toLowerCase()}`}>
+          <div className="index-evaluation-status">
+            {advice.status === 'VALIDATED' ? <CheckCircle2 size={18} /> : <Info size={18} />}
+            <div><strong>{indexAdviceLabel(advice.status)}</strong><span>{advice.message}</span></div>
+          </div>
+          {advice.status === 'VALIDATED' && advice.validation && advice.candidate && (
+            <>
+              <div className="index-plan-metrics">
+                <div><span>Başlangıç maliyeti</span><strong>{formatNumber(advice.validation.baselineTotalCost)}</strong><small>{advice.validation.baselineAccess || 'Plan düğümü'}</small></div>
+                <div><span>Sanal index maliyeti</span><strong>{formatNumber(advice.validation.hypotheticalTotalCost)}</strong><small>{advice.validation.hypotheticalAccess || 'Plan düğümü'}</small></div>
+                <div><span>Tahmini düşüş</span><strong>%{formatNumber(advice.validation.costReductionPercent)}</strong><small>Planner cost, süre değil</small></div>
+                <div><span>Tahmini index boyutu</span><strong>{formatBytes(advice.validation.estimatedIndexSizeBytes)}</strong><small>HypoPG {advice.validation.hypopgVersion}</small></div>
+              </div>
+              <div className="index-sql-heading"><div><strong>Kopyalanabilir index SQL’i</strong><span>İncelemeden çalıştırmayın; uygulama bu DDL’i yürütmedi.</span></div><button type="button" className="copy-sql-button" onClick={() => onCopy(advice.candidate!.createIndexSql)}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'Index SQL’ini kopyala'}</button></div>
+              <pre className="index-sql"><code>{advice.candidate.createIndexSql}</code></pre>
+              <div className="index-confidence"><span>{advice.confidence?.level === 'HIGH' ? 'Yüksek' : 'Orta'} güven</span>{advice.confidence?.reasons.map((reason) => <small key={reason}>{reason}</small>)}</div>
+            </>
+          )}
+          <small className="ddl-safety-note"><ShieldAlert size={13} /> ddlExecuted=false · Gerçek index oluşturulmadı</small>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function QueryDetailModal({ queryId, window, onClose }: { queryId: string; window: TimeWindow; onClose: () => void }) {
   const [state, setState] = useState<Loadable<QueryDetail>>({ status: 'loading' })
   const [copied, setCopied] = useState(false)
+  const [indexAdvice, setIndexAdvice] = useState<Record<string, Loadable<QueryIndexAdvice>>>({})
+  const [copiedIndexKey, setCopiedIndexKey] = useState<string | null>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
 
   const load = () => {
     const controller = new AbortController()
     setState({ status: 'loading' })
+    setIndexAdvice({})
     advisorApi.getQuery(queryId, window, controller.signal).then(({ data }) => {
       setState({ status: 'success', data })
     }).catch((error: unknown) => {
@@ -480,6 +572,30 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
     await navigator.clipboard.writeText(state.data.fullSql)
     setCopied(true)
     globalThis.setTimeout(() => setCopied(false), 1800)
+  }
+
+  const evaluateIndex = async (predicate: QueryPredicate) => {
+    const key = predicateAdviceKey(predicate)
+    setIndexAdvice((current) => ({ ...current, [key]: { status: 'loading' } }))
+    try {
+      const { data } = await advisorApi.evaluateIndex(queryId, window, predicate)
+      setIndexAdvice((current) => ({ ...current, [key]: { status: 'success', data } }))
+    } catch (error: unknown) {
+      setIndexAdvice((current) => ({
+        ...current,
+        [key]: { status: 'error', error: error instanceof Error ? error.message : 'HypoPG doğrulaması alınamadı.' },
+      }))
+    }
+  }
+
+  const copyIndexSql = async (key: string, statement: string) => {
+    try {
+      await navigator.clipboard.writeText(statement)
+      setCopiedIndexKey(key)
+      globalThis.setTimeout(() => setCopiedIndexKey(null), 1800)
+    } catch {
+      setIndexAdvice((current) => ({ ...current, [key]: { status: 'error', error: 'Index SQL’i panoya kopyalanamadı.' } }))
+    }
   }
 
   const totalSharedBlocks = (state.data?.sharedBlocksHit ?? 0) + (state.data?.sharedBlocksRead ?? 0)
@@ -538,6 +654,45 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                       </div>
                     ))}
                   </div>
+                </article>
+
+                <article className="detail-card predicate-card">
+                  <div className="detail-card-heading">
+                    <div><span className="panel-kicker">pg_qualstats {state.data.predicates.capability.version || ''}</span><h2>WHERE filtreleri ve index adayı gözlemleri</h2></div>
+                    <span className="finding-count">{state.data.predicates.items.length} gözlem</span>
+                  </div>
+                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.predicates.capability.reason} Bu alan otomatik <code>CREATE INDEX</code> çalıştırmaz.</span></div>
+                  {!state.data.predicates.capability.available ? (
+                    <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>Predicate telemetrisi kapalı</strong><p>Kaynak sunucuda pg_qualstats ve PoWA datasource kaydını etkinleştirin.</p></div></div>
+                  ) : state.data.predicates.items.length ? (
+                    <div className="predicate-list">
+                      {state.data.predicates.items.map((predicate) => (
+                        <div className={`predicate-item ${predicate.signal.toLowerCase()}`} key={`${predicate.qualId}:${predicate.relationId}:${predicate.evalType}`}>
+                          <div className="predicate-item-heading">
+                            <div><strong>{predicate.schemaName}.{predicate.tableName}</strong><span>{predicate.columns.length ? predicate.columns.join(', ') : `relation OID ${predicate.relationId}`}</span></div>
+                            <SeverityBadge severity={predicateSignalSeverity(predicate.signal)} label={predicateSignalLabel(predicate.signal)} />
+                          </div>
+                          <div className="predicate-metrics">
+                            <div><span>Eleme oranı</span><strong>{predicate.filterRatio == null ? '—' : `%${formatNumber(predicate.filterRatio * 100)}`}</strong></div>
+                            <div><span>Örneklenen çalışma</span><strong>{formatLargeNumber(predicate.occurrences)}</strong></div>
+                            <div><span>İşlenen satır</span><strong>{formatLargeNumber(predicate.rowsProcessed)}</strong></div>
+                            <div><span>Elenen satır</span><strong>{formatLargeNumber(predicate.rowsFiltered)}</strong></div>
+                          </div>
+                          <div className="predicate-recommendation"><Sparkles size={16} /><div><strong>Güvenli öneri</strong><span>{predicate.recommendation}</span></div></div>
+                          <small className="predicate-footnote">{predicate.sampleCount} snapshot · {predicate.evalType === 'FILTER' ? 'scan sonrası WHERE filtresi' : predicate.evalType === 'INDEX_CONDITION' ? 'index koşulu' : 'predicate türü bilinmiyor'} · operator OID {predicate.operatorOids.join(', ') || 'yok'}</small>
+                          <PredicateIndexEvaluation
+                            predicate={predicate}
+                            state={indexAdvice[predicateAdviceKey(predicate)]}
+                            copied={copiedIndexKey === predicateAdviceKey(predicate)}
+                            onEvaluate={() => evaluateIndex(predicate)}
+                            onCopy={(statement) => copyIndexSql(predicateAdviceKey(predicate), statement)}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="predicate-empty"><Info size={20} /><div><strong>Bu pencerede predicate örneği yok</strong><p>Sorgu yeniden çalışıp collector snapshot aldığında bu alan otomatik dolar.</p></div></div>
+                  )}
                 </article>
 
                 <article className="detail-card comparison-card">

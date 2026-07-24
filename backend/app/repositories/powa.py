@@ -504,6 +504,40 @@ class PowaRepository:
                 )
                 return [dict(row) for row in await cursor.fetchall()]
 
+    async def predicate_evidence(
+        self,
+        *,
+        window: str,
+        server_id: int,
+        database_id: int,
+        query_id: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT *
+                    FROM advisor.predicate_metrics(
+                        %s::interval,
+                        %s::integer,
+                        %s::oid,
+                        %s::bigint
+                    )
+                    """,
+                    (interval, server_id, database_id, query_id),
+                )
+                rows = [dict(row) for row in await cursor.fetchall()]
+                await cursor.execute(
+                    """
+                    SELECT *
+                    FROM advisor.predicate_capability(%s::integer)
+                    """,
+                    (server_id,),
+                )
+                capability = dict(await cursor.fetchone())
+        return rows, capability
+
     async def annotate(
         self,
         *,

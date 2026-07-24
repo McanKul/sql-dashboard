@@ -357,7 +357,7 @@ WITH period AS (
             FROM "PoWA".powa_catalog_roles AS excluded_role
            WHERE excluded_role.srvid = d.server_id
              AND excluded_role.oid = d.user_id
-             AND excluded_role.rolname = 'powa_collector'
+             AND excluded_role.rolname IN ('powa_collector', 'advisor_evaluator')
       )
     GROUP BY d.server_id, d.database_id, d.query_id
 ), enriched AS (
@@ -374,9 +374,16 @@ WITH period AS (
         ) / NULLIF((p.previous_total_exec_time_ms / NULLIF(p.previous_calls, 0)), 0) AS regression_percent
     FROM period AS p
     JOIN (
-        SELECT srvid, dbid, queryid, min(query) AS query
-          FROM "PoWA".powa_statements
-         GROUP BY srvid, dbid, queryid
+        SELECT statement.srvid, statement.dbid, statement.queryid, min(statement.query) AS query
+          FROM "PoWA".powa_statements AS statement
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM "PoWA".powa_catalog_roles AS excluded_role
+              WHERE excluded_role.srvid = statement.srvid
+                AND excluded_role.oid = statement.userid
+                AND excluded_role.rolname IN ('powa_collector', 'advisor_evaluator')
+         )
+         GROUP BY statement.srvid, statement.dbid, statement.queryid
     ) AS s
       ON s.srvid = p.server_id
      AND s.dbid = p.database_id
@@ -1618,6 +1625,234 @@ WHERE latest.transaction_started_at IS NOT NULL
   AND COALESCE(latest.state, '') <> 'idle'
   AND COALESCE(latest.application_name, '') !~ '^PoWA collector';
 
+-- pg_qualstats evidence is deliberately kept outside the impact score.  This
+-- adapter exposes only predicates that PoWA has already persisted in the
+-- repository and never emits executable DDL.  Stock PoWA 5.2 transfers
+-- WHERE/filter predicates, but not column-to-column JOIN predicates.
+CREATE OR REPLACE FUNCTION advisor.predicate_metrics(
+    p_window interval DEFAULT interval '24 hours',
+    p_server_id integer DEFAULT NULL,
+    p_database_id oid DEFAULT NULL,
+    p_query_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    server_id integer,
+    server_alias text,
+    database_id oid,
+    database_name text,
+    query_id bigint,
+    user_id oid,
+    qual_id bigint,
+    relation_id oid,
+    schema_name text,
+    table_name text,
+    column_names text[],
+    operator_oids oid[],
+    eval_type text,
+    occurrences bigint,
+    rows_processed bigint,
+    rows_filtered bigint,
+    filter_ratio double precision,
+    observed_from timestamptz,
+    observed_to timestamptz,
+    sample_count bigint,
+    signal text,
+    recommendation text
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor
+AS $$
+WITH historical_samples AS (
+    SELECT
+        h.srvid AS server_id,
+        h.qualid AS qual_id,
+        h.queryid AS query_id,
+        h.dbid AS database_id,
+        h.userid AS user_id,
+        (sample_record).ts AS sample_at,
+        (sample_record).occurences AS occurrences,
+        (sample_record).execution_count AS rows_processed,
+        (sample_record).nbfiltered AS rows_filtered
+    FROM "PoWA".powa_qualstats_quals_history AS h
+    CROSS JOIN LATERAL unnest(h.records) AS sample_record
+    WHERE h.coalesce_range && tstzrange(now() - p_window, now(), '[]')
+      AND (sample_record).ts >= now() - p_window
+      AND (sample_record).ts <= now()
+), current_samples AS (
+    SELECT
+        c.srvid,
+        c.qualid,
+        c.queryid,
+        c.dbid,
+        c.userid,
+        c.ts,
+        c.occurences,
+        c.execution_count,
+        c.nbfiltered
+    FROM "PoWA".powa_qualstats_quals_history_current AS c
+    WHERE c.ts >= now() - p_window
+      AND c.ts <= now()
+), samples AS (
+    SELECT * FROM historical_samples
+    UNION ALL
+    SELECT * FROM current_samples
+), metrics AS (
+    SELECT
+        s.server_id,
+        s.qual_id,
+        s.query_id,
+        s.database_id,
+        s.user_id,
+        sum(COALESCE(s.occurrences, 0))::bigint AS occurrences,
+        sum(COALESCE(s.rows_processed, 0))::bigint AS rows_processed,
+        sum(COALESCE(s.rows_filtered, 0))::bigint AS rows_filtered,
+        min(s.sample_at) AS observed_from,
+        max(s.sample_at) AS observed_to,
+        count(*)::bigint AS sample_count
+    FROM samples AS s
+    WHERE (p_server_id IS NULL OR s.server_id = p_server_id)
+      AND (p_database_id IS NULL OR s.database_id = p_database_id)
+      AND (p_query_id IS NULL OR s.query_id = p_query_id)
+    GROUP BY s.server_id, s.qual_id, s.query_id, s.database_id, s.user_id
+), predicate_columns AS (
+    SELECT
+        q.srvid AS server_id,
+        q.qualid AS qual_id,
+        q.queryid AS query_id,
+        q.dbid AS database_id,
+        q.userid AS user_id,
+        predicate.relid AS relation_id,
+        predicate.eval_type::text AS raw_eval_type,
+        COALESCE(ns.nspname::text, 'unknown') AS schema_name,
+        COALESCE(cls.relname::text, 'relation-' || predicate.relid::text) AS table_name,
+        COALESCE(
+            array_agg(attr.attname::text ORDER BY predicate.attnum)
+                FILTER (WHERE attr.attname IS NOT NULL),
+            ARRAY[]::text[]
+        ) AS column_names,
+        array_agg(predicate.opno ORDER BY predicate.attnum)::oid[] AS operator_oids
+    FROM "PoWA".powa_qualstats_quals AS q
+    CROSS JOIN LATERAL unnest(q.quals) AS predicate(relid, attnum, opno, eval_type)
+    LEFT JOIN "PoWA".powa_catalog_class AS cls
+      ON cls.srvid = q.srvid AND cls.dbid = q.dbid AND cls.oid = predicate.relid
+    LEFT JOIN "PoWA".powa_catalog_namespace AS ns
+      ON ns.srvid = cls.srvid AND ns.dbid = cls.dbid AND ns.oid = cls.relnamespace
+    LEFT JOIN "PoWA".powa_catalog_attribute AS attr
+      ON attr.srvid = q.srvid AND attr.dbid = q.dbid
+     AND attr.attrelid = predicate.relid AND attr.attnum = predicate.attnum
+    GROUP BY
+        q.srvid, q.qualid, q.queryid, q.dbid, q.userid,
+        predicate.relid, predicate.eval_type, ns.nspname, cls.relname
+), evidence AS (
+    SELECT
+        m.*,
+        pc.relation_id,
+        pc.schema_name,
+        pc.table_name,
+        pc.column_names,
+        pc.operator_oids,
+        CASE pc.raw_eval_type
+            WHEN 'f' THEN 'FILTER'
+            WHEN 'i' THEN 'INDEX_CONDITION'
+            ELSE 'UNKNOWN'
+        END AS eval_type,
+        LEAST(
+            1.0,
+            GREATEST(0.0, m.rows_filtered::double precision / NULLIF(m.rows_processed, 0))
+        ) AS filter_ratio
+    FROM metrics AS m
+    JOIN predicate_columns AS pc
+      ON pc.server_id = m.server_id
+     AND pc.qual_id = m.qual_id
+     AND pc.query_id = m.query_id
+     AND pc.database_id = m.database_id
+     AND pc.user_id = m.user_id
+), classified AS (
+    SELECT
+        e.*,
+        CASE
+            WHEN e.sample_count < 2 OR e.occurrences < 5 OR e.rows_processed < 1000
+                THEN 'INSUFFICIENT_DATA'
+            WHEN e.eval_type = 'INDEX_CONDITION'
+                THEN 'INDEX_CONDITION_OBSERVED'
+            WHEN e.filter_ratio >= 0.50 AND e.occurrences >= 20 AND e.rows_processed >= 10000
+                THEN 'INDEX_CANDIDATE'
+            WHEN e.filter_ratio >= 0.20 AND e.occurrences >= 10
+                THEN 'REVIEW'
+            ELSE 'OBSERVED'
+        END AS signal
+    FROM evidence AS e
+)
+SELECT
+    c.server_id,
+    COALESCE(server.alias::text, server.hostname::text, 'server-' || c.server_id::text),
+    c.database_id,
+    COALESCE(db.datname::text, 'db-' || c.database_id::text),
+    c.query_id,
+    c.user_id,
+    c.qual_id,
+    c.relation_id,
+    c.schema_name,
+    c.table_name,
+    c.column_names,
+    c.operator_oids,
+    c.eval_type,
+    c.occurrences,
+    c.rows_processed,
+    c.rows_filtered,
+    c.filter_ratio,
+    c.observed_from,
+    c.observed_to,
+    c.sample_count,
+    c.signal,
+    CASE c.signal
+        WHEN 'INSUFFICIENT_DATA'
+            THEN 'Ornek sayisi dusuk; index karari vermeden once daha fazla predicate verisi toplayin.'
+        WHEN 'INDEX_CONDITION_OBSERVED'
+            THEN 'Bu predicate planlarda index kosulu olarak goruluyor; mevcut indexin etkinligini EXPLAIN ile dogrulayin.'
+        WHEN 'INDEX_CANDIDATE'
+            THEN 'Yuksek eleme oranli WHERE filtresi; HypoPG ve EXPLAIN ile sanal index faydasini dogrulayin.'
+        WHEN 'REVIEW'
+            THEN 'WHERE filtresi kayda deger satir eliyor; tablo boyutu ve sorgu planiyla birlikte inceleyin.'
+        ELSE 'Predicate gozlemlendi; daha guclu bir index sinyali icin veri birikimini izleyin.'
+    END
+FROM classified AS c
+LEFT JOIN "PoWA".powa_servers AS server ON server.id = c.server_id
+LEFT JOIN "PoWA".powa_databases AS db
+  ON db.srvid = c.server_id AND db.oid = c.database_id
+WHERE c.schema_name !~ '^(pg_|information_schema$)'
+ORDER BY
+    CASE c.signal
+        WHEN 'INDEX_CANDIDATE' THEN 1
+        WHEN 'REVIEW' THEN 2
+        WHEN 'INDEX_CONDITION_OBSERVED' THEN 3
+        WHEN 'OBSERVED' THEN 4
+        ELSE 5
+    END,
+    c.filter_ratio DESC NULLS LAST,
+    c.occurrences DESC;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor.predicate_capability(p_server_id integer)
+RETURNS TABLE (
+    available boolean,
+    version text
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor
+AS $$
+SELECT
+    COALESCE(bool_or(config.enabled), false) AS available,
+    max(config.version)::text AS version
+FROM "PoWA".powa_extension_config AS config
+WHERE config.srvid = p_server_id
+  AND config.extname = 'pg_qualstats';
+$$;
+
 GRANT USAGE ON SCHEMA advisor TO advisor_api;
 GRANT SELECT ON ALL TABLES IN SCHEMA advisor TO advisor_api;
 GRANT INSERT, UPDATE ON advisor.query_annotations TO advisor_api;
@@ -1629,6 +1864,10 @@ GRANT EXECUTE ON FUNCTION advisor.index_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.database_io_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.io_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.operation_metrics(interval) TO advisor_api;
+REVOKE ALL ON FUNCTION advisor.predicate_metrics(interval, integer, oid, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION advisor.predicate_metrics(interval, integer, oid, bigint) TO advisor_api;
+REVOKE ALL ON FUNCTION advisor.predicate_capability(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION advisor.predicate_capability(integer) TO advisor_api;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA advisor GRANT SELECT ON TABLES TO advisor_api;
 ALTER DEFAULT PRIVILEGES IN SCHEMA advisor GRANT EXECUTE ON FUNCTIONS TO advisor_api;

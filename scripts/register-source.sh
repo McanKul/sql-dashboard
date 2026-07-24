@@ -22,6 +22,7 @@ PoWA:
   --frequency SECONDS         Snapshot araligi; varsayilan: 60, minimum: 5
   --coalesce COUNT            Arsiv birlestirme araligi; varsayilan: 100, minimum: 5
   --retention INTERVAL        PostgreSQL interval; varsayilan: "90 days"
+  pg_qualstats               Iterasyon 2.1-B'de tum kayitlarda zorunlu datasource
 
 Kaynak hazirlama (opsiyonel):
   --prepare                   Monitoring DB, rol, extension ve grant'lari uygula
@@ -242,16 +243,28 @@ probe="$({ printf '%s\n' "$source_password"; } | docker compose exec -T reposito
     --host "$1" --port "$2" --username "$4" --dbname "$3" --command \
     "SELECT (SELECT extversion FROM pg_extension WHERE extname = '\''powa'\''),
             EXISTS (SELECT 1 FROM pg_extension WHERE extname = '\''pg_stat_statements'\''),
+            (SELECT extversion FROM pg_extension WHERE extname = '\''pg_qualstats'\''),
             pg_has_role(current_user, '\''pg_read_all_stats'\'', '\''member'\''),
             pg_has_role(current_user, '\''powa_snapshot'\'', '\''member'\''),
-            (SELECT count(*) >= 0 FROM pg_stat_statements);"
+            (SELECT count(*) >= 0 FROM pg_stat_statements),
+            (SELECT count(*) >= 0 FROM \"PoWA\".powa_qualstats_src(0)),
+            COALESCE((
+              SELECT has_function_privilege(
+                       current_user,
+                       format('\''%I.pg_qualstats_reset()'\'', n.nspname),
+                       '\''EXECUTE'\''
+                     )
+                FROM pg_extension e
+                JOIN pg_namespace n ON n.oid = e.extnamespace
+               WHERE e.extname = '\''pg_qualstats'\''
+            ), false);"
 ' _ "$source_host" "$source_port" "$monitoring_db" "$collector_user")" || fail "Collector roluyle kaynak preflight basarisiz. --prepare kullanin veya docs/INSTALLATION.md adimlarini uygulayin."
 
-IFS='|' read -r powa_version pgss_ready read_stats snapshot_role preload_ready <<< "$probe"
+IFS='|' read -r powa_version pgss_ready pgqs_version read_stats snapshot_role pgss_callable pgqs_source_ready pgqs_reset_ready <<< "$probe"
 [[ "$powa_version" =~ ^([4-9]|[1-9][0-9]+)\. ]] || fail "Kaynak PoWA 4+ olmali; bulunan: ${powa_version:-yok}"
-[[ "$pgss_ready" == t && "$read_stats" == t && "$snapshot_role" == t && "$preload_ready" == t ]] \
-  || fail "Kaynak preflight eksik: pgss=${pgss_ready}, read_stats=${read_stats}, powa_snapshot=${snapshot_role}, preload=${preload_ready}"
-info "Kaynak preflight gecti (PoWA ${powa_version})"
+[[ "$pgss_ready" == t && "$pgqs_version" =~ ^2\.1\. && "$read_stats" == t && "$snapshot_role" == t && "$pgss_callable" == t && "$pgqs_source_ready" == t && "$pgqs_reset_ready" == t ]] \
+  || fail "Kaynak preflight eksik: pgss=${pgss_ready}, pg_qualstats=${pgqs_version:-yok}, read_stats=${read_stats}, powa_snapshot=${snapshot_role}, pgss_callable=${pgss_callable}, pgqs_source=${pgqs_source_ready}, pgqs_reset=${pgqs_reset_ready}"
+info "Kaynak preflight gecti (PoWA ${powa_version}, pg_qualstats ${pgqs_version})"
 
 repo_psql=(docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 --dbname powa_repository --tuples-only --no-align)
 repo_query() {
@@ -283,6 +296,8 @@ if [[ -n "$alias_id" ]]; then
     --set=server_id="$alias_id" --set=source_host="$source_host" --set=source_port="$source_port" \
     --set=source_alias="$source_alias" --set=collector_user="$collector_user" --set=monitoring_db="$monitoring_db" \
     --set=frequency="$frequency" --set=coalesce="$coalesce" --set=retention="$retention"
+  activation_ok="$(repo_query 'SELECT "PoWA".powa_activate_extension(:'"'"'server_id'"'"'::integer, '"'"'pg_qualstats'"'"');' --set=server_id="$alias_id")"
+  [[ "$activation_ok" == t ]] || fail "Mevcut PoWA kaydinda pg_qualstats etkinlestirilemedi"
   server_id="$alias_id"
   info "Mevcut PoWA server id ${server_id} idempotent olarak guncellendi"
 else
@@ -292,7 +307,7 @@ else
         alias => :'"'"'source_alias'"'"', username => :'"'"'collector_user'"'"', password => NULL,
         dbname => :'"'"'monitoring_db'"'"', frequency => :'"'"'frequency'"'"'::integer,
         powa_coalesce => :'"'"'coalesce'"'"'::integer, retention => :'"'"'retention'"'"'::interval,
-        allow_ui_connection => false, extensions => ARRAY[]::text[]);' \
+        allow_ui_connection => false, extensions => ARRAY['"'"'pg_qualstats'"'"']::text[]);' \
     --set=source_host="$source_host" --set=source_port="$source_port" --set=source_alias="$source_alias" \
     --set=collector_user="$collector_user" --set=monitoring_db="$monitoring_db" --set=frequency="$frequency" \
     --set=coalesce="$coalesce" --set=retention="$retention"

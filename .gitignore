@@ -8,8 +8,7 @@ __pycache__/
 htmlcov/
 *.py[cod]
 *.log
-backups/*.dump
-backups/*.sql
+backups/
 runtime/collector/sources/*
 !runtime/collector/sources/.gitkeep
 *.pass

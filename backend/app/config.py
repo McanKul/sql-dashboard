@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     sql_text_visibility: str = "authorized"
     retention_days: int = 90
     log_level: str = "INFO"
+    evaluator_url: str | None = None
+    evaluator_token: str = "advisor-dev-evaluator-token"
+    evaluator_timeout_seconds: float = Field(default=4.0, gt=0, le=15)
 
     @field_validator("database_url")
     @classmethod

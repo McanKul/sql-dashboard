@@ -9,13 +9,15 @@ from app.api.router import (
     _cache_hit_percent,
     _database_io_payload,
     _index_payload,
+    _predicate_payload,
     _summarize_collectors,
     io_telemetry,
     overview,
+    query_predicates,
     queries,
 )
 from app.repositories.powa import findings_for, interval_for, repository, score_breakdown, serialize_query
-from app.schemas import AnnotationUpdate, IndexResponse
+from app.schemas import AnnotationUpdate, IndexResponse, PredicateResponse
 from app.security import can_view_sql, mask_sql
 
 
@@ -258,6 +260,97 @@ def test_insufficient_index_history_is_not_reported_as_healthy() -> None:
     assert response.items[0].signalLevel == "UNKNOWN"
     assert response.items[0].signal == "INSUFFICIENT_DATA"
     assert response.summary.candidateSignals == 0
+
+
+def test_predicate_contract_keeps_sampled_semantics_and_never_emits_ddl() -> None:
+    payload = _predicate_payload(
+        {
+            "server_id": 1,
+            "database_id": 16384,
+            "query_id": -42,
+            "qual_id": 99,
+            "relation_id": 10,
+            "schema_name": "public",
+            "table_name": "orders",
+            "column_names": ["status"],
+            "operator_oids": [98],
+            "eval_type": "FILTER",
+            "occurrences": 12,
+            "rows_processed": 1000,
+            "rows_filtered": 750,
+            "filter_ratio": 0.75,
+            "observed_from": __import__("datetime").datetime(2026, 7, 24, 10, 0),
+            "observed_to": __import__("datetime").datetime(2026, 7, 24, 11, 0),
+            "sample_count": 4,
+            "signal": "REVIEW",
+            "recommendation": "HypoPG ve EXPLAIN ile dogrulayin.",
+        }
+    )
+    response = PredicateResponse.model_validate(
+        {
+            "window": "24h",
+            "queryId": "-42",
+            "capability": {
+                "available": True,
+                "version": "2.1.4",
+                "dataAvailable": True,
+                "coverage": "WHERE_FILTER_ONLY",
+                "joinsAvailable": False,
+                "ddlGenerated": False,
+                "reason": "Yalniz WHERE/filter gecmisi.",
+            },
+            "items": [payload],
+        }
+    )
+
+    assert response.items[0].queryId == "-42"
+    assert response.items[0].occurrences == 12
+    assert response.items[0].rowsProcessed == 1000
+    assert response.items[0].rowsFiltered == 750
+    assert response.capability.coverage == "WHERE_FILTER_ONLY"
+    assert response.capability.joinsAvailable is False
+    assert response.capability.ddlGenerated is False
+
+
+@pytest.mark.asyncio
+async def test_predicate_route_exposes_where_only_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed = __import__("datetime").datetime(2026, 7, 24, 11, 0)
+
+    async def predicate_evidence(**kwargs: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+        assert kwargs == {"window": "1h", "server_id": 1, "database_id": 16384, "query_id": -42}
+        return [
+            {
+                "server_id": 1,
+                "database_id": 16384,
+                "query_id": -42,
+                "qual_id": 99,
+                "relation_id": 10,
+                "schema_name": "public",
+                "table_name": "orders",
+                "column_names": ["status"],
+                "operator_oids": [98],
+                "eval_type": "FILTER",
+                "occurrences": 12,
+                "rows_processed": 1000,
+                "rows_filtered": 750,
+                "filter_ratio": 0.75,
+                "observed_from": observed,
+                "observed_to": observed,
+                "sample_count": 4,
+                "signal": "REVIEW",
+                "recommendation": "Planla dogrulayin.",
+            }
+        ], {"available": True, "version": "2.1.4"}
+
+    monkeypatch.setattr(repository, "predicate_evidence", predicate_evidence)
+
+    result = await query_predicates(query_id=-42, window="1h", server_id=1, database_id=16384)
+
+    assert result["queryId"] == "-42"
+    assert result["capability"]["dataAvailable"] is True
+    assert result["capability"]["joinsAvailable"] is False
+    assert result["capability"]["ddlGenerated"] is False
+    assert "statement cagri sayisi degildir" in result["capability"]["reason"]
 
 
 @pytest.mark.asyncio

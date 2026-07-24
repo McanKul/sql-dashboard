@@ -81,9 +81,9 @@ PDF production için `track=top` önerir; bu düşük sürprizli başlangıç ay
 
 Bu fark belgede açık olmalıdır; aksi halde test fonksiyonu çalıştığı halde beklenen sorgular dashboardda görünmeyebilir.
 
-### 7. PostgreSQL 17'de tarihsel lock zinciri vaat edilmemelidir
+### 7. PostgreSQL 18.4'te tarihsel lock zinciri vaat edilmemelidir
 
-PDF sistem sağlığına lock bekleme/blocker sinyali ekliyor. PoWA 5.2'nin `pg_stat_lock` veri kaynağı PostgreSQL **19** gerektirir. Bu stack PostgreSQL 17 kullandığı için güvenilir geçmiş lock/blocker zinciri üretmiyormuş gibi davranmaz.
+PDF sistem sağlığına lock bekleme/blocker sinyali ekliyor. PoWA 5.2'nin `pg_stat_lock` veri kaynağı PostgreSQL **19** gerektirir. Stack PostgreSQL 18.4'e yükseltilmiş olsa da bu gereksinim hâlâ karşılanmaz; ürün güvenilir geçmiş lock/blocker zinciri varmış gibi davranmaz.
 
 Uygulama:
 
@@ -95,7 +95,7 @@ Canlı anlık `pg_locks` sorgusu eklemek API'nin repository-only sınırını bo
 
 ### 8. Repository'de preload gerekmiyor
 
-Remote mode repository kendi performansını local background worker ile toplamıyorsa `powa` veya `pg_stat_statements` preload ve restart zorunlu değildir. Kaynak instance'ta `pg_stat_statements` preload zorunluluğu devam eder. Repo yalnız kaynak command'ında preload ayarı yapar.
+Remote mode repository kendi performansını local background worker ile toplamıyorsa `powa` veya stats extension preload/restart zorunlu değildir. İterasyon 2.1-B sonrasında kaynak instance'ta `pg_stat_statements,pg_qualstats` preload zorunludur; repository command'ı preload ayarı taşımaz.
 
 ### 9. PoWA'nın hazır rollerinden yararlanıldı
 
@@ -103,13 +103,23 @@ Genel `GRANT ALL TABLES` yaklaşımı yerine PoWA 5.2'nin rol modeli kullanılı
 
 - `advisor_api`: `powa_read_all_data`
 - `powa_collector`: `powa_read_all_data`, `powa_write_all_data`, `powa_snapshot`
-- Kaynakta collector: `pg_read_all_stats`, `powa_snapshot` ve gerekli function execute
+- Kaynakta collector: `pg_read_all_stats`, `powa_snapshot`, gerekli PoWA function execute ve `pg_qualstats()`/`pg_qualstats_reset()` execute
 
 Repository kaynak kaydında düz metin parola yoktur; libpq `.pgpass` kullanılır. Gerçek kaynaklar alias bazlı `0600` secret dosyalarıyla eklenir ve collector açılışında tek geçici pgpass içinde birleştirilir.
 
 ### 10. Çoklu gerçek kaynak kaydı idempotent hale getirildi
 
 PDF'deki tek hard-coded source örneği demo için yeterlidir, fakat ürün entegrasyonu için yeterli değildir. Repo `scripts/register-source.sh` ile host, port, monitoring DB, collector rolü, frequency ve retention'ı config/CLI üzerinden alır; aynı alias tekrar verildiğinde server id ve geçmiş korunarak kayıt güncellenir. Hazırlık SQL'i opsiyonel olarak uygulanabilir, parola repository'ye yazılmaz ve ilk snapshot ayrıca doğrulanır. Sürekli sentetik workload yalnız `demo` Compose profiliyle açılır.
+
+### 11. Predicate/index-adayı gözlem katmanı eklendi
+
+İterasyon 2.1-B ile `pg_qualstats` WHERE/filter geçmişi repository adapter'ına, `GET /api/v1/queries/{query_id}/predicates` endpoint'ine ve sorgu detay paneline bağlandı. Sözleşme kapsamı `WHERE_FILTER_ONLY`, `joinsAvailable=false` ve `ddlGenerated=false` olarak açıkça bildirir. Stok PoWA 5.2 repository hattında JOIN kaydı bulunmaması sorguda JOIN olmadığı anlamına gelmez.
+
+Sayaç adları da statement metriklerinden ayrılmıştır: `occurrences`, pg_qualstats/PoWA `occurences` alanından gelen örneklenmiş predicate çalışma sayısıdır; `pg_stat_statements.calls` değildir. `rowsProcessed` kaynak `execution_count`, `rowsFiltered` kaynak `nbfiltered` değeridir; `filterRatio` bu iki satır sayacının oranıdır. Predicate endpoint'i yalnız inceleme sinyali üretir; otomatik `CREATE INDEX`, index silme veya SQL rewrite yapmaz.
+
+### 12. HypoPG doğrulaması ayrı ve düşük yetkili tutuldu
+
+İterasyon 2.2, uygun SELECT/tek kolonlu B-tree adaylarını ayrı `evaluator` servisinde, aynı kaynak oturumundaki baseline ve sanal-index plain `EXPLAIN` planlarıyla doğrular. Yalnız sanal index planda seçilir ve planner-cost eşiği aşılırsa kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı gösterilir. Uygulama gerçek DDL çalıştırmaz; `ddlExecuted=false` değişmezi korunur. Referans kapsam tek yapılandırılmış `test-source/appdb` hedefidir; collector'a eklenen dış kaynaklar otomatik evaluator kapsamına girmez.
 
 ## PDF kapsamıyla repo davranışının karşılaştırması
 
@@ -119,11 +129,12 @@ PDF'deki tek hard-coded source örneği demo için yeterlidir, fakat ürün ente
 | Impact Score | Var | Uygulandı; score breakdown API'de |
 | Regresyon | Var | Uygulandı |
 | Sorgu detay/trend | Var | Uygulandı |
-| Sistem sağlığı | Var | PG17'de mümkün sinyaller uygulandı; lock açıkça sınırlı |
+| Sistem sağlığı | Var | PG18.4'te mümkün sinyaller uygulandı; lock açıkça sınırlı ve PG19 gereksinimi korunuyor |
 | Annotation/audit | Var | API'de uygulandı ve acceptance testte doğrulanır; tek kullanıcılı kurulumda takım iş akışı UI'dan kaldırıldı |
 | Collector/retention ekranı | Var | Operasyonlar ekranında repository kapasitesi, collector/retention, I/O, WAL/checkpoint ve index telemetrisiyle uygulandı |
 | Kurulum anlatımı | Kullanıcı ek talebi | Dashboard'dan çıkarıldı; platform ve dış kaynak adımları `docs/INSTALLATION.md` içinde |
-| Otomatik index/SQL rewrite | Kapsam dışı | Uygulanmadı; Operasyonlar ekranı index gözlemlerinin DROP önerisi olmadığını ve PK/unique bilgisinin repository'de doğrulanamadığını açıkça belirtir |
+| Predicate/index adayı | PDF ilk iterasyonunda kapsam dışı | WHERE/filter kanıtı ve dar kapsamlı HypoPG doğrulaması uygulandı; JOIN unavailable, yalnız `VALIDATED` sonuç kopyalanabilir SQL taşır |
+| Otomatik index/SQL rewrite | Kapsam dışı | Uygulanmadı; predicate paneli `ddlGenerated=false`, evaluator `ddlExecuted=false` döner; gösterilen SQL yalnız DBA taslağıdır |
 | Native distro kurulumu | Ayrıntılı runbook | Tasarım referansı; doğrulanmış rota Compose |
 
 ## Güvenlik açısından ek notlar
@@ -150,7 +161,8 @@ Aşağıdakiler sağlanırsa PDF'deki ilk iterasyon amacı karşılanır:
 6. Sorgular gerçek PoWA fark metrikleriyle sıralanır ve SQL yetkisiz rolde maskelenir.
 7. Annotation değişikliği audit kaydı oluşturur.
 8. UI Genel Bakış, Sorgular, Sistem Sağlığı ve Operasyonlar ekranlarını açar. Takım iş akışı tek kullanıcılı kurulum kararıyla UI kapsamı dışında kalır; annotation API'leri backend'de durur.
-9. 24 saatlik sorgu listesi kabul ortamında 2 saniyenin altında yanıt verir.
+9. Predicate endpoint'i ve sorgu detay paneli WHERE/filter kanıtını gösterir; JOIN ve DDL capability sınırlarını açıkça bildirir.
+10. 24 saatlik sorgu listesi kabul ortamında 2 saniyenin altında yanıt verir.
 
 Bu kontroller `bash scripts/verify.sh` ile otomatikleştirilmiştir. Sonuç olarak PDF'nin ilk iterasyon mimarisi **doğru**, yukarıdaki sürüm/container/capability düzeltmeleri ise uygulama için **gerekli**dir.
 

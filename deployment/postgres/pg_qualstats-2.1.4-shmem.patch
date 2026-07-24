@@ -1,0 +1,12 @@
+diff --git a/pg_qualstats.c b/pg_qualstats.c
+--- a/pg_qualstats.c
++++ b/pg_qualstats.c
+@@ -2511,0 +2512,8 @@ pgqs_memsize(void)
++
++	/* pgqs_shmem_startup() creates this fixed-size hash unconditionally. */
++	if (!pgqs_track_constants)
++	{
++		size = add_size(size, hash_estimate_size(pgqs_max,
++											 sizeof(pgqsQueryStringEntry) +
++											 pgqs_query_size * sizeof(char)));
++	}

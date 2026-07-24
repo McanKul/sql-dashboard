@@ -212,6 +212,37 @@ export const demoQueryDetails: Record<string, QueryDetail> = Object.fromEntries(
       { id: 'f1', severity: 'critical', title: 'Yüksek shared blok okuması', description: 'Bu sorgu seçili dönemde belirgin bir okuma yükü oluşturuyor.', recommendation: 'Sorgu planını gerçek parametreler ve buffer ölçümleriyle doğrulayın.' },
       { id: 'f2', severity: 'warning', title: 'Yüksek toplam çalışma süresi', description: 'Çağrı sayısı ve ortalama süre birlikte toplam etkiyi yükseltiyor.', recommendation: 'En yoğun kullanım senaryosunu ölçüp sorgu planındaki pahalı adımları inceleyin.' },
     ],
+    predicates: {
+      capability: {
+        available: true,
+        version: '2.1.4',
+        dataAvailable: true,
+        coverage: 'WHERE_FILTER_ONLY',
+        joinsAvailable: false,
+        ddlGenerated: false,
+        reason: 'PoWA repository hattı yalnız WHERE/filter predicate geçmişini taşır; JOIN kapsamı bu panelde yoktur.',
+        observedFrom: '2026-07-22T09:43:00Z',
+        observedTo: '2026-07-22T10:43:00Z',
+      },
+      items: [{
+        qualId: `demo-${index + 1}`,
+        relationId: 16400 + index,
+        schemaName: 'public',
+        tableName: index === 0 ? 'orders' : 'events',
+        columns: [index === 0 ? 'created_at' : 'event_type'],
+        operatorOids: [1324],
+        evalType: 'FILTER',
+        occurrences: 1842,
+        rowsProcessed: 2_400_000,
+        rowsFiltered: 2_040_000,
+        filterRatio: .85,
+        observedFrom: '2026-07-22T09:43:00Z',
+        observedTo: '2026-07-22T10:43:00Z',
+        sampleCount: 120,
+        signal: 'INDEX_CANDIDATE',
+        recommendation: 'Yüksek eleme oranlı WHERE filtresi; HypoPG ve EXPLAIN ile sanal index faydasını doğrulayın.',
+      }],
+    },
   }]),
 ) as Record<string, QueryDetail>
 
@@ -222,7 +253,7 @@ const history = (values: number[]) => values.map((value, index) => ({
 
 export const demoHealth: SystemHealth = {
   collectedAt: '2026-07-22T10:43:00Z',
-  postgresVersion: '16.4',
+  postgresVersion: '18.4',
   overall: 'warning',
   metrics: [
     { key: 'connections', label: 'Bağlantı kullanımı', value: 64, unit: '%', target: '< %80', severity: 'healthy', description: '128 / 200 bağlantı aktif', history: history([46, 48, 52, 58, 61, 64]) },

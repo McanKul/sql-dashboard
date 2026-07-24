@@ -11,7 +11,7 @@ DECLARE
 BEGIN
     SELECT string_agg(required.name, ', ' ORDER BY required.name)
       INTO missing
-      FROM (VALUES ('pg_stat_statements'), ('btree_gist'), ('powa')) AS required(name)
+      FROM (VALUES ('pg_stat_statements'), ('pg_qualstats'), ('btree_gist'), ('powa')) AS required(name)
      WHERE NOT EXISTS (
          SELECT 1
            FROM pg_available_extensions AS available
@@ -29,6 +29,13 @@ BEGIN
     )) THEN
         RAISE EXCEPTION
           'pg_stat_statements shared_preload_libraries icinde degil. Ayari ekleyip PostgreSQL clusterini yeniden baslatin.';
+    END IF;
+
+    IF NOT ('pg_qualstats' = ANY (
+        string_to_array(replace(current_setting('shared_preload_libraries'), ' ', ''), ',')
+    )) THEN
+        RAISE EXCEPTION
+          'pg_qualstats shared_preload_libraries icinde degil. Ayari ekleyip PostgreSQL clusterini yeniden baslatin.';
     END IF;
 
     IF current_setting('compute_query_id', true) = 'off' THEN
@@ -65,8 +72,10 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO %I', datname, :'collector_user')
 
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE EXTENSION IF NOT EXISTS pg_qualstats;
 CREATE SCHEMA IF NOT EXISTS "PoWA";
 CREATE EXTENSION IF NOT EXISTS powa WITH SCHEMA "PoWA";
+SELECT "PoWA".powa_activate_extension(0, 'pg_qualstats');
 
 SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), :'collector_user')
 \gexec
@@ -75,6 +84,19 @@ SELECT format('GRANT USAGE ON SCHEMA %I TO %I', 'PoWA', :'collector_user')
 SELECT format('GRANT powa_snapshot TO %I', :'collector_user')
 \gexec
 SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', 'PoWA', :'collector_user')
+\gexec
+
+-- Remote collector snapshot sonrasinda pg_qualstats_reset() cagirir. Bu
+-- fonksiyon PUBLIC'ten revoke edildigi icin collector'a acik yetki gerekir.
+SELECT format(
+    'GRANT EXECUTE ON FUNCTION %I.pg_qualstats(), %I.pg_qualstats_reset() TO %I',
+    n.nspname,
+    n.nspname,
+    :'collector_user'
+)
+FROM pg_extension e
+JOIN pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'pg_qualstats'
 \gexec
 
 SELECT current_setting('track_io_timing') = 'on' AS track_io_timing_enabled
@@ -87,4 +109,5 @@ SELECT current_setting('track_io_timing') = 'on' AS track_io_timing_enabled
 SELECT current_database() AS monitoring_database,
        (SELECT extversion FROM pg_extension WHERE extname = 'powa') AS powa_version,
        (SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements') AS pgss_version,
+       (SELECT extversion FROM pg_extension WHERE extname = 'pg_qualstats') AS pg_qualstats_version,
        pg_has_role(current_user, 'pg_read_all_stats', 'member') AS admin_can_read_stats;

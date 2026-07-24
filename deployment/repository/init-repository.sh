@@ -12,6 +12,13 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE SCHEMA IF NOT EXISTS "PoWA";
 CREATE EXTENSION IF NOT EXISTS powa WITH SCHEMA "PoWA";
+-- Normal fresh installs already populate powa_roles.  A dump/restore can leave
+-- those mappings empty, in which case reuse the restored cluster roles and
+-- rebuild the ACLs without trying to recreate them.
+SELECT "PoWA".setup_powa_roles(true)
+WHERE NOT EXISTS (
+    SELECT 1 FROM "PoWA".powa_roles WHERE rolname IS NOT NULL
+);
 
 CREATE ROLE powa_collector LOGIN PASSWORD :'collector_password';
 CREATE ROLE advisor_api LOGIN PASSWORD :'api_password';
@@ -37,7 +44,7 @@ SELECT "PoWA".powa_register_server(
     powa_coalesce => 100,
     retention => interval '90 days',
     allow_ui_connection => false,
-    extensions => ARRAY[]::text[]
+    extensions => ARRAY['pg_qualstats']::text[]
 );
 SQL
     ;;

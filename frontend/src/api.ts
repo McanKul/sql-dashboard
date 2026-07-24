@@ -10,6 +10,8 @@ import type {
   OverviewStats,
   QueryDetail,
   QueryFinding,
+  QueryIndexAdvice,
+  QueryPredicate,
   QueryListParams,
   QuerySummary,
   ServerOption,
@@ -89,6 +91,40 @@ interface RawQueryDetail extends RawQuery {
     previousCalls: number
   }
   recommendations?: { available: boolean; label: string; reason: string } | null
+}
+
+interface RawPredicateResponse {
+  window: TimeWindow
+  queryId: string
+  capability: {
+    available: boolean
+    version?: string | null
+    dataAvailable: boolean
+    coverage: 'WHERE_FILTER_ONLY'
+    joinsAvailable: false
+    ddlGenerated: false
+    reason: string
+    observedFrom?: string | null
+    observedTo?: string | null
+  }
+  items: Array<{
+    qualId: string
+    relationId: number
+    schemaName: string
+    tableName: string
+    columns: string[]
+    operatorOids: number[]
+    evalType: 'FILTER' | 'INDEX_CONDITION' | 'UNKNOWN'
+    occurrences: number
+    rowsProcessed: number
+    rowsFiltered: number
+    filterRatio?: number | null
+    observedFrom: string
+    observedTo: string
+    sampleCount: number
+    signal: 'INDEX_CANDIDATE' | 'REVIEW' | 'INDEX_CONDITION_OBSERVED' | 'OBSERVED' | 'INSUFFICIENT_DATA'
+    recommendation: string
+  }>
 }
 
 interface RawOverview {
@@ -290,7 +326,7 @@ function labelForTimestamp(timestamp: string): string {
   return new Intl.DateTimeFormat('tr-TR', { day: '2-digit', month: 'short', hour: '2-digit' }).format(date)
 }
 
-function mapDetail(query: RawQueryDetail): QueryDetail {
+function mapDetail(query: RawQueryDetail, predicatePayload: RawPredicateResponse): QueryDetail {
   const observedAt = query.trend.at(-1)?.timestamp || query.updatedAt || new Date().toISOString()
   const summary = mapSummary(query, observedAt)
   const breakdown = Object.entries(query.scoreBreakdown || {}).map(([key, part]) => {
@@ -331,6 +367,21 @@ function mapDetail(query: RawQueryDetail): QueryDetail {
       { metric: 'Toplam çalışma', before: previousTotal, after: currentTotal, unit: 'ms', improvementPercent: previousTotal ? ((previousTotal - currentTotal) / previousTotal) * 100 : 0 },
     ],
     findings: mapFindings(query),
+    predicates: {
+      capability: predicatePayload.capability,
+      items: predicatePayload.items.map((item) => ({
+        ...item,
+        qualId: String(item.qualId),
+        relationId: Number(item.relationId),
+        columns: Array.isArray(item.columns) ? item.columns : [],
+        operatorOids: Array.isArray(item.operatorOids) ? item.operatorOids.map(Number) : [],
+        occurrences: Number(item.occurrences || 0),
+        rowsProcessed: Number(item.rowsProcessed || 0),
+        rowsFiltered: Number(item.rowsFiltered || 0),
+        filterRatio: optionalNumber(item.filterRatio),
+        sampleCount: Number(item.sampleCount || 0),
+      })),
+    },
   }
 }
 
@@ -543,7 +594,34 @@ export const advisorApi = {
     if (key.serverId !== undefined) params.set('serverId', String(key.serverId))
     if (key.databaseId !== undefined) params.set('databaseId', String(key.databaseId))
     const suffix = params.size ? `?${params.toString()}` : ''
-    return asResult(mapDetail(await request<RawQueryDetail>(`/queries/${encodeURIComponent(key.queryId)}${suffix}`, { signal })), 'api')
+    const detailPath = `/queries/${encodeURIComponent(key.queryId)}${suffix}`
+    const [detail, predicates] = await Promise.all([
+      request<RawQueryDetail>(detailPath, { signal }),
+      request<RawPredicateResponse>(`/queries/${encodeURIComponent(key.queryId)}/predicates${suffix}`, { signal }),
+    ])
+    return asResult(mapDetail(detail, predicates), 'api')
+  },
+
+  async evaluateIndex(id: string, window: TimeWindow, predicate: QueryPredicate, signal?: AbortSignal): Promise<ApiResult<QueryIndexAdvice>> {
+    if (demoModeEnabled) return asResult({ status: 'UNAVAILABLE', reasonCode: 'DEMO_MODE', message: 'HypoPG dogrulamasi demo verisinde calistirilmaz.', ddlExecuted: false }, 'demo')
+    const key = parseQueryKey(id)
+    if (key.serverId === undefined || key.databaseId === undefined) {
+      throw new ApiClientError({ path: `/queries/${key.queryId}/index-evaluations`, message: 'HypoPG icin sunucu ve veritabani kimligi gerekli.' })
+    }
+    const payload = await request<QueryIndexAdvice>(
+      `/queries/${encodeURIComponent(key.queryId)}/index-evaluations?window=${window}`,
+      {
+        method: 'POST',
+        signal,
+        body: JSON.stringify({
+          serverId: key.serverId,
+          databaseId: key.databaseId,
+          qualId: predicate.qualId,
+          relationId: predicate.relationId,
+        }),
+      },
+    )
+    return asResult(payload, 'api')
   },
 
   async getSystemHealth(signal?: AbortSignal): Promise<ApiResult<SystemHealth>> {
@@ -572,7 +650,7 @@ export const advisorApi = {
       architecture: { host: 'Demo host', source: { count: 1 }, dataFlow: ['PostgreSQL kaynakları', 'collector', 'repository-db', 'api', 'web'], apiSourceConnection: false },
       services: [{ name: 'PoWA Collector', service: 'collector', status: 'HEALTHY' }, { name: 'PostgreSQL repository', service: 'repository-db', status: 'HEALTHY' }],
       collector: { alias: 'demo-source', status: 'HEALTHY', lagSeconds: 4, frequencySeconds: 30, retention: '90 days' },
-      repository: { postgresVersion: '16', powaVersion: '5', sizeBytes: 32_000_000, retentionDays: 90 },
+      repository: { postgresVersion: '18.4', powaVersion: '5.2.0', sizeBytes: 32_000_000, retentionDays: 90 },
     }
     if (demoModeEnabled) return asResult(mapOperations(demoRaw, { available: true, items: [] }, { available: true, items: [], capabilities: [], contexts: [], servers: [] }), 'demo')
 

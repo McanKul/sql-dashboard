@@ -29,6 +29,117 @@ class QueryFilters(BaseModel):
     page_size: int = Field(default=50, ge=1, le=200)
 
 
+class PredicateCapability(BaseModel):
+    available: bool
+    version: str | None = None
+    dataAvailable: bool
+    coverage: Literal["WHERE_FILTER_ONLY"]
+    joinsAvailable: Literal[False]
+    ddlGenerated: Literal[False]
+    reason: str
+    observedFrom: datetime | None = None
+    observedTo: datetime | None = None
+
+
+class PredicateEvidence(BaseModel):
+    serverId: int
+    serverAlias: str
+    databaseId: int
+    databaseName: str
+    queryId: str
+    qualId: str
+    relationId: int
+    schemaName: str
+    tableName: str
+    columns: list[str]
+    operatorOids: list[int]
+    evalType: Literal["FILTER", "INDEX_CONDITION", "UNKNOWN"]
+    occurrences: int
+    rowsProcessed: int
+    rowsFiltered: int
+    filterRatio: float | None
+    observedFrom: datetime
+    observedTo: datetime
+    sampleCount: int
+    signal: Literal[
+        "INDEX_CANDIDATE",
+        "REVIEW",
+        "INDEX_CONDITION_OBSERVED",
+        "OBSERVED",
+        "INSUFFICIENT_DATA",
+    ]
+    recommendation: str
+
+
+class PredicateResponse(BaseModel):
+    window: Literal["1h", "24h", "7d", "30d"]
+    queryId: str
+    capability: PredicateCapability
+    items: list[PredicateEvidence]
+
+
+class IndexEvaluationRequest(BaseModel):
+    serverId: int = Field(ge=1)
+    databaseId: int = Field(ge=1)
+    qualId: str = Field(min_length=1, max_length=32, pattern=r"^-?\d+$")
+    relationId: int = Field(ge=1)
+
+
+class IndexCandidateSql(BaseModel):
+    method: Literal["btree"]
+    columns: list[str]
+    createIndexSql: str
+    copyable: Literal[True]
+
+
+class IndexPlanValidation(BaseModel):
+    mode: Literal["GENERIC_PLAN", "PLAIN_PLAN"]
+    hypopgVersion: str
+    baselineTotalCost: float
+    hypotheticalTotalCost: float
+    costReductionPercent: float
+    hypotheticalIndexUsed: bool
+    baselineAccess: str | None = None
+    hypotheticalAccess: str | None = None
+    estimatedIndexSizeBytes: int
+    tableSizeBytes: int
+    evaluatedAt: datetime
+
+
+class IndexAdviceConfidence(BaseModel):
+    level: Literal["MEDIUM", "HIGH"]
+    reasons: list[str]
+
+
+class IndexAdvice(BaseModel):
+    status: Literal["VALIDATED", "NO_IMPROVEMENT", "UNAVAILABLE", "UNSAFE", "INSUFFICIENT"]
+    reasonCode: str
+    message: str
+    candidate: IndexCandidateSql | None = None
+    validation: IndexPlanValidation | None = None
+    confidence: IndexAdviceConfidence | None = None
+    ddlExecuted: Literal[False]
+
+
+class InternalIndexEvaluationRequest(BaseModel):
+    serverId: int = Field(ge=1)
+    serverAlias: str = Field(min_length=1, max_length=120)
+    databaseId: int = Field(ge=1)
+    databaseName: str = Field(min_length=1, max_length=128)
+    queryId: str = Field(min_length=1, max_length=32, pattern=r"^-?\d+$")
+    normalizedSql: str = Field(min_length=1, max_length=100_000)
+    qualId: str = Field(min_length=1, max_length=32, pattern=r"^-?\d+$")
+    relationId: int = Field(ge=1)
+    schemaName: str = Field(min_length=1, max_length=128)
+    tableName: str = Field(min_length=1, max_length=128)
+    columns: list[str] = Field(min_length=1, max_length=1)
+    operatorOids: list[int] = Field(min_length=1, max_length=8)
+    occurrences: int = Field(ge=0)
+    rowsProcessed: int = Field(ge=0)
+    filterRatio: float | None = Field(default=None, ge=0, le=1)
+    sampleCount: int = Field(ge=0)
+
+
 class IndexSummary(BaseModel):
     indexesObserved: int
     candidateSignals: int

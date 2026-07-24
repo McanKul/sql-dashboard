@@ -80,6 +80,72 @@ export interface QueryFinding {
   recommendation: string
 }
 
+export interface PredicateCapability {
+  available: boolean
+  version?: string | null
+  dataAvailable: boolean
+  coverage: 'WHERE_FILTER_ONLY'
+  joinsAvailable: false
+  ddlGenerated: false
+  reason: string
+  observedFrom?: string | null
+  observedTo?: string | null
+}
+
+export interface QueryPredicate {
+  qualId: string
+  relationId: number
+  schemaName: string
+  tableName: string
+  columns: string[]
+  operatorOids: number[]
+  evalType: 'FILTER' | 'INDEX_CONDITION' | 'UNKNOWN'
+  occurrences: number
+  rowsProcessed: number
+  rowsFiltered: number
+  filterRatio?: number | null
+  observedFrom: string
+  observedTo: string
+  sampleCount: number
+  signal: 'INDEX_CANDIDATE' | 'REVIEW' | 'INDEX_CONDITION_OBSERVED' | 'OBSERVED' | 'INSUFFICIENT_DATA'
+  recommendation: string
+}
+
+export interface PredicateInsights {
+  capability: PredicateCapability
+  items: QueryPredicate[]
+}
+
+export interface QueryIndexAdvice {
+  status: 'VALIDATED' | 'NO_IMPROVEMENT' | 'UNAVAILABLE' | 'UNSAFE' | 'INSUFFICIENT'
+  reasonCode: string
+  message: string
+  candidate?: {
+    method: 'btree'
+    columns: string[]
+    createIndexSql: string
+    copyable: true
+  } | null
+  validation?: {
+    mode: 'GENERIC_PLAN' | 'PLAIN_PLAN'
+    hypopgVersion: string
+    baselineTotalCost: number
+    hypotheticalTotalCost: number
+    costReductionPercent: number
+    hypotheticalIndexUsed: boolean
+    baselineAccess?: string | null
+    hypotheticalAccess?: string | null
+    estimatedIndexSizeBytes: number
+    tableSizeBytes: number
+    evaluatedAt: string
+  } | null
+  confidence?: {
+    level: 'MEDIUM' | 'HIGH'
+    reasons: string[]
+  } | null
+  ddlExecuted: false
+}
+
 export interface QueryDetail extends QuerySummary {
   fullSql: string
   firstSeenAt: string
@@ -100,6 +166,7 @@ export interface QueryDetail extends QuerySummary {
     improvementPercent: number
   }>
   findings: QueryFinding[]
+  predicates: PredicateInsights
 }
 
 export interface SystemHealth {

@@ -10,7 +10,6 @@ fi
 
 docker compose exec -T source-db \
   psql -U postgres -d appdb -Atqc \
-  "SELECT run_advisor_test_workload(${iterations});"
+  "SET pg_qualstats.sample_rate = 1; SELECT run_advisor_test_workload(${iterations});"
 
 echo "Test yuku tamamlandi. Collector frekansi 5 saniye; iki snapshot icin yaklasik 10 saniye bekleyin."
-

@@ -1,15 +1,15 @@
 # Kurulum ve işletim rehberi
 
-Bu rehber ilk iterasyonu macOS/OrbStack veya Docker Engine çalıştırabilen Linux üzerinde kurar. Ana yol container tabanlıdır; işletim sistemi yalnız Docker kurulum adımını değiştirir. Uygulama stack'i ve kabul komutları bütün platformlarda aynıdır.
+Bu rehber PostgreSQL 18, İterasyon 2.1-B predicate paneli ve İterasyon 2.2 HypoPG doğrulamasını içeren mevcut stack'i macOS/OrbStack veya Docker Engine çalıştırabilen Linux üzerinde kurar. Ana yol container tabanlıdır; işletim sistemi yalnız Docker kurulum adımını değiştirir. Uygulama stack'i ve kabul komutları bütün platformlarda aynıdır.
 
 ## 1. Kurulum modelini doğru okuyun
 
-Bu repo varsayılan olarak tek bir fiziksel/virtual host üzerinde iki PostgreSQL container'ı açar:
+Bu repo varsayılan olarak tek bir fiziksel/virtual host üzerinde iki PostgreSQL 18 container'ı açar; mevcut kabul ortamında her ikisi de PostgreSQL 18.4 olarak doğrulanmıştır:
 
 1. Kaynak PostgreSQL: host loopback `15432`, container `5432`
 2. Repository PostgreSQL: host loopback `15433`, container `5433`
 
-Bunlara collector, API ve web container'ları eklenir. Sürekli sentetik trafik üreten `workload` container'ı yalnız isteğe bağlı `demo` profiliyle açılır. Bu ayrım PDF'deki “tek test sunucusu, iki PostgreSQL instance” kararının çalıştırılabilir halidir.
+Bunlara collector, repository-only API, ayrı salt-okunur HypoPG evaluator ve web container'ları eklenir. Sürekli sentetik trafik üreten `workload` container'ı yalnız isteğe bağlı `demo` profiliyle açılır. Bu ayrım PDF'deki “tek test sunucusu, iki PostgreSQL instance” kararının çalıştırılabilir halidir.
 
 Üretim benzeri dış erişimde yalnız web portu `5173` açılır. DB ve API portları `.env.example` içinde `127.0.0.1` adresine bağlıdır. Web container'ındaki Nginx, `/api` isteklerini Docker iç ağındaki FastAPI'ye taşır.
 
@@ -180,6 +180,8 @@ chmod 600 .env
 POSTGRES_ADMIN_PASSWORD=GUCLU_ADMIN_PAROLASI
 POWA_COLLECTOR_PASSWORD=GUCLU_COLLECTOR_PAROLASI
 ADVISOR_API_PASSWORD=GUCLU_API_PAROLASI
+ADVISOR_EVALUATOR_PASSWORD=GUCLU_EVALUATOR_PAROLASI
+EVALUATOR_TOKEN=GUCLU_RASTGELE_IC_SERVIS_TOKENI
 ```
 
 Varsayılan bind ayarlarını ilk iterasyon için koruyun:
@@ -193,6 +195,28 @@ WEB_BIND=0.0.0.0
 
 Bu sayede yalnız web dış ağdan erişilebilir. `.env` dosyasını Git'e eklemeyin.
 
+İterasyon 2.1-B demo kaynağı için varsayılanlar:
+
+```dotenv
+PG_QUALSTATS_SAMPLE_RATE=0.1
+PG_QUALSTATS_MAX=10000
+SOURCE_DB_SHM_SIZE=256mb
+```
+
+Sampling oranını üretimde overhead ölçmeden yükseltmeyin. `PG_QUALSTATS_MAX` büyütülürse PostgreSQL shared-memory ihtiyacı ile container `/dev/shm` kapasitesi birlikte artırılmalıdır.
+
+İterasyon 2.2 demo evaluator varsayılanları:
+
+```dotenv
+EVALUATOR_ALLOWED_SERVER_ALIAS=test-source
+EVALUATOR_ALLOWED_DATABASE=appdb
+EVALUATOR_STATEMENT_TIMEOUT_MS=2000
+EVALUATOR_LOCK_TIMEOUT_MS=250
+EVALUATOR_MIN_IMPROVEMENT_PERCENT=10
+```
+
+Bu izin listesi monitoring kaydından bağımsızdır. Değerleri başka bir alias'a çevirmek tek başına dış kaynağı hazır hale getirmez; source DSN'i, HypoPG/rol/grant'ları ve kısıtlı ağ yolu ayrıca kurulmalıdır.
+
 Gerçek kaynaklarla temiz bir repository kuracaksanız ve demo kaydını istemiyorsanız **ilk `docker compose up` öncesinde** şunu da ayarlayın:
 
 ```dotenv
@@ -200,6 +224,12 @@ REGISTER_DEMO_SOURCE=false
 ```
 
 Bu init ayarı yalnız boş `repository_data` volume'ü bootstrap edilirken okunur; mevcut volume'deki demo kaydını geriye dönük silmez.
+
+### PostgreSQL 17'den 18'e major geçiş uyarısı
+
+Compose artık PostgreSQL 18 image'ı ve `/var/lib/postgresql/18/docker` veri diziniyle çalışır. PostgreSQL 17 named volume'ünü doğrudan PostgreSQL 18 container'ına bağlamayın; major sürüm veri dizinleri binary uyumlu değildir. Kaynak ve repository için önce doğrulanmış logical dump ile rol yedeği alın, ayrı PG18 volume'lerini oluşturun, restore edin ve ancak satır/snapshot sayıları doğrulandıktan sonra eski volume'leri kaldırın. Alternatif olarak DBA kontrollü `pg_upgrade` akışı kullanın.
+
+`scripts/enable-pg-qualstats.sh` yalnız extension/datasource/grant geçişini yapar; PostgreSQL major upgrade'i yapmaz. Major geçiş öncesinde repository geçmişi ve kaynak uygulama verisi ayrıca yedeklenmelidir.
 
 ### Adım 3 — Portları kontrol edin
 
@@ -230,10 +260,12 @@ Beklenen sonuç: çıktı ve hata olmadan tamamlanmasıdır. Bir environment de�
 docker compose up --build -d
 ```
 
-Bu komut beş ana servisi başlatır; `demo` profili seçilmediği için sürekli workload başlamaz. İlk build şu kontrolleri içerir:
+Bu komut altı ana servisi (`source-db`, `repository-db`, `collector`, `evaluator`, `api`, `web`) başlatır; `demo` profili seçilmediği için sürekli workload başlamaz. İlk build şu kontrolleri içerir:
 
-- `postgres:17-trixie` tabanı indirilir.
+- `postgres:18-trixie` tabanı indirilir.
 - PoWA Archivist `REL_5_2_0` kaynak arşivi indirilir ve SHA-256 doğrulanır.
+- `pg_qualstats 2.1.4` kaynak arşivi indirilir, SHA-256 doğrulanır ve sabit sürüme yerel shared-memory düzeltmesi uygulanır.
+- HypoPG `1.4.3`, tam upstream commit arşivinden indirilir; SHA-256 ve extension sürümü doğrulanarak PostgreSQL 18 için derlenir.
 - PoWA Collector 1.3.2 wheel'i hash sabitlenmiş biçimde kurulur.
 - Backend ve frontend dependency'leri kurulur.
 
@@ -241,10 +273,10 @@ Bu komut beş ana servisi başlatır; `demo` profili seçilmediği için sürekl
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 source-db repository-db collector api web
+docker compose logs --tail=100 source-db repository-db collector evaluator api web
 ```
 
-Beklenen sonuç: iki PostgreSQL, collector, API ve web servisleri `healthy` görünür. `workload` listede olmamalıdır. İlk database bootstrap'ı birkaç dakika sürebilir.
+Beklenen sonuç: iki PostgreSQL, collector, evaluator, API ve web servisleri `healthy` görünür. `workload` listede olmamalıdır. İlk database bootstrap'ı birkaç dakika sürebilir.
 
 ### Adım 6 — Sağlık uçlarını kontrol edin
 
@@ -254,9 +286,11 @@ Aynı hostta:
 curl -fsS http://localhost:8000/api/v1/health
 curl -fsS http://localhost:5173/healthz
 curl -fsS http://localhost:5173/api/v1/health
+docker compose exec -T evaluator python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3).read().decode())"
 ```
 
-İlk API yanıtında `repository: healthy`, `collector: healthy` ve `powaVersion: 5.2.0` beklenir.
+İlk API yanıtında `repository: healthy`, `collector: healthy`, `postgresVersion: 18.4` ve `powaVersion: 5.2.0` beklenir. Evaluator yanıtında `database_name=appdb`, `role_name=advisor_evaluator`, `hypopg_version=1.4.3`, `default_read_only=on` ve `ddlExecuted=false` bulunmalıdır.
 
 Başka bir bilgisayardan yalnız web/proxy kontrolü yapın:
 
@@ -277,7 +311,7 @@ bash scripts/run-test-workload.sh 20
 {"ok": true, "iterations": 20, "statementsExecuted": 80, "durationMs": 123.45}
 ```
 
-Collector 5 saniyede bir snapshot alır. İki ölçüm farkı için yaklaşık 10 saniye bekleyin.
+Collector 5 saniyede bir snapshot alır. İki ölçüm farkı için yaklaşık 10 saniye bekleyin. Komut deterministik predicate kabulü için yalnız kendi oturumunda `pg_qualstats.sample_rate=1` kullanır; cluster varsayılanı `0.1` olarak kalır.
 
 Bu komut tek seferlik kontrollü trafik üretir. Sürekli sentetik trafik varsayılan olarak kapalıdır. Yalnız demo ihtiyacında:
 
@@ -301,8 +335,10 @@ API_URL=http://localhost:18000 WEB_URL=http://localhost:15173 bash scripts/verif
 Beklenen son satır:
 
 ```text
-İlk iterasyon çalışma zamanı kabul kontrolleri tamamlandı.
+Iterasyon 1, Iterasyon 2.1-B pg_qualstats ve Iterasyon 2.2 HypoPG kabul kontrolleri tamamlandi.
 ```
+
+Test ayrıca iki database'in PostgreSQL 18 kullandığını, veri dizininin `/var/lib/postgresql/18/docker` olduğunu, gerçek bir predicate kaydı üzerinden `WHERE_FILTER_ONLY` capability sözleşmesini ve HypoPG evaluator'ın gerçek index oluşturmadan aynı oturumda plan doğrulaması yaptığını kontrol eder.
 
 ### Adım 9 — Analiz arayüzünü açın
 
@@ -318,7 +354,28 @@ Uzak Linux sunucusu:
 http://SUNUCU_IP:5173
 ```
 
-Kurulum adımları dashboard'da yer almaz; bu belge işletim sistemi kurulumunun tek kaynağıdır. İlk iterasyon kabulü için Genel Bakış'ta veri, Sorgular ekranında en az bir sorgu detayı ve Operasyonlar'da ilgili collector kaynağının healthy görünmesi yeterlidir.
+Kurulum adımları dashboard'da yer almaz; bu belge işletim sistemi kurulumunun tek kaynağıdır. Kabul için Genel Bakış'ta veri, Sorgular ekranında en az bir sorgu detayı ve WHERE/filter predicate paneli, Operasyonlar'da da ilgili collector kaynağının healthy görünmesi beklenir.
+
+Predicate endpoint'ini bağımsız kontrol etmek için gerçek sorgu, server ve database kimliklerini kullanın:
+
+```bash
+curl -fsS -H 'X-Advisor-Role: analyst' \
+  'http://localhost:8000/api/v1/queries/QUERY_ID/predicates?window=24h&serverId=SERVER_ID&databaseId=DATABASE_OID'
+```
+
+Yanıtta `capability.coverage=WHERE_FILTER_ONLY`, `joinsAvailable=false` ve `ddlGenerated=false` beklenir. `occurrences` örneklenen predicate çalışmasıdır ve sorgunun statement çağrı sayısı değildir. `rowsProcessed`, PoWA/pg_qualstats `execution_count`; `rowsFiltered`, `nbfiltered` sayacından gelir. `filterRatio`, `rowsFiltered / rowsProcessed` oranıdır. Bu alanlar index inceleme adayı üretir; endpoint `CREATE INDEX` metni üretmez veya DDL çalıştırmaz.
+
+Uygun predicate için UI'daki **HypoPG ile doğrula** butonunu kullanın veya aynı kimliklerle endpoint'i çağırın:
+
+```bash
+curl -fsS -H 'X-Advisor-Role: analyst' \
+  -H 'Content-Type: application/json' \
+  -X POST \
+  'http://localhost:8000/api/v1/queries/QUERY_ID/index-evaluations?window=24h' \
+  -d '{"serverId":1,"databaseId":16384,"qualId":"QUAL_ID","relationId":RELATION_OID}'
+```
+
+`candidate.createIndexSql` yalnız `status=VALIDATED` olduğunda bulunur ve `CREATE INDEX CONCURRENTLY` taslağıdır. `validation.costReductionPercent` planner cost farkıdır, süre kazancı değildir. Sonuç ne olursa olsun `ddlExecuted=false` beklenir; uygulama SQL'i yürütmez.
 
 ## Gerçek bir PostgreSQL kaynağını ekleme
 
@@ -328,7 +385,7 @@ Kurulum adımları dashboard'da yer almaz; bu belge işletim sistemi kurulumunun
 
 Script şunları yapar:
 
-1. Collector parolasıyla uzak bağlantıyı ve PoWA yetkilerini kontrol eder.
+1. Collector parolasıyla uzak bağlantıyı, PoWA/`pg_qualstats` sürümlerini, gerçek datasource çağrısını ve reset yetkisini kontrol eder.
 2. İstenirse `--prepare` ile monitoring DB, collector rolü, extension ve grant'ları oluşturur/günceller.
 3. PoWA repository kaydını alias üzerinden ekler veya günceller.
 4. `powa_servers.password` değerini daima `NULL` tutar.
@@ -340,22 +397,27 @@ Script şunları otomatik yapmaz:
 - Kaynak işletim sistemine PoWA binary/paketi kurmak
 - `postgresql.conf` değiştirmek veya PostgreSQL'ü yeniden başlatmak
 - `pg_hba.conf`, firewall, DNS, VPN ya da TLS sertifikası değiştirmek
+- HypoPG binary/extension'ı, `advisor_evaluator` rolünü veya dış kaynak evaluator DSN/ağ yolunu hazırlamak
 
 Bu değişiklikler canlı veritabanında bakım ve güvenlik kararı gerektirir.
 
 ### 1 — Kaynak PostgreSQL ön koşulları
 
-Kaynak cluster'ın PostgreSQL major sürümüne uygun `powa`/PoWA Archivist, `pg_stat_statements` ve `btree_gist` extension dosyalarını işletim sistemi paket yöneticisiyle kurun. PoWA'nın remote-mode belgeleri `pg_stat_statements` veri kaynağını zorunlu kabul eder.
+Kaynak cluster'ın PostgreSQL major sürümüne uygun `powa`/PoWA Archivist, `pg_stat_statements`, `pg_qualstats 2.1.x` ve `btree_gist` extension dosyalarını işletim sistemi paket yöneticisiyle kurun. `--prepare` bu binary/control dosyalarını işletim sistemine kurmaz. Yalnız telemetry toplamak için HypoPG gerekmez; bu kaynakta İterasyon 2.2 plan doğrulaması isteniyorsa HypoPG 1.4.3 ayrıca hedef uygulama database'ine kurulmalıdır.
 
 `postgresql.conf` için minimum:
 
 ```conf
-shared_preload_libraries = 'pg_stat_statements'
+shared_preload_libraries = 'pg_stat_statements,pg_qualstats'
 compute_query_id = on
 track_io_timing = on
+pg_qualstats.track_constants = off
+pg_qualstats.track_pg_catalog = off
+pg_qualstats.resolve_oids = off
+pg_qualstats.sample_rate = 0.1
 ```
 
-Mevcut `shared_preload_libraries` listesinde başka modüller varsa onları silmeyin; virgülle `pg_stat_statements` ekleyin. Bu değişiklik cluster restart gerektirir. `track_io_timing` ölçüm maliyeti taşıyabildiği için canlıda DBA kararıyla açılmalıdır.
+Mevcut `shared_preload_libraries` listesinde başka modüller varsa onları silmeyin; virgülle iki extension'ı ekleyin. Preload değişikliği cluster restart gerektirir. `track_io_timing` ve sampling ölçüm maliyeti taşıyabildiği için canlı değerler DBA kararı ve overhead ölçümüyle seçilmelidir.
 
 Kontrol:
 
@@ -363,6 +425,7 @@ Kontrol:
 SHOW shared_preload_libraries;
 SHOW compute_query_id;
 SHOW track_io_timing;
+SHOW pg_qualstats.sample_rate;
 ```
 
 Collector container'ından kaynak host/portuna ağ erişimi, kaynak `pg_hba.conf` içinde collector hostu için TLS/SCRAM kuralı ve firewall izni olmalıdır. Aynı Docker hostundaki host PostgreSQL için `localhost` yazmayın; container açısından bu kendi container'ıdır. `host.docker.internal` veya yönlendirilebilir DNS/IP kullanın.
@@ -442,13 +505,17 @@ Beklenenler:
 - `password IS NULL`
 - `frequency >= 5`
 - `snapts > -infinity`
-- Collector hata dizisi boş
+- Collector hata dizisi boş ve `pg_qualstats` datasource/fonksiyonları etkin
 - Secret dosya izni `0600`
 - Kaynak `/api/v1/servers` listesinde
 
 Aynı register komutunu ikinci kez çalıştırmak yeni server id üretmez; mevcut id üzerinde bağlantı, frekans, coalesce ve retention güncellenir. Alias mantıksal kaynak kimliğidir. Bir alias'ı bambaşka bir cluster'a yöneltmek eski ve yeni geçmişi aynı server id altında birleştireceğinden önerilmez; yeni fiziksel/mantıksal kaynak için yeni alias kullanın.
 
 Her kayıt/parola rotasyonu collector container'ını yeniden oluşturur. Mevcut kaynak worker'ları birkaç saniyeliğine yeniden bağlanır; repository geçmişi kaybolmaz. Çok sayıda canlı kaynakta bu kısa kesintiyi operasyon penceresinde planlayın.
+
+PoWA 5.2'nin standart remote qualstats hattında repository'ye WHERE/filter predicate geçmişi gelir. Raw kaynak `pg_qualstats()` JOIN predicate'lerini de yakalar; kolon-kolon JOIN'lerin repository'de görünmemesi kurulum hatası değildir ve ayrı source snapshotter gerektirir.
+
+Bu noktada kaynak yalnız monitoring kapsamındadır. HypoPG doğrulaması için collector secret'ından ayrı read-only rol, sabit alias/database allowlist'i, kaynak portuna kısıtlı evaluator network yolu ve ayrı DSN gerekir. Referans stack tek evaluator hedefi destekler; çoklu kaynak otomatik yönlendirilmez. Uygulanacak kontrollü adımlar [İterasyon 2.2 dış kaynak runbook'unda](ITERATION_2_2_HYPOPG.md#dış-kaynak-sınırı-ve-runbook) yer alır.
 
 ### 5 — TLS ve çoklu kaynak sınırı
 
@@ -561,6 +628,21 @@ Script custom-format `pg_dump` üretir. Yedeği aynı hostta bırakmak tek baş�
 
 Kaynak server kaydı `retention = interval '90 days'` ile oluşturulur. `.env` içindeki `RETENTION_DAYS=90` API/operasyon ekranındaki ayardır; mevcut PoWA kaydını sonradan tek başına değiştirmez. Retention değişikliği repository'de PoWA'nın yönetim fonksiyonlarıyla ve kapasite planıyla birlikte yapılmalıdır.
 
+### İterasyon 2.1-B / 2.2 mevcut-volume geçişi
+
+Named volume daha eski image ile oluşturulduysa init scriptleri kendiliğinden tekrar çalışmaz. Demo stack'i veri/geçmiş silmeden yükseltmek için:
+
+```bash
+docker compose build source-db
+docker compose up -d --force-recreate source-db repository-db
+bash scripts/enable-pg-qualstats.sh
+bash scripts/enable-hypopg.sh
+docker compose up -d --force-recreate evaluator api web
+bash scripts/verify.sh
+```
+
+İlk script preload/call/grant koşulunu doğrular, küçük kontrollü workload üretir ve hem snapshot hem qualstats history ilerleyene kadar bekler. İkinci script image'daki HypoPG 1.4.3'ü, `advisor_hypopg` şemasını ve salt-okunur evaluator rolünü mevcut `appdb` içinde hazırlar. İkisi de `test-source` demo kaydına özeldir. Gerçek dış kaynakları izlemek için DBA preload/restart işleminden sonra aynı alias ile `scripts/register-source.sh` çalıştırılır; dış kaynak HypoPG evaluator hazırlığı bunun dışında ve ayrı runbook'a tabidir.
+
 ## 8. Temizleme ve yeniden kurulum
 
 Normal kaldırma, veriyi saklar:
@@ -608,6 +690,37 @@ curl -fsS -H 'X-Advisor-Role: analyst' \
 ```
 
 PoWA fark metriği için en az iki snapshot gerekir.
+
+### `pg_qualstats` eksik veya preload edilmemiş
+
+```bash
+docker compose exec -T source-db psql -U postgres -d powa -c \
+  "SELECT extversion FROM pg_extension WHERE extname='pg_qualstats'; SHOW shared_preload_libraries;"
+docker compose logs --tail=200 source-db collector
+```
+
+Extension dosyası image/host üzerinde bulunmalı, preload listesinde yer almalı ve preload değişikliğinden sonra PostgreSQL yeniden başlatılmış olmalıdır. Eski demo volume için yukarıdaki mevcut-volume geçişini uygulayın.
+
+### Source startup shared-memory hatası
+
+`PG_QUALSTATS_MAX` yükseltildiyse `SOURCE_DB_SHM_SIZE` değerini de kapasite ölçümüne göre artırın. Varsayılan kombinasyon `10000` ve `256mb` olarak kabul testinden geçer. Sabit `2.1.4` image'ı ayrıca belgelenen shared-memory hesap düzeltmesini içerir.
+
+### HypoPG `UNAVAILABLE`, `UNSAFE` veya SQL göstermiyor
+
+```bash
+docker compose ps evaluator
+docker compose logs --tail=200 evaluator api
+docker compose exec -T source-db psql -U postgres -d appdb -c \
+  "SELECT extversion FROM pg_extension WHERE extname='hypopg'; SELECT rolname, rolconfig FROM pg_roles WHERE rolname='advisor_evaluator';"
+```
+
+Mevcut demo volume'ünde extension/rol yoksa `bash scripts/enable-hypopg.sh` çalıştırıp `evaluator api web` servislerini yeniden oluşturun. `UNSAFE`, evaluator arızası demek değildir: DML, birden çok statement, RLS, çözümlenemeyen/çok kolonlu predicate, B-tree uyumsuz operator veya eski repository OID'i güvenli biçimde reddedilir. `NO_IMPROVEMENT` eşdeğer index bulunduğunu ya da varsayılan `%10` planner-cost eşiğinin aşılmadığını gösterebilir. SQL yalnız `VALIDATED` durumda açılır; hiçbir durumda gerçek DDL çalıştırılmaz.
+
+Dış alias yalnız collector'a kaydedildiyse `SOURCE_NOT_CONFIGURED` beklenir. Ana API'ye source DSN eklemeyin; [dış kaynak evaluator runbook'unu](ITERATION_2_2_HYPOPG.md#dış-kaynak-sınırı-ve-runbook) uygulayın.
+
+### JOIN predicate kaynakta var, repository'de yok
+
+Bu PoWA 5.2 standart datasource sınırıdır. Raw `pg_qualstats()` kolon-kolon JOIN'i yakalar, standart `powa_qualstats_src` yalnız tek taraflı WHERE/filter kayıtlarını taşır. Predicate endpoint'inin `joinsAvailable=false` dönmesi bu nedenle beklenir ve sorguda JOIN bulunmadığını kanıtlamaz. Collector'ı veya volume'ü sıfırlamayın; JOIN için sonraki düşük yetkili source-snapshotter adımı gerekir.
 
 ### Port kullanımda
 

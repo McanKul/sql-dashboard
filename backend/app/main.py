@@ -36,8 +36,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="PostgreSQL Sorgu Performansi ve Oneri Motoru",
-    version="1.0.0-iteration-1",
-    description="PoWA repository uzerinden salt-okunur sorgu analizi ve advisor notlari.",
+    version="1.0.0-iteration-2.2",
+    description=(
+        "PoWA repository uzerinden sorgu analizi ve ayri salt-okunur evaluator ile "
+        "istege bagli HypoPG plan dogrulamasi."
+    ),
     lifespan=lifespan,
 )
 
@@ -45,7 +48,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=False,
-    allow_methods=["GET", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type", "X-Advisor-Role", "X-Advisor-Actor"],
 )
 

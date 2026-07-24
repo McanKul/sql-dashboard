@@ -10,8 +10,17 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 
 from app.config import WINDOW_INTERVALS, get_settings
 from app.repositories.powa import repository, serialize_query
-from app.schemas import AnnotationUpdate, IndexResponse, IoResponse
+from app.schemas import (
+    AnnotationUpdate,
+    IndexAdvice,
+    IndexEvaluationRequest,
+    IndexResponse,
+    InternalIndexEvaluationRequest,
+    IoResponse,
+    PredicateResponse,
+)
 from app.security import can_view_sql, request_role, require_admin
+from app.services.evaluator import evaluate_index_candidate
 
 
 router = APIRouter(prefix="/api/v1")
@@ -139,6 +148,35 @@ def _index_payload(row: dict[str, Any]) -> dict[str, Any]:
         "signalLevel": row.get("signal_level"),
         "signal": row.get("signal"),
         "recommendation": row.get("recommendation"),
+    }
+
+
+def _predicate_payload(row: dict[str, Any]) -> dict[str, Any]:
+    filter_ratio = row.get("filter_ratio")
+    return {
+        "serverId": row["server_id"],
+        "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
+        "databaseId": row["database_id"],
+        "databaseName": row.get("database_name") or f"db-{row['database_id']}",
+        "queryId": str(row["query_id"]),
+        "qualId": str(row["qual_id"]),
+        "relationId": row["relation_id"],
+        "schemaName": row.get("schema_name") or "unknown",
+        "tableName": row.get("table_name") or f"relation-{row['relation_id']}",
+        "columns": list(row.get("column_names") or []),
+        "operatorOids": [int(value) for value in (row.get("operator_oids") or [])],
+        "evalType": row.get("eval_type") or "UNKNOWN",
+        # pg_qualstats occurences is sampled predicate execution evidence.  It
+        # must not be presented as the statement call count.
+        "occurrences": int(row.get("occurrences") or 0),
+        "rowsProcessed": int(row.get("rows_processed") or 0),
+        "rowsFiltered": int(row.get("rows_filtered") or 0),
+        "filterRatio": None if filter_ratio is None else round(float(filter_ratio), 6),
+        "observedFrom": row["observed_from"],
+        "observedTo": row["observed_to"],
+        "sampleCount": int(row.get("sample_count") or 0),
+        "signal": row.get("signal") or "INSUFFICIENT_DATA",
+        "recommendation": row.get("recommendation") or "Daha fazla predicate verisi toplayin.",
     }
 
 
@@ -373,6 +411,159 @@ async def query_detail(
         }
     )
     return item
+
+
+@router.get("/queries/{query_id}/predicates", response_model=PredicateResponse)
+async def query_predicates(
+    query_id: int,
+    window: Window = "24h",
+    server_id: int = Query(alias="serverId"),
+    database_id: int = Query(alias="databaseId"),
+) -> dict[str, Any]:
+    rows, raw_capability = await repository.predicate_evidence(
+        window=window,
+        server_id=server_id,
+        database_id=database_id,
+        query_id=query_id,
+    )
+    available = bool(raw_capability.get("available"))
+    observed_from = min((row["observed_from"] for row in rows), default=None)
+    observed_to = max((row["observed_to"] for row in rows), default=None)
+    if not available:
+        reason = "pg_qualstats bu kaynakta etkin degil; predicate/index adayi verisi uretilemiyor."
+    elif not rows:
+        reason = "pg_qualstats etkin, ancak secili pencerede bu sorgu icin predicate ornegi yok."
+    else:
+        reason = (
+            "PoWA 5.2 repository hatti yalniz WHERE/filter predicate gecmisini tasir; "
+            "JOIN verisi yoklugu sorguda JOIN olmadigi anlamina gelmez. Occurrence degeri "
+            "orneklenen predicate calismasidir, statement cagri sayisi degildir."
+        )
+    return {
+        "window": window,
+        "queryId": str(query_id),
+        "capability": {
+            "available": available,
+            "version": raw_capability.get("version"),
+            "dataAvailable": bool(rows),
+            "coverage": "WHERE_FILTER_ONLY",
+            "joinsAvailable": False,
+            "ddlGenerated": False,
+            "reason": reason,
+            "observedFrom": observed_from,
+            "observedTo": observed_to,
+        },
+        "items": [_predicate_payload(row) for row in rows],
+    }
+
+
+@router.post("/queries/{query_id}/index-evaluations", response_model=IndexAdvice)
+async def evaluate_query_index(
+    query_id: int,
+    payload: IndexEvaluationRequest,
+    role: Annotated[str, Depends(request_role)],
+    window: Window = "24h",
+) -> dict[str, Any]:
+    if not can_view_sql(role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="HypoPG plan dogrulamasi analyst yetkisi gerektirir.",
+        )
+
+    rows, raw_capability = await repository.predicate_evidence(
+        window=window,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+        query_id=query_id,
+    )
+    if not raw_capability.get("available"):
+        return {
+            "status": "UNAVAILABLE",
+            "reasonCode": "PREDICATE_TELEMETRY_UNAVAILABLE",
+            "message": "Kaynakta pg_qualstats predicate telemetrisi etkin degil.",
+            "ddlExecuted": False,
+        }
+
+    predicate = next(
+        (
+            row
+            for row in rows
+            if str(row["qual_id"]) == payload.qualId
+            and int(row["relation_id"]) == payload.relationId
+        ),
+        None,
+    )
+    if predicate is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Predicate adayi secili pencerede bulunamadi.",
+        )
+    if predicate.get("signal") == "INSUFFICIENT_DATA":
+        return {
+            "status": "INSUFFICIENT",
+            "reasonCode": "INSUFFICIENT_PREDICATE_EVIDENCE",
+            "message": "HypoPG dogrulamasi icin daha fazla predicate ornegi birikmeli.",
+            "ddlExecuted": False,
+        }
+    if predicate.get("eval_type") != "FILTER" or predicate.get("signal") not in {
+        "INDEX_CANDIDATE",
+        "REVIEW",
+    }:
+        return {
+            "status": "NO_IMPROVEMENT",
+            "reasonCode": "NO_NEW_BTREE_CANDIDATE",
+            "message": "Bu predicate icin yeni tek kolonlu B-tree adayi uretilmedi.",
+            "ddlExecuted": False,
+        }
+
+    columns = list(predicate.get("column_names") or [])
+    if predicate.get("schema_name") == "unknown" or len(columns) != 1:
+        return {
+            "status": "UNSAFE",
+            "reasonCode": "UNRESOLVED_OR_COMPOSITE_PREDICATE",
+            "message": "Canli kaynakta tek kolonlu predicate kimligi guvenle cozumlenemedi.",
+            "ddlExecuted": False,
+        }
+
+    operator_oids = [int(value) for value in (predicate.get("operator_oids") or [])]
+    if not operator_oids:
+        return {
+            "status": "UNSAFE",
+            "reasonCode": "UNRESOLVED_OPERATOR",
+            "message": "Predicate operatoru canli katalogda guvenle dogrulanamadi.",
+            "ddlExecuted": False,
+        }
+
+    query = await repository.query_by_id(
+        query_id=query_id,
+        window=window,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+    )
+    if query is None:
+        raise HTTPException(status_code=404, detail="Sorgu secili pencerede bulunamadi.")
+
+    request = InternalIndexEvaluationRequest(
+        serverId=payload.serverId,
+        serverAlias=str(predicate.get("server_alias") or f"server-{payload.serverId}"),
+        databaseId=payload.databaseId,
+        databaseName=str(predicate.get("database_name") or f"db-{payload.databaseId}"),
+        queryId=str(query_id),
+        normalizedSql=str(query["sql_text"]),
+        qualId=payload.qualId,
+        relationId=payload.relationId,
+        schemaName=str(predicate["schema_name"]),
+        tableName=str(predicate["table_name"]),
+        columns=columns,
+        operatorOids=operator_oids,
+        occurrences=int(predicate.get("occurrences") or 0),
+        rowsProcessed=int(predicate.get("rows_processed") or 0),
+        filterRatio=(
+            None if predicate.get("filter_ratio") is None else float(predicate["filter_ratio"])
+        ),
+        sampleCount=int(predicate.get("sample_count") or 0),
+    )
+    return await evaluate_index_candidate(request)
 
 
 @router.patch("/queries/{query_id}/annotation")

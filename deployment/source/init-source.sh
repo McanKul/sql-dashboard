@@ -2,13 +2,33 @@
 set -Eeuo pipefail
 
 : "${POWA_COLLECTOR_PASSWORD:?POWA_COLLECTOR_PASSWORD tanimli olmali}"
+: "${ADVISOR_EVALUATOR_PASSWORD:?ADVISOR_EVALUATOR_PASSWORD tanimli olmali}"
 
 psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   --set=collector_password="$POWA_COLLECTOR_PASSWORD" \
+  --set=evaluator_password="$ADVISOR_EVALUATOR_PASSWORD" \
   --set=source_database="$POSTGRES_DB" <<'SQL'
 CREATE ROLE powa_collector LOGIN PASSWORD :'collector_password';
+CREATE ROLE advisor_evaluator LOGIN PASSWORD :'evaluator_password'
+  NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT 2;
+ALTER ROLE advisor_evaluator SET default_transaction_read_only = on;
+ALTER ROLE advisor_evaluator SET statement_timeout = '2s';
+ALTER ROLE advisor_evaluator SET lock_timeout = '250ms';
+ALTER ROLE advisor_evaluator SET idle_in_transaction_session_timeout = '3s';
+
 GRANT CONNECT ON DATABASE :"source_database" TO powa_collector;
 GRANT pg_read_all_stats TO powa_collector;
+GRANT CONNECT ON DATABASE :"source_database" TO advisor_evaluator;
+
+CREATE SCHEMA advisor_hypopg;
+CREATE EXTENSION hypopg WITH SCHEMA advisor_hypopg;
+REVOKE ALL ON SCHEMA advisor_hypopg FROM PUBLIC;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA advisor_hypopg FROM PUBLIC;
+GRANT USAGE ON SCHEMA advisor_hypopg TO advisor_evaluator;
+GRANT EXECUTE ON FUNCTION advisor_hypopg.hypopg_reset() TO advisor_evaluator;
+GRANT EXECUTE ON FUNCTION advisor_hypopg.hypopg_create_index(text) TO advisor_evaluator;
+GRANT EXECUTE ON FUNCTION advisor_hypopg.hypopg_relation_size(oid) TO advisor_evaluator;
 
 CREATE TABLE customers (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -135,6 +155,10 @@ $$;
 
 COMMENT ON FUNCTION run_advisor_test_workload(integer) IS
 'PoWA/pg_stat_statements entegrasyonunu dogrulamak icin kontrollu sorgu yuku uretir.';
+
+GRANT USAGE ON SCHEMA public TO advisor_evaluator;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO advisor_evaluator;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO advisor_evaluator;
 SQL
 
 createdb --username "$POSTGRES_USER" powa
@@ -142,12 +166,36 @@ createdb --username "$POSTGRES_USER" powa
 psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname powa <<'SQL'
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE EXTENSION IF NOT EXISTS pg_qualstats;
 CREATE SCHEMA IF NOT EXISTS "PoWA";
 CREATE EXTENSION IF NOT EXISTS powa WITH SCHEMA "PoWA";
+-- Normal fresh installs already populate powa_roles.  A dump/restore can leave
+-- those mappings empty, in which case reuse the restored cluster roles and
+-- rebuild the ACLs without trying to recreate them.
+SELECT "PoWA".setup_powa_roles(true)
+WHERE NOT EXISTS (
+    SELECT 1 FROM "PoWA".powa_roles WHERE rolname IS NOT NULL
+);
+
+-- PoWA 5.2 kurulum sonunda mevcut destekli extension'lari etkinlestirir.
+-- Acik cagri, tekrar calistirilan bootstrap/upgrade akisini da guvenli tutar.
+SELECT "PoWA".powa_activate_extension(0, 'pg_qualstats');
 
 GRANT CONNECT ON DATABASE powa TO powa_collector;
 GRANT USAGE ON SCHEMA "PoWA" TO powa_collector;
 GRANT pg_read_all_stats TO powa_collector;
 GRANT powa_snapshot TO powa_collector;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA "PoWA" TO powa_collector;
+
+-- Collector her remote snapshot sonrasinda sayaclari sifirlar. Reset fonksiyonu
+-- PUBLIC'ten revoke edildigi icin extension semasinda acik yetki verilir.
+SELECT format(
+    'GRANT EXECUTE ON FUNCTION %I.pg_qualstats(), %I.pg_qualstats_reset() TO powa_collector',
+    n.nspname,
+    n.nspname
+)
+FROM pg_extension e
+JOIN pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'pg_qualstats'
+\gexec
 SQL

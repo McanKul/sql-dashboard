@@ -5,16 +5,18 @@ services:
     build:
       context: .
       dockerfile: deployment/postgres/Dockerfile
-    image: postgresql-advisor/powa-postgres:17-5.2.0
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-hypopg-1.4.3
+    shm_size: ${SOURCE_DB_SHM_SIZE:-256mb}
     environment:
       POSTGRES_DB: appdb
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
       POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:-advisor_dev_collector}
+      ADVISOR_EVALUATOR_PASSWORD: ${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}
     command:
       - postgres
       - -c
-      - shared_preload_libraries=pg_stat_statements
+      - shared_preload_libraries=pg_stat_statements,pg_qualstats
       - -c
       - compute_query_id=on
       - -c
@@ -24,13 +26,23 @@ services:
       - -c
       - pg_stat_statements.save=on
       - -c
+      - pg_qualstats.track_constants=off
+      - -c
+      - pg_qualstats.track_pg_catalog=off
+      - -c
+      - pg_qualstats.resolve_oids=off
+      - -c
+      - pg_qualstats.max=${PG_QUALSTATS_MAX:-10000}
+      - -c
+      - pg_qualstats.sample_rate=${PG_QUALSTATS_SAMPLE_RATE:-0.1}
+      - -c
       - track_io_timing=on
       - -c
-      - powa.ignored_users=powa_collector
+      - powa.ignored_users=powa_collector,advisor_evaluator
     ports:
       - "${SOURCE_DB_BIND:-127.0.0.1}:${SOURCE_DB_PORT:-15432}:5432"
     volumes:
-      - source_data:/var/lib/postgresql/data
+      - source_data:/var/lib/postgresql
       - ./deployment/source/init-source.sh:/docker-entrypoint-initdb.d/10-init-source.sh:ro,Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d appdb -p 5432 && psql -U postgres -d powa -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
@@ -39,10 +51,10 @@ services:
       retries: 30
       start_period: 20s
     restart: unless-stopped
-    networks: [advisor]
+    networks: [advisor, evaluator_source]
 
   repository-db:
-    image: postgresql-advisor/powa-postgres:17-5.2.0
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-hypopg-1.4.3
     environment:
       PGPORT: 5433
       POSTGRES_DB: powa_repository
@@ -58,7 +70,7 @@ services:
     ports:
       - "${REPOSITORY_DB_BIND:-127.0.0.1}:${REPOSITORY_DB_PORT:-15433}:5433"
     volumes:
-      - repository_data:/var/lib/postgresql/data
+      - repository_data:/var/lib/postgresql
       - ./deployment/repository/init-repository.sh:/docker-entrypoint-initdb.d/10-init-repository.sh:ro,Z
       - ./sql/001_advisor_schema.sql:/docker-entrypoint-initdb.d/20-advisor-schema.sql:ro,Z
       - ./sql/002_prepare_remote_source.sql:/opt/advisor/sql/002_prepare_remote_source.sql:ro,Z
@@ -111,7 +123,7 @@ services:
   api:
     build:
       context: ./backend
-    image: postgresql-advisor/api:iteration-1
+    image: postgresql-advisor/api:iteration-2.2
     environment:
       DATABASE_URL: postgresql://advisor_api:${ADVISOR_API_PASSWORD:-advisor_dev_api}@repository-db:5433/powa_repository
       DEFAULT_WINDOW: ${DEFAULT_WINDOW:-24h}
@@ -119,12 +131,17 @@ services:
       RETENTION_DAYS: ${RETENTION_DAYS:-90}
       SQL_TEXT_VISIBILITY: authorized
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EVALUATOR_URL: http://evaluator:8010
+      EVALUATOR_TOKEN: ${EVALUATOR_TOKEN:-advisor-dev-evaluator-token}
+      EVALUATOR_TIMEOUT_SECONDS: ${EVALUATOR_TIMEOUT_SECONDS:-4}
     ports:
       - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     depends_on:
       repository-db:
         condition: service_healthy
       collector:
+        condition: service_started
+      evaluator:
         condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
@@ -133,7 +150,40 @@ services:
       retries: 12
       start_period: 15s
     restart: unless-stopped
-    networks: [advisor]
+    networks: [advisor, evaluator_control]
+
+  evaluator:
+    build:
+      context: ./backend
+    image: postgresql-advisor/api:iteration-2.2
+    command: ["uvicorn", "app.evaluator:app", "--host", "0.0.0.0", "--port", "8010"]
+    environment:
+      EVALUATOR_DATABASE_URL: postgresql://advisor_evaluator:${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}@source-db:5432/appdb
+      EVALUATOR_ALLOWED_SERVER_ALIAS: ${EVALUATOR_ALLOWED_SERVER_ALIAS:-test-source}
+      EVALUATOR_ALLOWED_DATABASE: ${EVALUATOR_ALLOWED_DATABASE:-appdb}
+      EVALUATOR_TOKEN: ${EVALUATOR_TOKEN:-advisor-dev-evaluator-token}
+      EVALUATOR_STATEMENT_TIMEOUT_MS: ${EVALUATOR_STATEMENT_TIMEOUT_MS:-2000}
+      EVALUATOR_LOCK_TIMEOUT_MS: ${EVALUATOR_LOCK_TIMEOUT_MS:-250}
+      EVALUATOR_MIN_IMPROVEMENT_PERCENT: ${EVALUATOR_MIN_IMPROVEMENT_PERCENT:-10}
+    depends_on:
+      source-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    restart: unless-stopped
+    networks: [evaluator_control, evaluator_source]
 
   workload:
     build:
@@ -156,7 +206,7 @@ services:
   web:
     build:
       context: ./frontend
-    image: postgresql-advisor/web:iteration-1
+    image: postgresql-advisor/web:iteration-2.2
     ports:
       - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-5173}:80"
     depends_on:
@@ -173,6 +223,12 @@ services:
 networks:
   advisor:
     driver: bridge
+  evaluator_control:
+    driver: bridge
+    internal: true
+  evaluator_source:
+    driver: bridge
+    internal: true
 
 volumes:
   source_data:
