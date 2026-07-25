@@ -213,10 +213,10 @@ def test_unknown_window_rejected() -> None:
 
 
 def test_annotation_status_validation() -> None:
-    payload = AnnotationUpdate(status="in_review", note="Kontrol ediliyor", updatedBy="tester")
+    payload = AnnotationUpdate(status="in_review", note="Kontrol ediliyor")
     assert payload.status == "IN_REVIEW"
     with pytest.raises(ValidationError):
-        AnnotationUpdate(status="RUNNING", updatedBy="tester")
+        AnnotationUpdate(status="RUNNING")
 
 
 def test_api_source_connection_is_rejected() -> None:

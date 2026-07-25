@@ -18,6 +18,9 @@ fi
 
 docker compose --profile real-validation config --quiet
 
+[[ "${ADVISOR_API_TOKEN:-}" =~ ^adv_pat_v1_[A-Za-z0-9_-]{43}$ ]] \
+  || fail "ADVISOR_API_TOKEN secret manager'dan alinmis gecerli raw token olmali"
+
 required_services=(source-db repository-db api evaluator clone-db clone-evaluator)
 for service in "${required_services[@]}"; do
   service_id="$(
@@ -278,6 +281,7 @@ if docker compose --profile real-validation exec -T \
   -e ACCEPTANCE_SERVER_ID="$server_id" \
   -e ACCEPTANCE_DATABASE_ID="$database_id" \
   -e ACCEPTANCE_CANDIDATE_ID="$candidate_id" \
+  -e ADVISOR_API_TOKEN="$ADVISOR_API_TOKEN" \
   api python - >"$response_file" <<'PY'
 import json
 import os
@@ -285,9 +289,9 @@ import sys
 import urllib.error
 import urllib.request
 
-token = os.environ.get("RUNTIME_ADMIN_TOKEN", "")
-if len(token) < 16:
-    raise SystemExit("api container RUNTIME_ADMIN_TOKEN is not configured")
+token = os.environ.get("ADVISOR_API_TOKEN", "")
+if not token.startswith("adv_pat_v1_"):
+    raise SystemExit("ADVISOR_API_TOKEN is not configured")
 
 query_id = int(os.environ["ACCEPTANCE_QUERY_ID"])
 payload = json.dumps(
@@ -303,8 +307,7 @@ request = urllib.request.Request(
     data=payload,
     headers={
         "Content-Type": "application/json",
-        "X-Advisor-Role": "admin",
-        "X-Advisor-Admin-Token": token,
+        "Authorization": f"Bearer {token}",
     },
     method="POST",
 )

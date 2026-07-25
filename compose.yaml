@@ -222,9 +222,9 @@ services:
       CLONE_EVALUATOR_URL: http://clone-evaluator:8020
       CLONE_EVALUATOR_TOKEN: ${CLONE_EVALUATOR_TOKEN:-advisor-dev-clone-evaluator-token}
       CLONE_EVALUATOR_TIMEOUT_SECONDS: ${CLONE_EVALUATOR_TIMEOUT_SECONDS:-90}
-      # Bosken admin endpointleri fail-closed kalir. Yerel operator kullanimi
-      # icin .env.example'daki en az 16 karakterli secret'i ozellikle ayarlayin.
-      RUNTIME_ADMIN_TOKEN: ${RUNTIME_ADMIN_TOKEN:-}
+      # Bos registry annotation/export/runtime endpointlerini fail-closed tutar.
+      # Yalniz token SHA-256 hashleri API ortaminda saklanir.
+      ADVISOR_AUTH_PRINCIPALS: '${ADVISOR_AUTH_PRINCIPALS:-[]}'
     ports:
       - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     depends_on:

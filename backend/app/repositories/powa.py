@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -20,12 +20,53 @@ SORT_COLUMNS = {
     "waits": "wait_total_samples",
 }
 
+EXPORT_FETCH_SIZE = 500
+
 
 def interval_for(window: str) -> str:
     try:
         return WINDOW_INTERVALS[window]
     except KeyError as exc:
         raise ValueError(f"Gecersiz zaman araligi: {window}") from exc
+
+
+def _query_filters(
+    *,
+    search: str | None,
+    priority: str | None,
+    server_id: int | None,
+    database_id: int | None,
+    min_calls: int,
+    min_duration_ms: float,
+    regressions_only: bool,
+) -> tuple[str, list[Any]]:
+    """Build the shared, parameterized query-list/export filter clause."""
+    conditions = ["calls >= %s", "total_exec_time_ms >= %s"]
+    filters: list[Any] = [min_calls, min_duration_ms]
+
+    if search:
+        conditions.append("(sql_text ILIKE %s OR query_id::text ILIKE %s)")
+        search_pattern = f"%{search}%"
+        filters.extend([search_pattern, search_pattern])
+    if priority:
+        conditions.append("priority = %s")
+        filters.append(priority.upper())
+    if server_id is not None:
+        conditions.append("server_id = %s")
+        filters.append(server_id)
+    if database_id is not None:
+        conditions.append("database_id = %s")
+        filters.append(database_id)
+    if regressions_only:
+        conditions.extend([
+            "previous_period_available IS TRUE",
+            "comparison_reliable IS TRUE",
+            "regression_percent >= 20",
+            "previous_calls >= 20",
+            "calls >= 20",
+        ])
+
+    return " AND ".join(conditions), filters
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -401,32 +442,15 @@ class PowaRepository:
         regressions_only: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         interval = interval_for(window)
-        conditions = ["calls >= %s", "total_exec_time_ms >= %s"]
-        filters: list[Any] = [min_calls, min_duration_ms]
-
-        if search:
-            conditions.append("(sql_text ILIKE %s OR query_id::text ILIKE %s)")
-            search_pattern = f"%{search}%"
-            filters.extend([search_pattern, search_pattern])
-        if priority:
-            conditions.append("priority = %s")
-            filters.append(priority.upper())
-        if server_id is not None:
-            conditions.append("server_id = %s")
-            filters.append(server_id)
-        if database_id is not None:
-            conditions.append("database_id = %s")
-            filters.append(database_id)
-        if regressions_only:
-            conditions.extend([
-                "previous_period_available IS TRUE",
-                "comparison_reliable IS TRUE",
-                "regression_percent >= 20",
-                "previous_calls >= 20",
-                "calls >= 20",
-            ])
-
-        where_sql = " AND ".join(conditions)
+        where_sql, filters = _query_filters(
+            search=search,
+            priority=priority,
+            server_id=server_id,
+            database_id=database_id,
+            min_calls=min_calls,
+            min_duration_ms=min_duration_ms,
+            regressions_only=regressions_only,
+        )
         order_column = SORT_COLUMNS.get(sort_by, SORT_COLUMNS["impact"])
         offset = (page - 1) * page_size
 
@@ -464,6 +488,53 @@ class PowaRepository:
                     )
                     total = int((await cursor.fetchone())["total"])
         return rows, total
+
+    async def stream_query_rows(
+        self,
+        *,
+        window: str,
+        search: str | None = None,
+        priority: str | None = None,
+        server_id: int | None = None,
+        database_id: int | None = None,
+        min_calls: int = 0,
+        min_duration_ms: float = 0,
+        sort_by: str = "impact",
+        batch_size: int = EXPORT_FETCH_SIZE,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        """Yield every filtered query through a bounded server-side cursor."""
+        if batch_size < 1:
+            raise ValueError("batch_size en az 1 olmali")
+
+        interval = interval_for(window)
+        where_sql, filters = _query_filters(
+            search=search,
+            priority=priority,
+            server_id=server_id,
+            database_id=database_id,
+            min_calls=min_calls,
+            min_duration_ms=min_duration_ms,
+            regressions_only=False,
+        )
+        order_column = SORT_COLUMNS.get(sort_by, SORT_COLUMNS["impact"])
+        data_query = f"""
+            SELECT metrics.*, servers.alias AS server_alias
+            FROM advisor.query_metrics(%s::interval) AS metrics
+            LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
+            WHERE {where_sql}
+            ORDER BY {order_column} DESC NULLS LAST, query_id
+        """
+
+        async with pool.connection() as connection:
+            # A named cursor keeps result transfer and API memory bounded even
+            # when the filtered export contains far more than one UI page.
+            async with connection.cursor(name="advisor_query_csv_export") as cursor:
+                await cursor.execute(data_query, [interval, *filters])
+                while True:
+                    fetched = await cursor.fetchmany(batch_size)
+                    if not fetched:
+                        break
+                    yield [dict(row) for row in fetched]
 
     async def overview_summary(self, *, window: str) -> dict[str, Any]:
         """Aggregate every tracked query; pagination must never affect cards."""
@@ -887,35 +958,36 @@ class PowaRepository:
         actor: str,
     ) -> dict[str, Any]:
         async with pool.connection() as connection:
-            async with connection.transaction():
-                async with connection.cursor() as cursor:
-                    await cursor.execute("SELECT set_config('app.actor', %s, true)", (actor,))
-                    await cursor.execute(
-                        """
-                        INSERT INTO advisor.query_annotations
-                            (server_id, database_id, query_id, status, note, updated_by)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (server_id, database_id, query_id)
-                        DO UPDATE SET status = EXCLUDED.status,
-                                      note = EXCLUDED.note,
-                                      updated_by = EXCLUDED.updated_by,
-                                      updated_at = now()
-                        RETURNING server_id, database_id, query_id, status, note,
-                                  updated_by, updated_at
-                        """,
-                        (server_id, database_id, query_id, status, note, actor),
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT *
+                    FROM advisor.upsert_query_annotation(
+                        %s::integer, %s::oid, %s::bigint,
+                        %s::text, %s::text, %s::text
                     )
-                    return dict(await cursor.fetchone())
+                    """,
+                    (server_id, database_id, query_id, status, note, actor),
+                )
+                return dict(await cursor.fetchone())
 
-    async def audit_export(self, *, actor: str, details: dict[str, Any]) -> None:
+    async def record_query_export_audit(
+        self,
+        *,
+        actor: str,
+        phase: str,
+        details: dict[str, Any],
+    ) -> None:
+        normalized_phase = phase.upper()
+        if normalized_phase not in {"REQUESTED", "COMPLETED"}:
+            raise ValueError("Gecersiz CSV audit asamasi")
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     """
-                    INSERT INTO advisor.audit_log(actor, action, object_type, object_key, details)
-                    VALUES (%s, 'QUERIES_EXPORTED', 'query_collection', 'queries.csv', %s::jsonb)
+                    SELECT advisor.record_query_export_audit(%s::text, %s::text, %s::jsonb)
                     """,
-                    (actor, __import__("json").dumps(details)),
+                    (actor, normalized_phase, __import__("json").dumps(details)),
                 )
 
 

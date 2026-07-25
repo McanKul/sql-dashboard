@@ -9,9 +9,15 @@ import app.api.router as router_module
 from app.api.router import validate_query_index_runtime
 from app.repositories.powa import repository
 from app.schemas import RuntimeIndexValidationRequest
+from app.security import RequestPrincipal
 
 
 CANDIDATE_ID = "d3cc4474-0303-4a6f-b26f-82ad6d4e58a7"
+ADMIN_PRINCIPAL = RequestPrincipal(
+    credential_id="runtime-test",
+    subject="user:runtime-test",
+    roles=frozenset({"admin"}),
+)
 
 
 def _candidate() -> dict[str, Any]:
@@ -75,7 +81,7 @@ async def test_runtime_route_never_starts_planner_or_clone_without_fixture(
     result = await validate_query_index_runtime(
         query_id=-42,
         payload=_payload(),
-        role="admin",
+        principal=ADMIN_PRINCIPAL,
         window="24h",
     )
 
@@ -133,7 +139,7 @@ async def test_runtime_route_forwards_private_fixture_only_to_internal_clone(
     result = await validate_query_index_runtime(
         query_id=-42,
         payload=_payload(),
-        role="admin",
+        principal=ADMIN_PRINCIPAL,
         window="24h",
     )
 

@@ -3,16 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 ALLOWED_STATUSES = {"NEW", "IN_REVIEW", "COMPLETED", "REJECTED"}
 
 
 class AnnotationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     status: str
     note: str | None = Field(default=None, max_length=4000)
-    updated_by: str = Field(alias="updatedBy", min_length=1, max_length=120)
 
     @field_validator("status")
     @classmethod

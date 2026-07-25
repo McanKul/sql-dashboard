@@ -19,7 +19,11 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-`.env` içindeki admin, collector, API, evaluator, runtime operator ve iç servis token örneklerini değiştirin. `RUNTIME_ADMIN_TOKEN` değerini frontend build/env dosyasına koymayın. Ardından:
+`.env` içindeki PostgreSQL ve iç servis secret örneklerini değiştirin. Annotation,
+CSV ve runtime endpoint'leri için raw token'ı secret manager'da tutup yalnız
+hash registry'sini `ADVISOR_AUTH_PRINCIPALS` olarak yapılandırın; raw token'ı
+frontend build/env dosyasına koymayın. Credential üretimi ve rol modeli
+[kimlik doğrulama belgesindedir](docs/AUTHENTICATION.md). Ardından:
 
 ```bash
 docker info
@@ -267,9 +271,16 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 - Kaynak DSN'i yalnız ayrı `evaluator` servisindedir. Bu servis `advisor_evaluator` rolü, read-only transaction, kısa timeout, connection limit, internal network ve token korumalı iç endpoint ile sınırlandırılır; ana API'ye kaynak parolası verilmez.
 - HypoPG fonksiyonlarının PUBLIC yetkileri kaldırılmıştır. Evaluator yalnız sanal index oluşturur ve plain `EXPLAIN` çalıştırır; kopyalanabilir SQL'in kullanıcıya dönmesi gerçek DDL çalıştığı anlamına gelmez.
 - Header gönderilmeyen API isteği `viewer` sayılır ve tam SQL maskelenir. Referans web istemcisi analiz ekranları için demonstrasyon amaçlı `analyst` header'ı gönderir; bu gerçek kullanıcı kimliği değildir.
-- `admin` iddiası tek başına kabul edilmez. `RUNTIME_ADMIN_TOKEN` boşken admin işlemleri fail-closed kapalıdır; CSV export ve disposable-clone runtime testi için ayrıca bu server-side secret ile `X-Advisor-Admin-Token` gerekir. Secret browser bundle'ına verilmez; yalnız güvenilir yerel/operator istemcisi kullanır.
+- Annotation, CSV export ve disposable-clone runtime testi yalnız server-side
+  SHA-256 registry'de eşleşen Bearer principal ile açılır. Actor istemci
+  body/header'ından değil doğrulanmış `subject` değerinden gelir; API database
+  rolünün annotation/audit tablolarına doğrudan write yetkisi yoktur.
+- CSV export listeyle aynı filtrelerin tamamını uygular, 200 satır sayfa sınırına
+  takılmaz ve server-side cursor ile sabit boyutlu partiler hâlinde akar.
 - Runtime bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar; UI yalnız fixture'ın hazır olup olmadığını görür.
-- Statik operator token'ı tam kullanıcı kimlik doğrulamasının yerini tutmaz. İnternet erişimi verilen bir kurulumda OIDC/SSO veya kimlik doğrulayan reverse proxy eklenmeden üretim güvenliği sağlanmış sayılmaz.
+- Yerel/operator PAT modeli server-side kimlik sağlar fakat SSO değildir.
+  İnternet erişimi verilen bir kurulumda TLS, rate limit ve OIDC/BFF veya
+  kimlik doğrulayan reverse proxy eklenmeden üretim güvenliği sağlanmış sayılmaz.
 - `.env` yalnız yerel geliştirme içindir; canlı ortamda secret manager ve parola rotasyonu kullanın.
 - Docker port publish kuralları bazı firewall araçlarından önce uygulanabilir. Uzak web erişimini özellikle açtıysanız Linux sunucuda `DOCKER-USER` zinciri veya kurumun network policy katmanıyla yalnız web portuna izin verildiğini ayrıca doğrulayın.
 

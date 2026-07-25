@@ -104,6 +104,12 @@ migration_fingerprint="$(docker compose exec -T repository-db psql -U postgres -
   || fail "Repository migration ledger/manifest uyusmuyor: ${migration_fingerprint:-bos}"
 pass "Repository migration surumleri ve SHA-256 ledger kayitlari dogru"
 
+docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --port 5433 --dbname powa_repository --file=- \
+  < sql/tests/authenticated_actor_integration.sql \
+  >/tmp/advisor-authenticated-actor-integration.log
+pass "Annotation/export DB wrapper ACL, actor spoof ve rollback fixture'i dogru"
+
 source_hypopg_version="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'")"
 repository_hypopg_installed="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
@@ -1203,16 +1209,49 @@ assert elapsed < 2.0, f'queries API hedefi asildi: {elapsed:.3f}s'
 PY
 pass "24 saat sorgu API yaniti 2 saniyenin altinda (${http_seconds}s)"
 
-curl -fsS -X PATCH \
-  -H 'Content-Type: application/json' \
-  "${api_url}/api/v1/queries/${query_id}/annotation?serverId=${server_id}&databaseId=${database_id}" \
-  --data '{"status":"IN_REVIEW","note":"Otomatik kabul testi","updatedBy":"acceptance-test"}' \
-  >/tmp/advisor-annotation.json
+annotation_url="${api_url}/api/v1/queries/${query_id}/annotation?serverId=${server_id}&databaseId=${database_id}"
+if [[ "${ADVISOR_API_TOKEN:-}" =~ ^adv_pat_v1_[A-Za-z0-9_-]{43}$ ]]; then
+  curl -fsS -X PATCH \
+    -H "Authorization: Bearer ${ADVISOR_API_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    "$annotation_url" \
+    --data '{"status":"IN_REVIEW","note":"Otomatik kabul testi"}' \
+    >/tmp/advisor-annotation.json
 
-audit_count="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
-  "SELECT count(*) FROM advisor.audit_log WHERE actor = 'acceptance-test' AND action IN ('ANNOTATION_CREATED','ANNOTATION_UPDATED')")"
-(( audit_count >= 1 )) || fail "Annotation audit kaydi olusmadi"
-pass "Not/durum degisikligi audit loga yazildi"
+  annotation_actor="$("$python_bin" - /tmp/advisor-annotation.json <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    payload = json.load(handle)
+actor = payload.get('updatedBy')
+assert isinstance(actor, str) and actor, payload
+print(actor)
+PY
+)"
+  annotation_audit_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
+    -d powa_repository -AtF '|' -qc \
+    "SELECT annotation.updated_by,
+            count(audit.id) FILTER (WHERE audit.actor = annotation.updated_by)
+       FROM advisor.query_annotations AS annotation
+       LEFT JOIN advisor.audit_log AS audit
+         ON audit.object_key = annotation.server_id || ':' || annotation.database_id || ':' || annotation.query_id
+        AND audit.action IN ('ANNOTATION_CREATED','ANNOTATION_UPDATED')
+      WHERE annotation.server_id = ${server_id}
+        AND annotation.database_id = ${database_id}
+        AND annotation.query_id = ${query_id}
+      GROUP BY annotation.updated_by")"
+  IFS='|' read -r stored_actor audit_count <<< "$annotation_audit_state"
+  [[ "$annotation_actor" == "$stored_actor" && "$audit_count" =~ ^[0-9]+$ ]] \
+    || fail "Annotation response/satir actor eslesmedi: ${annotation_audit_state:-bos}"
+  (( audit_count >= 1 )) || fail "Dogrulanmis actor icin annotation audit kaydi olusmadi"
+  pass "Annotation response, satir sahibi ve audit actor Bearer subject ile eslesti"
+else
+  annotation_http_code="$(curl -sS -o /tmp/advisor-annotation-unauthorized.json -w '%{http_code}' \
+    -X PATCH -H 'Content-Type: application/json' "$annotation_url" \
+    --data '{"status":"IN_REVIEW","note":"Yetkisiz kabul testi"}')"
+  [[ "$annotation_http_code" == "401" ]] \
+    || fail "Token olmadan annotation 401 yerine ${annotation_http_code} dondu"
+  pass "Auth registry/token verilmediginde annotation fail-closed kapali"
+fi
 
 api_environment="$(docker compose exec -T api env)"
 [[ "$api_environment" != *"source-db"* && "$api_environment" != *":5432"* && "$api_environment" != *"/appdb"* ]] \

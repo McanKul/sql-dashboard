@@ -283,7 +283,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: {
       Accept: 'application/json',
       'X-Advisor-Role': 'analyst',
-      'X-Advisor-Actor': 'advisor-web',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
       ...init?.headers,
     },

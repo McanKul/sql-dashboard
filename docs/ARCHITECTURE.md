@@ -198,19 +198,22 @@ Sorgu analiz listesi `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE` ve `MERGE` i
 | `advisor_join_reader` | Yalnız JOIN outbox `fetch/ack` fonksiyonları | Yok | Source batch okuma ve teslim sonrası ack |
 | `advisor_join_ingest` | Yok | Tek server kimliğine bağlı private ingest/status/source-purge wrapper'ları; tablo ve global purge erişimi yok | JOIN batch yazımı |
 | `advisor_workload_login` | Yalnız opt-in realistic test rollerine `SET ROLE` ve stats okuma; admin yetkisi yok | Yok | İzole source üzerinde karma yük oturumlarını açma |
-| `advisor_api` | Bağlantı yok | PoWA read + advisor kontrollü write | API sorguları ve not/audit |
+| `advisor_api` | Bağlantı yok | PoWA/advisor read + yalnız SECURITY DEFINER annotation/audit wrapper'ları | API sorguları ve kontrollü not/audit |
 | `clone_admin` / `clone_runner` | Yalnız tmpfs clone cluster'ı; kaynak ağa yol yok | Yok | Clone oluşturma/index ve read-only gerçek plan ölçümü |
 | API isteği `viewer` | Yok | API üzerinden maskeli SQL | Varsayılan görüntüleme |
 | API isteği `analyst` | Yok | API üzerinden tam SQL | Analiz istemcisi |
-| API isteği `admin` + server-side token | Yok | Tam SQL + CSV export + clone runtime başlatma | Güvenilir yerel/operator istemcisi |
+| Doğrulanmış Bearer `annotator` | Yok | Kontrollü annotation wrapper'ı | Kimliği audit'e yazılan inceleyici |
+| Doğrulanmış Bearer `admin` | Yok | Tam SQL + annotation + streaming CSV + clone runtime | Güvenilir yerel/operator istemcisi |
 
 Header göndermeyen API isteği `viewer` olur; tek kullanıcılı referans web
 istemcisi ayrı bir kullanıcı/rol arayüzü göstermeden analiz verisini almak için
 sabit `analyst` isteği gönderir. Bu, davranışı ve maskeleme politikasını
-doğrulamak içindir; gerçek kimlik doğrulama değildir. `admin` rolü ise yalnız
-`X-Advisor-Role: admin` ile seçilemez: `X-Advisor-Admin-Token` değerinin
-sunucudaki `RUNTIME_ADMIN_TOKEN` ile eşleşmesi gerekir. Secret browser'a
-gönderilmez.
+doğrulamak içindir; write/audit kimliği değildir. Annotation, CSV ve runtime
+endpoint'leri `Authorization: Bearer` token'ını server-side
+`ADVISOR_AUTH_PRINCIPALS` SHA-256 registry'sinde doğrular. Actor registry'deki
+sabit subject'tir; `X-Advisor-Actor`, `X-Advisor-Admin-Token` ve body
+`updatedBy` yetki veya kimlik üretmez. Ayrıntılar
+[AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
 
 ## Bilinen sınırlar
 

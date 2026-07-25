@@ -3,10 +3,12 @@ from __future__ import annotations
 import csv
 import io
 import time
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 
 from app.config import WINDOW_INTERVALS, get_settings
 from app.clone_evaluator import (
@@ -28,7 +30,13 @@ from app.schemas import (
     PredicateResponse,
     RuntimeIndexValidationRequest,
 )
-from app.security import can_view_sql, request_role, require_admin
+from app.security import (
+    RequestPrincipal,
+    can_view_sql,
+    request_admin_principal,
+    request_annotator_principal,
+    request_role,
+)
 from app.services.evaluator import evaluate_index_candidate
 from app.services.clone_evaluator import validate_index_on_clone
 
@@ -36,6 +44,43 @@ from app.services.clone_evaluator import validate_index_on_clone
 router = APIRouter(prefix="/api/v1")
 settings = get_settings()
 Window = Literal["1h", "24h", "7d", "30d"]
+
+QUERY_CSV_COLUMNS = (
+    ("server_id", "server_id"),
+    ("database_id", "database_id"),
+    ("query_id", "query_id"),
+    ("sql", "sql_text"),
+    ("calls", "calls"),
+    ("total_exec_time_ms", "total_exec_time_ms"),
+    ("mean_exec_time_ms", "mean_exec_time_ms"),
+    ("cpu_user_time_ms", "cpu_user_time_ms"),
+    ("cpu_system_time_ms", "cpu_system_time_ms"),
+    ("cpu_total_time_ms", "cpu_total_time_ms"),
+    ("cpu_percent_of_exec_time", "cpu_percent_of_exec_time"),
+    ("filesystem_reads_bytes", "filesystem_reads_bytes"),
+    ("filesystem_writes_bytes", "filesystem_writes_bytes"),
+    ("wait_total_samples", "wait_total_samples"),
+    ("dominant_wait_category", "dominant_wait_category"),
+    ("dominant_wait_event", "dominant_wait_event"),
+    ("dominant_wait_share_percent", "dominant_wait_share_percent"),
+    ("impact_score", "impact_score"),
+    ("priority", "priority"),
+    ("regression_percent", "regression_percent"),
+    ("status", "review_status"),
+)
+
+
+def _query_csv_chunk(rows: list[dict[str, Any]], *, include_header: bool = False) -> str:
+    """Serialize one bounded database batch, never the complete export."""
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    if include_header:
+        writer.writerow([header for header, _ in QUERY_CSV_COLUMNS])
+    writer.writerows(
+        [row.get(key) for _, key in QUERY_CSV_COLUMNS]
+        for row in rows
+    )
+    return output.getvalue()
 
 
 COLLECTOR_STATUS_RANK = {
@@ -766,10 +811,9 @@ async def evaluate_composite_query_index(
 async def validate_query_index_runtime(
     query_id: int,
     payload: RuntimeIndexValidationRequest,
-    role: Annotated[str, Depends(request_role)],
+    principal: Annotated[RequestPrincipal, Depends(request_admin_principal)],
     window: Window = "24h",
 ) -> dict[str, Any]:
-    require_admin(role)
     candidate = await repository.composite_candidate(
         candidate_id=payload.candidateId,
         server_id=payload.serverId,
@@ -889,6 +933,7 @@ async def validate_query_index_runtime(
 async def update_annotation(
     query_id: int,
     payload: AnnotationUpdate,
+    principal: Annotated[RequestPrincipal, Depends(request_annotator_principal)],
     server_id: int = Query(alias="serverId"),
     database_id: int = Query(alias="databaseId"),
 ) -> dict[str, Any]:
@@ -898,7 +943,7 @@ async def update_annotation(
         query_id=query_id,
         status=payload.status,
         note=payload.note,
-        actor=payload.updated_by,
+        actor=principal.subject,
     )
     return {
         "serverId": row["server_id"],
@@ -1148,68 +1193,68 @@ async def operations() -> dict[str, Any]:
 
 @router.get("/export/queries.csv")
 async def export_queries(
-    role: Annotated[str, Depends(request_role)],
+    principal: Annotated[RequestPrincipal, Depends(request_admin_principal)],
     window: Window = "24h",
-    x_advisor_actor: str = Header(default="admin", alias="X-Advisor-Actor"),
-) -> Response:
-    require_admin(role)
-    rows, _ = await repository.query_rows(window=window, page_size=200, sort_by="impact")
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "server_id",
-            "database_id",
-            "query_id",
-            "sql",
-            "calls",
-            "total_exec_time_ms",
-            "mean_exec_time_ms",
-            "cpu_user_time_ms",
-            "cpu_system_time_ms",
-            "cpu_total_time_ms",
-            "cpu_percent_of_exec_time",
-            "filesystem_reads_bytes",
-            "filesystem_writes_bytes",
-            "wait_total_samples",
-            "dominant_wait_category",
-            "dominant_wait_event",
-            "dominant_wait_share_percent",
-            "impact_score",
-            "priority",
-            "regression_percent",
-            "status",
-        ]
+    search: str | None = Query(default=None, max_length=300),
+    priority: str | None = None,
+    server_id: int | None = Query(default=None, alias="serverId"),
+    database_id: int | None = Query(default=None, alias="databaseId"),
+    min_calls: int = Query(default=0, ge=0, alias="minCalls"),
+    min_duration_ms: float = Query(default=0, ge=0, alias="minDurationMs"),
+    sort_by: str = Query(default="impact", alias="sort"),
+) -> StreamingResponse:
+    export_id = str(uuid4())
+    export_context = {
+        "exportId": export_id,
+        "credentialId": principal.credential_id,
+        "window": window,
+        "filters": {
+            "search": search,
+            "priority": priority,
+            "serverId": server_id,
+            "databaseId": database_id,
+            "minCalls": min_calls,
+            "minDurationMs": min_duration_ms,
+            "sort": sort_by,
+        },
+    }
+    await repository.record_query_export_audit(
+        actor=principal.subject,
+        phase="REQUESTED",
+        details=export_context,
     )
-    for row in rows:
-        writer.writerow(
-            [
-                row["server_id"],
-                row["database_id"],
-                row["query_id"],
-                row["sql_text"],
-                row["calls"],
-                row["total_exec_time_ms"],
-                row["mean_exec_time_ms"],
-                row["cpu_user_time_ms"],
-                row["cpu_system_time_ms"],
-                row["cpu_total_time_ms"],
-                row["cpu_percent_of_exec_time"],
-                row["filesystem_reads_bytes"],
-                row["filesystem_writes_bytes"],
-                row["wait_total_samples"],
-                row["dominant_wait_category"],
-                row["dominant_wait_event"],
-                row["dominant_wait_share_percent"],
-                row["impact_score"],
-                row["priority"],
-                row["regression_percent"],
-                row["review_status"],
-            ]
+
+    async def body():
+        row_count = 0
+        async with aclosing(
+            repository.stream_query_rows(
+                window=window,
+                search=search,
+                priority=priority,
+                server_id=server_id,
+                database_id=database_id,
+                min_calls=min_calls,
+                min_duration_ms=min_duration_ms,
+                sort_by=sort_by,
+            )
+        ) as batches:
+            yield _query_csv_chunk([], include_header=True)
+            async for rows in batches:
+                row_count += len(rows)
+                yield _query_csv_chunk(rows)
+
+        # The cursor connection has returned to the pool before completion
+        # audit takes a second connection.  This ordering avoids pool
+        # starvation under concurrent exports.  A disconnected client keeps
+        # the durable REQUESTED entry but does not receive a false completion.
+        await repository.record_query_export_audit(
+            actor=principal.subject,
+            phase="COMPLETED",
+            details={**export_context, "rows": row_count},
         )
-    await repository.audit_export(actor=x_advisor_actor, details={"window": window, "rows": len(rows)})
-    return Response(
-        content=output.getvalue(),
+
+    return StreamingResponse(
+        content=body(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="queries-{window}.csv"'},
     )

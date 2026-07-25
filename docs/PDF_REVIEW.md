@@ -139,11 +139,11 @@ Sayaç adları da statement metriklerinden ayrılmıştır: `occurrences`, pg_qu
 
 ## Güvenlik açısından ek notlar
 
-PDF'nin repository-only API, ayrı roller, secret saklama ve SQL metni görünürlüğü kararları yerindedir. Repoda bunların temel davranışı uygulanmıştır. Bununla birlikte ilk iterasyonun şu parçaları üretim kimlik doğrulaması değildir:
+PDF'nin repository-only API, ayrı roller, secret saklama ve SQL metni görünürlüğü kararları yerindedir. Repoda bunların temel davranışı uygulanmıştır. Annotation, CSV ve runtime işlemlerinde body/header actor güveni kaldırılmış; server-side SHA-256 registry'de doğrulanan Bearer subject audit actor yapılmıştır. Bununla birlikte şu parçalar tam üretim kimlik doğrulaması değildir:
 
 - `X-Advisor-Role` header'ı istemci tarafından seçilebilir.
 - Referans web istemcisi tam sorgu ekranı için `analyst` header'ını varsayılan gönderir.
-- Annotation `updatedBy` alanı istemci girdisidir.
+- Yerel PAT registry gerçek API kimliği sağlar fakat OIDC/SSO değildir.
 - `.env` secret manager değildir.
 - Web varsayılan olarak HTTP `5173` sunar; TLS terminasyonu yoktur.
 
@@ -159,7 +159,7 @@ Aşağıdakiler sağlanırsa PDF'deki ilk iterasyon amacı karşılanır:
 4. Test fonksiyonu kontrollü sorgu yükü üretir.
 5. API yalnız repository bağlantısına sahiptir.
 6. Sorgular gerçek PoWA fark metrikleriyle sıralanır ve SQL yetkisiz rolde maskelenir.
-7. Annotation değişikliği audit kaydı oluşturur.
+7. Doğrulanmış `annotator|admin` principal annotation değişikliği yapar; response, satır sahibi ve audit actor aynı server-side subject olur.
 8. UI Genel Bakış, Sorgular, Sistem Sağlığı ve Operasyonlar ekranlarını açar. Takım iş akışı tek kullanıcılı kurulum kararıyla UI kapsamı dışında kalır; annotation API'leri backend'de durur.
 9. Predicate endpoint'i ve sorgu detay paneli WHERE/filter kanıtını gösterir; JOIN ve DDL capability sınırlarını açıkça bildirir.
 10. 24 saatlik sorgu listesi kabul ortamında 2 saniyenin altında yanıt verir.

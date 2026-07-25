@@ -102,12 +102,10 @@ fixture hash/identity/expiry kontrolünden sonra aynı persisted adayı HypoPG i
 yeniden doğrular:
 
 ```bash
-# .env'deki degeri kopyalamak yerine tercihen secret manager'dan alin.
-export RUNTIME_ADMIN_TOKEN='AYNI_GUCLU_RUNTIME_OPERATOR_TOKENI'
+export ADVISOR_API_TOKEN='SECRET_MANAGERDAN_ALINAN_RAW_TOKEN'
 curl -fsS -X POST \
   -H 'Content-Type: application/json' \
-  -H 'X-Advisor-Role: admin' \
-  -H "X-Advisor-Admin-Token: ${RUNTIME_ADMIN_TOKEN:?runtime token gerekli}" \
+  -H "Authorization: Bearer ${ADVISOR_API_TOKEN:?api token gerekli}" \
   -d '{"serverId":1,"databaseId":16384,"candidateId":"CANDIDATE_ID"}' \
   'http://127.0.0.1:8000/api/v1/queries/QUERY_ID/runtime-index-validations?window=24h'
 ```
@@ -163,7 +161,7 @@ clone-evaluator <-> clone-db           (clone_data)
 
 `join-snapshotter` ana `advisor` ağına katılmaz. `api` clone DB credential'ı ve `clone_data` ağı almaz. `clone-evaluator` source/repository DSN'i veya bu ağları almaz. `clone-db` her bağlantıda `advisor.validation_clone=on` marker'ı taşır; evaluator marker, tam admin/runner rolü, template işareti ve bootstrap manifestini DDL/ölçüm öncesinde tekrar doğrular. PostgreSQL container'ına tmpfs bootstrap için yalnız sahiplik ve uid/gid geçiş capability'leri geri verilir; clone evaluator bütün Linux capability'lerini düşürür.
 
-Local template sentetik demo verisidir. Üretim benzeri testte aynı servisi yalnız önceden hazırlanmış, erişimi kısıtlı ve gerekiyorsa anonimleştirilmiş clone/restore üzerinde kullanın. `real-validation` profilini genel kullanıma açmadan gerçek kimlik doğrulama, rate limit, audit retention, kaynak veri sınıflandırması ve kapasite sınırı ekleyin. Server-side `RUNTIME_ADMIN_TOKEN` browser'ın admin rolünü kendi kendine ileri sürmesini engeller; kullanıcı kimliği/SSO değildir.
+Local template sentetik demo verisidir. Üretim benzeri testte aynı servisi yalnız önceden hazırlanmış, erişimi kısıtlı ve gerekiyorsa anonimleştirilmiş clone/restore üzerinde kullanın. `real-validation` profili `admin` rollü, server-side hash registry'de doğrulanan Bearer principal ister. Genel kullanıma açmadan TLS, rate limit, audit retention, kaynak veri sınıflandırması ve kapasite sınırı ekleyin. Yerel PAT modeli SSO değildir; ayrıntılar [AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
 
 ## Mevcut demo volume'ünü 2.5–2.6'ya geçirme
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +20,35 @@ WINDOW_BUCKETS: dict[str, str] = {
     "7d": "6 hours",
     "30d": "1 day",
 }
+
+
+PrincipalRole = Literal["analyst", "annotator", "admin"]
+
+
+class AuthPrincipalConfig(BaseModel):
+    """Server-side credential registry entry.
+
+    Only a SHA-256 digest is configured. The bearer token itself stays in the
+    caller's secret store and is never placed in the API environment.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    credential_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    subject: str = Field(min_length=1, max_length=120)
+    token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    roles: frozenset[PrincipalRole] = Field(min_length=1)
+
+    @field_validator("subject")
+    @classmethod
+    def safe_subject(cls, value: str) -> str:
+        if (
+            value != value.strip()
+            or not value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("subject bos olamaz veya kontrol karakteri iceremez")
+        return value
 
 
 class Settings(BaseSettings):
@@ -38,7 +68,7 @@ class Settings(BaseSettings):
     clone_evaluator_url: str | None = None
     clone_evaluator_token: str = "advisor-dev-clone-evaluator-token"
     clone_evaluator_timeout_seconds: float = Field(default=90.0, gt=0, le=180)
-    runtime_admin_token: str | None = None
+    advisor_auth_principals: list[AuthPrincipalConfig] = Field(default_factory=list)
 
     @field_validator("database_url")
     @classmethod
@@ -55,19 +85,15 @@ class Settings(BaseSettings):
             raise ValueError(f"default_window sunlardan biri olmali: {', '.join(WINDOW_INTERVALS)}")
         return value
 
-    @field_validator("runtime_admin_token", mode="before")
-    @classmethod
-    def strong_or_disabled_runtime_admin_token(cls, value: object) -> object:
-        if value is None:
-            return None
-        if not isinstance(value, str):
-            raise ValueError("runtime_admin_token en az 16 karakter olmali")
-        value = value.strip()
-        if not value:
-            return None
-        if len(value) < 16:
-            raise ValueError("runtime_admin_token en az 16 karakter olmali")
-        return value
+    @model_validator(mode="after")
+    def unique_auth_credentials(self) -> Settings:
+        credential_ids = [item.credential_id for item in self.advisor_auth_principals]
+        token_hashes = [item.token_sha256 for item in self.advisor_auth_principals]
+        if len(credential_ids) != len(set(credential_ids)):
+            raise ValueError("advisor_auth_principals credential_id degerleri benzersiz olmali")
+        if len(token_hashes) != len(set(token_hashes)):
+            raise ValueError("advisor_auth_principals token_sha256 degerleri benzersiz olmali")
+        return self
 
 
 @lru_cache

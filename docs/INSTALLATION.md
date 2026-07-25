@@ -190,7 +190,7 @@ ADVISOR_JOIN_REPOSITORY_PASSWORD=GUCLU_JOIN_REPOSITORY_PAROLASI
 CLONE_ADMIN_PASSWORD=GUCLU_CLONE_ADMIN_PAROLASI
 CLONE_RUNNER_PASSWORD=GUCLU_CLONE_RUNNER_PAROLASI
 CLONE_EVALUATOR_TOKEN=GUCLU_CLONE_IC_SERVIS_TOKENI
-RUNTIME_ADMIN_TOKEN=GUCLU_RUNTIME_OPERATOR_TOKENI
+ADVISOR_AUTH_PRINCIPALS='[{"credential_id":"operator-cli","subject":"user:operator","token_sha256":"64_KARAKTER_LOWERCASE_SHA256","roles":["analyst","annotator","admin"]}]'
 ```
 
 Varsayılan bind ayarlarını ilk iterasyon için koruyun:
@@ -202,10 +202,12 @@ API_BIND=127.0.0.1
 WEB_BIND=127.0.0.1
 ```
 
-Bu sayede DB, API ve web yalnız aynı hosttan erişilebilir. `RUNTIME_ADMIN_TOKEN`
-frontend build/env değişkeni değildir ve browser'a verilmez. `.env` dosyasını
-Git'e eklemeyin. Bu değer boş bırakılırsa admin endpoint'leri fail-closed kapalı
-kalır; en az 16 karakterli rastgele bir değer seçin.
+Bu sayede DB, API ve web yalnız aynı hosttan erişilebilir. Registry girdisini
+ve raw token'ı `scripts/generate-auth-credential.py` ile üretin. Raw token
+frontend build/env değişkeni değildir; yalnız secret manager'da tutulur. API
+ortamı yalnız SHA-256 hashini alır. `.env` dosyasını Git'e eklemeyin. Registry
+boş bırakılırsa annotation/export/runtime endpoint'leri fail-closed kapalı
+kalır. Ayrıntılar [AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
 
 İterasyon 2.1-B demo kaynağı için varsayılanlar:
 
@@ -351,14 +353,17 @@ Beklenen sonuç, bütün kontrollerin `[OK]` ile tamamlanması ve scriptin sıf�
 
 Test ayrıca iki database'in PostgreSQL 18 kullandığını, veri dizininin `/var/lib/postgresql/18/docker` olduğunu, gerçek predicate kayıtları üzerinden WHERE+JOIN capability sözleşmesini, CPU/wait history alanlarını, composite candidate eşiklerini ve HypoPG evaluator'ın gerçek index oluşturmadan aynı oturumda plan doğrulaması yaptığını kontrol eder.
 
-İsteğe bağlı İterasyon 2.7 kabulü için `.env` içinde en az 16 karakterli ve varsayılandan değiştirilmiş `RUNTIME_ADMIN_TOKEN` bulunmalıdır. Önceki kabul testi demo composite adayını hazırladıktan sonra:
+İsteğe bağlı İterasyon 2.7 kabulü için `.env` içindeki
+`ADVISOR_AUTH_PRINCIPALS` registry'sinde `admin` rolü ve çağıran shell'de aynı
+credential'ın raw `ADVISOR_API_TOKEN` değeri bulunmalıdır. Önceki kabul testi
+demo composite adayını hazırladıktan sonra:
 
 ```bash
 docker compose --profile real-validation up -d --wait clone-db clone-evaluator
 bash scripts/verify-real-validation.sh
 ```
 
-Script exact normalize eşitlik sorgusuna audit metadatalı `["paid"]` sentetik fixture'ı operator kayıt yoluyla bağlar; admin-token API çağrısını, gerçek index kullanımını, kaynak index fingerprint'inin değişmediğini ve disposable baseline/candidate database'lerin temizlendiğini doğrular. Genel/manual fixture ve endpoint akışı [2.5–2.7 runbook'undadır](ITERATIONS_2_5_TO_2_7.md#27-disposable-clone-profili). Profil varsayılan stack için zorunlu değildir.
+Script exact normalize eşitlik sorgusuna audit metadatalı `["paid"]` sentetik fixture'ı operator kayıt yoluyla bağlar; admin Bearer API çağrısını, gerçek index kullanımını, kaynak index fingerprint'inin değişmediğini ve disposable baseline/candidate database'lerin temizlendiğini doğrular. Genel/manual fixture ve endpoint akışı [2.5–2.7 runbook'undadır](ITERATIONS_2_5_TO_2_7.md#27-disposable-clone-profili). Profil varsayılan stack için zorunlu değildir.
 
 ### Adım 9 — Analiz arayüzünü açın
 
@@ -623,19 +628,22 @@ curl -fsS -H 'X-Advisor-Role: analyst' \
 Admin CSV export:
 
 ```bash
-# .env'deki degeri kopyalamak yerine tercihen secret manager'dan alin.
-export RUNTIME_ADMIN_TOKEN='AYNI_GUCLU_RUNTIME_OPERATOR_TOKENI'
+export ADVISOR_API_TOKEN='SECRET_MANAGERDAN_ALINAN_RAW_TOKEN'
 curl -fsS \
-  -H 'X-Advisor-Role: admin' \
-  -H "X-Advisor-Admin-Token: ${RUNTIME_ADMIN_TOKEN:?runtime token gerekli}" \
-  -H 'X-Advisor-Actor: kurulum-kontrolu' \
-  'http://localhost:8000/api/v1/export/queries.csv?window=24h' \
+  -H "Authorization: Bearer ${ADVISOR_API_TOKEN:?api token gerekli}" \
+  'http://localhost:8000/api/v1/export/queries.csv?window=24h&priority=CRITICAL&minCalls=20' \
   -o queries-24h.csv
 ```
 
-`X-Advisor-Role: admin` tek başına yükseltme yapmaz; sunucudaki token ile sabit
-zamanlı doğrulama gerekir. Token'ı browser bundle'ına koymayın. Bu statik
-operator secret'ı yine de gerçek kullanıcı kimliği/SSO kanıtı değildir.
+CSV endpoint'i sorgu listesindeki `search`, `priority`, `serverId`, `databaseId`,
+`minCalls`, `minDurationMs` ve `sort` filtrelerini kabul eder. Eşleşen kayıtların
+tamamı PostgreSQL server-side cursor üzerinden sabit boyutlu partilerle aktarılır;
+UI'ın 200 satırlık sayfa sınırı export'a uygulanmaz ve dosyanın tamamı API
+belleğinde oluşturulmaz.
+
+CSV `admin` Bearer principal ister. Audit actor istemci header'ı değil,
+registry'deki doğrulanmış subject'tir. Token'ı browser bundle'ına koymayın;
+yerel PAT modeli SSO değildir.
 
 ## 7. Günlük işletim
 
