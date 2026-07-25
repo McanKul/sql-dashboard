@@ -88,12 +88,7 @@ services:
     volumes:
       - repository_data:/var/lib/postgresql
       - ./deployment/repository/init-repository.sh:/docker-entrypoint-initdb.d/10-init-repository.sh:ro,Z
-      - ./sql/004_powa_5_2_0_qualstats_purge_compat.sql:/docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql:ro,Z
-      - ./sql/001_advisor_schema.sql:/docker-entrypoint-initdb.d/20-advisor-schema.sql:ro,Z
-      - ./sql/006_runtime_replay_fixtures.sql:/docker-entrypoint-initdb.d/25-runtime-replay-fixtures.sql:ro,Z
-      - ./sql/005_bind_join_source_role.sql:/docker-entrypoint-initdb.d/30-bind-join-source-role.sql:ro,Z
-      - ./sql/002_prepare_remote_source.sql:/opt/advisor/sql/002_prepare_remote_source.sql:ro,Z
-      - ./sql/003_join_snapshot_source.sql:/opt/advisor/sql/003_join_snapshot_source.sql:ro,Z
+      - ./sql:/opt/advisor/sql:ro,z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d powa_repository -p 5433 && psql -U postgres -d powa_repository -p 5433 -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
       interval: 5s
@@ -104,6 +99,35 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [advisor, join_repository]
+
+  repository-migrate:
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-waits-1.1.11-hypopg-1.4.3
+    command: ["/opt/advisor/bin/run-migrations.sh"]
+    user: postgres
+    environment:
+      PGHOST: repository-db
+      PGPORT: "5433"
+      PGDATABASE: powa_repository
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
+      JOIN_SOURCE_ALIAS: ${JOIN_SOURCE_ALIAS:-test-source}
+      MIGRATION_LOCK_TIMEOUT_SECONDS: ${MIGRATION_LOCK_TIMEOUT_SECONDS:-60}
+    volumes:
+      - ./deployment/repository/run-migrations.sh:/opt/advisor/bin/run-migrations.sh:ro,Z
+      - ./sql:/opt/advisor/sql:ro,z
+    depends_on:
+      repository-db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 128m
+    restart: "no"
+    networks: [advisor]
 
   collector:
     build:
@@ -131,6 +155,8 @@ services:
         condition: service_healthy
       repository-db:
         condition: service_healthy
+      repository-migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os,signal; os.kill(1, signal.SIGCONT)\""]
       interval: 15s
@@ -159,6 +185,8 @@ services:
         condition: service_healthy
       repository-db:
         condition: service_healthy
+      repository-migrate:
+        condition: service_completed_successfully
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=8m
@@ -202,6 +230,8 @@ services:
     depends_on:
       repository-db:
         condition: service_healthy
+      repository-migrate:
+        condition: service_completed_successfully
       collector:
         condition: service_started
       evaluator:

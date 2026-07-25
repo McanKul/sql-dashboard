@@ -36,6 +36,56 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return float(value)
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _as_float(value)
+
+
+def _temporal_reliability(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize query window reliability without inventing missing history.
+
+    The fallback branches keep the API compatible with a repository that has
+    not yet applied the reliability migration.  Once the explicit SQL columns
+    are present they are authoritative, including an explicit ``False``.
+    """
+    previous_period_value = row.get("previous_period_available")
+    if previous_period_value is None:
+        previous_period_available = (
+            row.get("previous_calls") is not None
+            and row.get("previous_mean_exec_time_ms") is not None
+        )
+    else:
+        previous_period_available = bool(previous_period_value)
+
+    reset_detected = bool(row.get("reset_detected"))
+    comparison_value = row.get("comparison_reliable")
+    comparison_reliable = (
+        previous_period_available
+        and not reset_detected
+        and (True if comparison_value is None else bool(comparison_value))
+    )
+    warming_value = row.get("warming_up")
+
+    coverage_percent = _optional_float(row.get("coverage_percent"))
+    if coverage_percent is not None:
+        coverage_percent = round(max(0.0, min(100.0, coverage_percent)), 2)
+
+    return {
+        "observedFrom": row.get("observed_from"),
+        "observedTo": row.get("observed_to"),
+        "coveragePercent": coverage_percent,
+        "resetDetected": reset_detected,
+        "comparisonReliable": comparison_reliable,
+        "warmingUp": (
+            not previous_period_available
+            if warming_value is None
+            else bool(warming_value)
+        ),
+        "previousPeriodAvailable": previous_period_available,
+    }
+
+
 P95_UNAVAILABLE_REASON = (
     "PoWA/pg_stat_statements kümülatif toplam ve çağrı sayısı tutar; "
     "tekil çalışma süresi dağılımı olmadığı için güvenilir p95 hesaplanamaz."
@@ -81,8 +131,11 @@ def findings_for(row: Mapping[str, Any]) -> list[str]:
         findings.append("Toplam veritabani suresinin onemli bir bolumunu kullaniyor.")
     if int(row.get("shared_blocks_read") or 0) > int(row.get("shared_blocks_hit") or 0) * 0.25:
         findings.append("Okunan shared blok miktari yuksek; sorgu plani incelenmeli.")
+    reliability = _temporal_reliability(row)
     if (
-        _as_float(row.get("regression_percent")) >= 20
+        reliability["comparisonReliable"]
+        and reliability["previousPeriodAvailable"]
+        and _as_float(row.get("regression_percent")) >= 20
         and int(row.get("previous_calls") or 0) >= 20
         and int(row.get("calls") or 0) >= 20
     ):
@@ -150,6 +203,12 @@ def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, A
         wait_reason = (
             "Oranlar yalniz sampled wait dagilimini gosterir; CPU suresiyle veya duvar saatiyle toplanmaz."
         )
+    reliability = _temporal_reliability(row)
+    previous_period_available = reliability["previousPeriodAvailable"]
+    comparison_reliable = reliability["comparisonReliable"]
+    previous_calls = row.get("previous_calls")
+    previous_mean = row.get("previous_mean_exec_time_ms")
+    regression_percent = row.get("regression_percent")
     return {
         "serverId": row["server_id"],
         "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
@@ -232,9 +291,22 @@ def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, A
             "events": wait_events if wait_data_available else [],
             "scoreIncluded": False,
         },
-        "previousCalls": int(row.get("previous_calls") or 0),
-        "previousMeanExecTimeMs": round(_as_float(row.get("previous_mean_exec_time_ms")), 2),
-        "regressionPercent": round(_as_float(row.get("regression_percent")), 2),
+        **reliability,
+        "previousCalls": (
+            int(previous_calls)
+            if previous_period_available and previous_calls is not None
+            else None
+        ),
+        "previousMeanExecTimeMs": (
+            round(_as_float(previous_mean), 2)
+            if previous_period_available and previous_mean is not None
+            else None
+        ),
+        "regressionPercent": (
+            round(_as_float(regression_percent), 2)
+            if comparison_reliable and regression_percent is not None
+            else None
+        ),
         "impactScore": round(_as_float(row.get("impact_score")), 1),
         "priority": row.get("priority") or "LOW",
         "status": row.get("review_status") or "NEW",
@@ -347,6 +419,8 @@ class PowaRepository:
             filters.append(database_id)
         if regressions_only:
             conditions.extend([
+                "previous_period_available IS TRUE",
+                "comparison_reliable IS TRUE",
                 "regression_percent >= 20",
                 "previous_calls >= 20",
                 "calls >= 20",
@@ -356,13 +430,9 @@ class PowaRepository:
         order_column = SORT_COLUMNS.get(sort_by, SORT_COLUMNS["impact"])
         offset = (page - 1) * page_size
 
-        count_query = f"""
-            SELECT count(*) AS total
-            FROM advisor.query_metrics(%s::interval)
-            WHERE {where_sql}
-        """
         data_query = f"""
-            SELECT metrics.*, servers.alias AS server_alias
+            SELECT metrics.*, servers.alias AS server_alias,
+                   count(*) OVER () AS filtered_total
             FROM advisor.query_metrics(%s::interval) AS metrics
             LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
             WHERE {where_sql}
@@ -372,10 +442,27 @@ class PowaRepository:
 
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
-                await cursor.execute(count_query, [interval, *filters])
-                total = int((await cursor.fetchone())["total"])
                 await cursor.execute(data_query, [interval, *filters, page_size, offset])
                 rows = [dict(row) for row in await cursor.fetchall()]
+                if rows:
+                    total = int(rows[0]["filtered_total"])
+                    for row in rows:
+                        row.pop("filtered_total", None)
+                elif page == 1:
+                    total = 0
+                else:
+                    # An out-of-range page has no row carrying the window
+                    # count.  Keep that rare fallback correct without making
+                    # every normal list request evaluate query_metrics twice.
+                    await cursor.execute(
+                        f"""
+                        SELECT count(*) AS total
+                        FROM advisor.query_metrics(%s::interval)
+                        WHERE {where_sql}
+                        """,
+                        [interval, *filters],
+                    )
+                    total = int((await cursor.fetchone())["total"])
         return rows, total
 
     async def overview_summary(self, *, window: str) -> dict[str, Any]:
@@ -390,7 +477,9 @@ class PowaRepository:
                         count(*)::bigint AS tracked_queries,
                         count(*) FILTER (WHERE priority = 'CRITICAL')::bigint AS critical_queries,
                         count(*) FILTER (
-                            WHERE regression_percent >= 20
+                            WHERE previous_period_available IS TRUE
+                              AND comparison_reliable IS TRUE
+                              AND regression_percent >= 20
                               AND previous_calls >= 20
                               AND calls >= 20
                         )::bigint AS regressions
@@ -443,8 +532,13 @@ class PowaRepository:
     ) -> list[dict[str, Any]]:
         interval = interval_for(window)
         bucket = WINDOW_BUCKETS[window]
-        clauses = ["sample_at >= now() - %s::interval", "toplevel"]
-        params: list[Any] = [bucket, interval, interval]
+        clauses = [
+            "sample_at >= now() - %s::interval",
+            "toplevel",
+            "predecessor_available",
+            "NOT (gap_detected AND previous_sample_at < now() - %s::interval)",
+        ]
+        params: list[Any] = [bucket, interval, interval, interval]
         if query_id is not None:
             clauses.append("query_id = %s")
             params.append(query_id)

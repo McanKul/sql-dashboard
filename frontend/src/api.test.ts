@@ -11,6 +11,29 @@ function jsonResponse(payload: unknown, status = 200): Response {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('advisor API contracts', () => {
+  it('does not turn unavailable or unreliable query history into zero regression', async () => {
+    const base = {
+      serverId: 1, databaseId: 2, databaseName: 'app', sql: 'select 1', sqlVisible: true,
+      calls: 25, totalExecTimeMs: 50, meanExecTimeMs: 2, dbLoadPercent: 1,
+      sharedBlocksHit: 10, sharedBlocksRead: 0, tempBlocksWritten: 0, walBytes: 0,
+      impactScore: 5, priority: 'LOW', status: 'NEW', findings: [], scoreBreakdown: {},
+      observedFrom: '2026-07-24T08:00:00Z', observedTo: '2026-07-25T08:00:00Z',
+      coveragePercent: 100, warmingUp: false,
+    }
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse({
+      items: [
+        { ...base, queryId: '1', resetDetected: false, comparisonReliable: true, previousPeriodAvailable: true, previousCalls: 25, previousMeanExecTimeMs: 1.5, regressionPercent: 33.33 },
+        { ...base, queryId: '2', resetDetected: true, comparisonReliable: false, previousPeriodAvailable: false, previousCalls: null, previousMeanExecTimeMs: null, regressionPercent: null },
+      ],
+      total: 2,
+    }))))
+
+    const { data } = await advisorApi.getQueries('24h', { page: 1, pageSize: 50 })
+
+    expect(data.items[0]).toMatchObject({ lastSeenAt: '2026-07-25T08:00:00Z', changePercent: 33.33, hasComparison: true, comparisonReliable: true })
+    expect(data.items[1]).toMatchObject({ lastSeenAt: '2026-07-25T08:00:00Z', changePercent: null, hasComparison: false, resetDetected: true, previousPeriodAvailable: false })
+  })
+
   it('keeps repository index, IO capability, and detailed telemetry fields', async () => {
     vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => {
       const url = String(input)
@@ -81,9 +104,16 @@ describe('advisor API contracts', () => {
         filesystemWritesBytes: 0,
         scoreIncluded: false,
       },
-      previousCalls: 0,
-      previousMeanExecTimeMs: 0,
-      regressionPercent: 0,
+      observedFrom: '2026-07-23T07:00:00Z',
+      observedTo: '2026-07-23T08:00:00Z',
+      coveragePercent: 42.5,
+      resetDetected: true,
+      comparisonReliable: false,
+      warmingUp: false,
+      previousPeriodAvailable: false,
+      previousCalls: null,
+      previousMeanExecTimeMs: null,
+      regressionPercent: null,
       impactScore: 1,
       priority: 'LOW',
       status: 'NEW',
@@ -92,7 +122,7 @@ describe('advisor API contracts', () => {
       durationDistribution: { available: false, reason: 'Dağılım verisi yok.' },
       scoreBreakdown: { physicalRead: { weight: 0.2, contribution: 0.03, percentileScore: 100, volumeFactor: 0.006, absoluteValue: 6, fullScoreAt: 1000, unit: 'blocks' } },
       trend: [{ timestamp: '2026-07-23T08:00:00Z', totalExecTimeMs: 20, calls: 10 }],
-      comparison: { currentMeanMs: 2, previousMeanMs: 0, regressionPercent: 0, currentCalls: 10, previousCalls: 0 },
+      comparison: { currentMeanMs: 2, previousMeanMs: null, regressionPercent: null, currentCalls: 10, previousCalls: null },
       }))
     }))
 
@@ -103,6 +133,19 @@ describe('advisor API contracts', () => {
     expect(data.rowsPerCall).toBe(3)
     expect(data.cpu).toMatchObject({ totalTimeMs: 10, percentOfExecTime: 50, scoreIncluded: false })
     expect(data.cpu.capability).toMatchObject({ available: true, version: '2.3.2', dataAvailable: true })
+    expect(data).toMatchObject({
+      observedFrom: '2026-07-23T07:00:00Z',
+      observedTo: '2026-07-23T08:00:00Z',
+      lastSeenAt: '2026-07-23T08:00:00Z',
+      coveragePercent: 42.5,
+      resetDetected: true,
+      comparisonReliable: false,
+      warmingUp: false,
+      previousPeriodAvailable: false,
+      changePercent: null,
+      hasComparison: false,
+      comparison: [],
+    })
     expect(data.scoreBreakdown[0]).toMatchObject({ contribution: 0.03, volumeFactor: 0.006, fullScoreAt: 1000 })
     expect(data.predicates.capability).toMatchObject({ available: true, coverage: 'WHERE_FILTER_ONLY', joinsAvailable: false, ddlGenerated: false })
     expect(data.predicates.items[0]).toMatchObject({ tableName: 'orders', columns: ['status'], occurrences: 12, rowsProcessed: 1000, rowsFiltered: 750, signal: 'REVIEW' })

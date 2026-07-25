@@ -684,11 +684,18 @@ yönetim fonksiyonlarıyla ve kapasite planıyla birlikte yapılmalıdır.
 
 ### İterasyon 2.1-B–2.6 mevcut-volume geçişi
 
-Named volume daha eski image ile oluşturulduysa init scriptleri kendiliğinden tekrar çalışmaz. Demo stack'i veri/geçmiş silmeden yükseltmek için:
+Named volume daha eski image ile oluşturulduysa init scriptleri kendiliğinden
+tekrar çalışmaz. `repository-migrate` bu nedenle her `docker compose up`
+akışında repository sağlıklı olduktan sonra checksum doğrulamalı ve advisory
+lock korumalı upgrade'i çalıştırır. Aynı adımı elle yürütmek için
+`bash scripts/migrate-repository.sh` kullanılabilir; ayrıntılar
+[REPOSITORY_MIGRATIONS.md](REPOSITORY_MIGRATIONS.md) içindedir. Demo stack'i
+veri/geçmiş silmeden yükseltmek için:
 
 ```bash
 docker compose build source-db
 docker compose up -d --force-recreate source-db repository-db
+bash scripts/migrate-repository.sh
 bash scripts/enable-pg-qualstats.sh
 bash scripts/enable-hypopg.sh
 bash scripts/enable-pg-stat-kcache.sh
@@ -724,7 +731,11 @@ docker compose up --build -d
 
 > **Dikkat:** `down -v`, `source_data` ve `repository_data` volume'lerini; örnek uygulama verisini, PoWA geçmişini, kullanıcı notlarını ve audit kayıtlarını kalıcı olarak siler. Bu komutu yalnız hedefin test stack'i olduğunu doğruladıktan ve gerekli repository yedeğini aldıktan sonra çalıştırın.
 
-Init scriptleri yalnız boş volume ilk oluşturulurken çalışır. Bootstrap SQL'ini değiştirdiğiniz halde sonuç görünmüyorsa bu davranışı göz önünde bulundurun; sırf yeniden denemek için üretim volume'ünü silmeyin.
+Init scriptleri yalnız boş volume ilk oluşturulurken çalışır. Bootstrap
+rollerindeki değişikliklerde bu davranışı göz önünde bulundurun; sırf yeniden
+denemek için üretim volume'ünü silmeyin. Advisor şema değişiklikleri init
+dosyalarına eklenmez, yeni manifest migration'ı olarak dağıtılır ve
+`scripts/migrate-repository.sh` ile mevcut volume'e uygulanır.
 
 ## 9. Hata giderme
 

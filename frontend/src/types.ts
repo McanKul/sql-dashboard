@@ -33,7 +33,17 @@ export interface OverviewStats {
   }>
 }
 
-export interface QuerySummary {
+export interface QueryObservationReliability {
+  observedFrom: string | null
+  observedTo: string | null
+  coveragePercent: number | null
+  resetDetected: boolean
+  comparisonReliable: boolean
+  warmingUp: boolean
+  previousPeriodAvailable: boolean
+}
+
+export interface QuerySummary extends QueryObservationReliability {
   id: string
   queryId: string
   serverId: number
@@ -57,7 +67,7 @@ export interface QuerySummary {
   priority: string
   severity: Severity
   lastSeenAt: string
-  changePercent: number
+  changePercent: number | null
   hasComparison: boolean
 }
 

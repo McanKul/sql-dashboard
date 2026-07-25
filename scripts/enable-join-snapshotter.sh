@@ -12,8 +12,6 @@ docker compose ps --services --status running | grep -qx repository-db \
 
 docker compose exec -T source-db test -r /opt/advisor/sql/003_join_snapshot_source.sql \
   || fail "Source container JOIN outbox SQL dosyasini tasimiyor; source-db'yi yeni compose ile yeniden olusturun"
-docker compose exec -T repository-db test -r /docker-entrypoint-initdb.d/25-runtime-replay-fixtures.sql \
-  || fail "Repository container runtime fixture migrasyonunu tasimiyor; repository-db'yi yeni compose ile yeniden olusturun"
 
 # Existing named volumes do not rerun docker-entrypoint init scripts.  Create or
 # rotate the dedicated source login, then install the atomic capture/reset
@@ -59,17 +57,9 @@ ALTER ROLE advisor_join_ingest LOGIN PASSWORD :'join_ingest_password'
 GRANT CONNECT ON DATABASE powa_repository TO advisor_join_ingest;
 SQL
 
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql >/dev/null
-
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/20-advisor-schema.sql >/dev/null
-
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/25-runtime-replay-fixtures.sql >/dev/null
+# All repository-side compatibility, advisor and replay-fixture DDL is owned
+# by the checksum-verified migration runner.
+bash scripts/migrate-repository.sh >/dev/null
 
 docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
   --username postgres --port 5433 --dbname powa_repository <<'SQL'

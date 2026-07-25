@@ -79,14 +79,8 @@ wait_retention_ok="$(docker compose exec -T repository-db psql -U postgres -p 54
 [[ "$wait_retention_ok" == t ]] \
   || fail "Repository pg_wait_sampling retention 30 gun olarak ayarlanamadi"
 
-# Existing named volumes do not rerun docker-entrypoint init scripts. Apply the
-# rerunnable adapter without deleting repository history.
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql >/dev/null
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/20-advisor-schema.sql >/dev/null
+# Existing volume upgrades and adapter DDL go through the versioned runner.
+bash scripts/migrate-repository.sh >/dev/null
 pass "Repository datasource, 30 gun wait retention ve advisor wait adapter'i guncel"
 
 docker compose up -d --force-recreate --no-deps collector >/dev/null

@@ -90,12 +90,7 @@ unset ADVISOR_REPLAY_VALUES_TO_VALIDATE
 docker compose config --quiet
 docker compose ps --services --status running | grep -qx repository-db \
   || fail "repository-db calismiyor"
-docker compose exec -T repository-db test -r /docker-entrypoint-initdb.d/25-runtime-replay-fixtures.sql \
-  || fail "Runtime fixture SQL mount'u yok; repository-db'yi yeni compose ile yeniden olusturun"
-
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/25-runtime-replay-fixtures.sql >/dev/null
+bash scripts/migrate-repository.sh >/dev/null
 
 docker compose exec -T \
   -e REPLAY_CANDIDATE_ID="$candidate_id" \

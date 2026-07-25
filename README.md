@@ -29,6 +29,23 @@ docker compose up --build -d
 docker compose ps
 ```
 
+`repository-migrate` tek seferlik servisinin başarıyla tamamlanması beklenen
+durumdur. Bu servis fresh ve mevcut named volume'lerde sürümlü SQL dosyalarının
+checksum'ını doğrular; collector, JOIN snapshotter ve API ancak migration
+başarısından sonra başlar. Elle upgrade/tekrar doğrulama için
+`bash scripts/migrate-repository.sh` kullanılabilir. Ayrıntılı model
+[docs/REPOSITORY_MIGRATIONS.md](docs/REPOSITORY_MIGRATIONS.md) içindedir.
+
+Query/kcache/wait sayaç resetleri ile gerçek pencere kapsamının kabul testi:
+
+```bash
+bash scripts/verify-temporal-reliability.sh
+```
+
+`observedFrom`, `observedTo`, `coveragePercent`, `resetDetected`,
+`comparisonReliable`, `warmingUp` ve eksik önceki dönem `null` semantiği
+[temporal reliability belgesinde](docs/TEMPORAL_RELIABILITY.md) açıklanır.
+
 Bu komut demo PostgreSQL'ü ölçülebilir hedef olarak hazırlar ancak sürekli yük üreten `workload` servisini başlatmaz. `REGISTER_DEMO_SOURCE=false` yalnız **boş bir repository volume'ünün ilk kurulumu öncesinde** seçilirse demo kaydı oluşturulmaz; gerçek kaynak-only kurulumlarda bu seçenek kullanılabilir.
 
 İlk build sırasında PostgreSQL 18 tabanı üzerinde PoWA Archivist 5.2.0, `pg_qualstats` 2.1.4, `pg_stat_kcache` 2.3.2, `pg_wait_sampling` release 1.1.11 (extension version 1.1) ve HypoPG 1.4.3 doğrulanmış kaynak arşivlerinden derlenir; bu nedenle sonraki başlatmalardan daha uzun sürer. PostgreSQL 17 named volume'leri yalnız image etiketi değiştirilerek açılamaz; PG18'in `/var/lib/postgresql/18/docker` veri dizini düzenine dump/restore veya `pg_upgrade` ile taşınmalıdır. Aşağıdaki scriptler aynı PostgreSQL major sürümündeki mevcut demo volume'lerini yeni extension/rol/grant düzenine geçirir; temiz volume init sırasında zaten hazırlanır.
@@ -168,7 +185,7 @@ Denetim sırasında agresif demo yükü 6 worker ile yaklaşık 1.164 statement 
 7. Sistem Sağlığı sinyalleri kümülatif sayaç ve küçük demo tabloları nedeniyle fazla hassastır. `stats_reset`, gözlem süresi, tablo boyutu ve zaman penceresi sinyal açıklamasına dahil edilmelidir.
 8. Sürekli workload için gerekli `quick`, `normal` ve açık opt-in `stress` ayrımı artık gerçekçi yük runbook'u ve bounded generator ile uygulanmıştır; mutlak TPS hosttan bağımsız bir hard gate değildir.
 
-**25 Temmuz 2026 kısa kalibrasyon kapanışı:** En yüksek doğruluk etkili iki madde kapatıldı. Ana dashboard/trend yalnız top-level statement toplamını kullanıyor; regresyon puanı ve “yavaşlayan sorgu” sayısı için her iki dönemde en az 20 çağrı ve en az `%20` artış gerekiyor, büyüklük katsayısı `%50`de tam değere ulaşıyor. Observation-hour hacim modeli ve 85/70/40 priority sınırları korundu. Ortam profili, coverage ve uzun süreli production dağılım kalibrasyonu ayrı ürün işi olarak kalır; 2.3 CPU sinyali ölçüm görmeden skora eklenmedi.
+**25 Temmuz 2026 kısa kalibrasyon kapanışı:** En yüksek doğruluk etkili maddeler kapatıldı. Ana dashboard/trend yalnız top-level statement toplamını kullanıyor; regresyon puanı ve “yavaşlayan sorgu” sayısı için her iki dönemde en az 20 çağrı ve en az `%20` artış gerekiyor, büyüklük katsayısı `%50`de tam değere ulaşıyor. Query/kcache sayaç resetinde reset sonrası ilk aktivite korunuyor; uzun collector gap'leri dönem sınırında yanlış toplam üretemiyor. API ve UI gerçek gözlem aralığını, coverage'ı, warm-up'ı ve önceki dönem güvenilirliğini açıkça gösteriyor; geçmiş yokken regresyon alanları `null` kalıyor. Observation-hour hacim modeli ve 85/70/40 priority sınırları korundu. Ortam profili ile uzun süreli production dağılım kalibrasyonu ayrı ürün işi olarak kalır; 2.3 CPU sinyali ölçüm görmeden skora eklenmedi.
 
 ## İterasyon 2 araç stratejisi
 

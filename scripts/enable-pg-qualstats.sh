@@ -65,11 +65,9 @@ activation_ok="$(
   || fail "Repository pg_qualstats datasource aktivasyonu basarisiz"
 pass "Repository test-source pg_qualstats datasource etkin"
 
-# Repair the guarded PoWA 5.2.0 qualstats purge typo on existing named
-# volumes. Fresh images already carry the corrected extension artifact.
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql >/dev/null
+# The migration runner owns the PoWA compatibility repair and records its
+# checksum on both fresh and existing named volumes.
+bash scripts/migrate-repository.sh >/dev/null
 pass "PoWA 5.2.0 pg_qualstats retention purge uyumlulugu hazir"
 
 previous_state="$({

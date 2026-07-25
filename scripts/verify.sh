@@ -89,6 +89,21 @@ repo_ext="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d pow
 [[ "$repo_ext" == *"powa=5.2.0"* && "$repo_ext" == *"pg_stat_statements="* ]] || fail "Repository extension seti eksik: ${repo_ext}"
 pass "Kaynak pg_qualstats 2.1.4, pg_stat_kcache 2.3.2, pg_wait_sampling 1.1 ve iki PoWA extension seti dogru"
 
+expected_migration_fingerprint=""
+while IFS='|' read -r migration_version _migration_name _migration_script migration_checksum; do
+  [[ -z "$migration_version" || "$migration_version" == \#* ]] && continue
+  [[ -z "$expected_migration_fingerprint" ]] \
+    || expected_migration_fingerprint+=","
+  expected_migration_fingerprint+="${migration_version}:${migration_checksum}"
+done < sql/repository-migrations.manifest
+migration_fingerprint="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
+  -d powa_repository -Atqc \
+  "SELECT string_agg(version || ':' || checksum, ',' ORDER BY version)
+     FROM advisor_migrations.schema_migrations")"
+[[ "$migration_fingerprint" == "$expected_migration_fingerprint" ]] \
+  || fail "Repository migration ledger/manifest uyusmuyor: ${migration_fingerprint:-bos}"
+pass "Repository migration surumleri ve SHA-256 ledger kayitlari dogru"
+
 source_hypopg_version="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'")"
 repository_hypopg_installed="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \

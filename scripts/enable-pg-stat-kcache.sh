@@ -49,14 +49,9 @@ activation_ok="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
 [[ "$activation_ok" == t ]] \
   || fail "Repository pg_stat_kcache datasource aktivasyonu basarisiz"
 
-# Existing named volumes do not rerun docker-entrypoint init scripts.  Apply the
-# rerunnable advisor adapter so CPU fields become available without data loss.
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql >/dev/null
-docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
-  --username postgres --port 5433 --dbname powa_repository \
-  --file /docker-entrypoint-initdb.d/20-advisor-schema.sql >/dev/null
+# Activate the datasource first, then let the versioned runner own every
+# repository schema change for fresh and existing named volumes.
+bash scripts/migrate-repository.sh >/dev/null
 pass "Repository datasource ve advisor CPU adapter'i guncel"
 
 previous_epoch="$(docker compose exec -T repository-db psql -U postgres -p 5433 \

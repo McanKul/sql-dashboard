@@ -299,8 +299,8 @@ function OverviewPage({ state, queries, window, onRetry, onOpenQuery, onNavigate
                   <span className="compact-query-copy"><strong>{query.title}</strong><code>{query.fingerprint}</code></span>
                   <span className="query-duration">{formatDuration(query.avgDurationMs)}<small>ortalama</small></span>
                   {query.hasComparison
-                    ? <span className={`change ${query.changePercent > 0 ? 'negative' : 'positive'}`}>{query.changePercent > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}%{formatNumber(Math.abs(query.changePercent))}</span>
-                    : <span className="change unavailable">Yeterli geçmiş yok</span>}
+                    ? <span className={`change ${regressionValue(query) > 0 ? 'negative' : 'positive'}`}>{regressionValue(query) > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}%{formatNumber(Math.abs(regressionValue(query)))}</span>
+                    : <span className="change unavailable">{comparisonStatusLabel(query)}</span>}
                   <ChevronRight size={16} className="row-chevron" />
                 </button>
               ))}
@@ -407,8 +407,8 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
                   <td><strong className="tabular">{formatLargeNumber(query.sharedBlocksRead)} okuma</strong><small>{formatLargeNumber(query.sharedBlocksHit)} cache hit</small></td>
                   <td><strong className="tabular">{formatLargeNumber(query.tempBlocksWritten)} temp blok</strong><small>{formatBytes(query.walBytes)} WAL</small></td>
                   <td><strong className="tabular">{formatLargeNumber(query.calls)} çağrı</strong>{query.hasComparison
-                    ? <span className={`change ${query.changePercent > 0 ? 'negative' : 'positive'}`}>{query.changePercent > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}%{formatNumber(Math.abs(query.changePercent))}</span>
-                    : <small>Karşılaştırma yok</small>}
+                    ? <span className={`change ${regressionValue(query) > 0 ? 'negative' : 'positive'}`}>{regressionValue(query) > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}%{formatNumber(Math.abs(regressionValue(query)))}</span>
+                    : <small>{comparisonStatusLabel(query)}</small>}
                   </td>
                   <td><button type="button" className="icon-button row-open" onClick={() => onOpenQuery(query.id)} aria-label={`${query.title} detayını aç`}><ChevronRight size={17} /></button></td>
                 </tr>
@@ -431,7 +431,7 @@ function scoreMetricValue(item: QueryDetail['scoreBreakdown'][number], query: Qu
     const fallback: Record<string, [number, string]> = {
       totalTime: [query.totalTimeMs, 'ms'], physicalRead: [query.sharedBlocksRead, 'blocks'],
       callFrequency: [query.calls, 'calls'], tempWrite: [query.tempBlocksWritten, 'blocks'],
-      regression: [query.changePercent, 'percent'], wal: [query.walBytes, 'bytes'],
+      regression: [regressionValue(query), 'percent'], wal: [query.walBytes, 'bytes'],
     }
     ;[value, unit] = fallback[item.key] || [0, '']
   }
@@ -441,6 +441,29 @@ function scoreMetricValue(item: QueryDetail['scoreBreakdown'][number], query: Qu
   if (unit.toLowerCase().includes('block')) return `${formatLargeNumber(value)} blok`
   if (unit.toLowerCase().includes('call')) return `${formatLargeNumber(value)} çağrı`
   return `${formatLargeNumber(value)}${unit ? ` ${unit}` : ''}`
+}
+
+function regressionValue(query: Pick<QuerySummary, 'changePercent'>): number {
+  return query.changePercent ?? 0
+}
+
+function comparisonStatusLabel(query: Pick<QuerySummary, 'resetDetected' | 'warmingUp' | 'previousPeriodAvailable' | 'comparisonReliable'>): string {
+  if (query.resetDetected) return 'Sayaç reseti algılandı'
+  if (query.warmingUp) return 'Veri birikiyor'
+  if (!query.previousPeriodAvailable) return 'Önceki dönem yok'
+  if (!query.comparisonReliable) return 'Karşılaştırma güvenilir değil'
+  return 'En az 20 çağrı gerekli'
+}
+
+function comparisonStatusDetail(query: QuerySummary): string {
+  if (query.resetDetected) return 'Seçili dönem içinde sayaç reseti bulunduğu için regresyon yüzdesi hesaplanmadı.'
+  if (query.warmingUp) return 'İstenen pencereyi güvenilir biçimde karşılamak için collector geçmişi henüz birikiyor.'
+  if (!query.previousPeriodAvailable) return 'Aynı sorgu için önceki eş dönemde karşılaştırılabilir ölçüm bulunamadı.'
+  if (!query.comparisonReliable) {
+    const coverage = query.coveragePercent === null ? '' : ` Ölçülen kapsam: %${formatNumber(query.coveragePercent)}.`
+    return `Snapshot kapsamı veya collector sürekliliği güvenilir bir karşılaştırma için yeterli değil.${coverage}`
+  }
+  return 'Regresyon göstermek için mevcut ve önceki dönemde en az 20 çağrı gerekir.'
 }
 
 function scoreThresholdValue(item: QueryDetail['scoreBreakdown'][number]): string | null {
@@ -710,10 +733,10 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
 
                 <article className="detail-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">{windowLabels[window]}</span><h2>Çalışma süresi eğilimi</h2></div>{state.data.hasComparison
-                    ? <span className={`change ${state.data.changePercent > 0 ? 'negative' : 'positive'}`}>{state.data.changePercent > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />} %{formatNumber(Math.abs(state.data.changePercent))}</span>
-                    : <span className="change unavailable">Yeterli geçmiş yok</span>}
+                    ? <span className={`change ${regressionValue(state.data) > 0 ? 'negative' : 'positive'}`}>{regressionValue(state.data) > 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />} %{formatNumber(Math.abs(regressionValue(state.data)))}</span>
+                    : <span className="change unavailable">{comparisonStatusLabel(state.data)}</span>}
                   </div>
-                  <MiniTrend points={state.data.trend.map((point) => ({ label: point.label.replace(' Tem', ''), value: point.durationMs }))} tone={!state.data.hasComparison ? 'blue' : state.data.changePercent > 0 ? 'red' : 'green'} height={142} label={`Sorgunun ${windowLabels[window].toLocaleLowerCase('tr')} çalışma süresi`} />
+                  <MiniTrend points={state.data.trend.map((point) => ({ label: point.label.replace(' Tem', ''), value: point.durationMs }))} tone={!state.data.hasComparison ? 'blue' : regressionValue(state.data) > 0 ? 'red' : 'green'} height={142} label={`Sorgunun ${windowLabels[window].toLocaleLowerCase('tr')} çalışma süresi`} />
                   <div className="trend-metrics"><div><span>Ortalama</span><strong>{formatDuration(state.data.avgDurationMs)}</strong></div><div><span>Çağrı</span><strong>{formatLargeNumber(state.data.calls)}</strong></div><div><span>Okunan shared blok</span><strong>{formatLargeNumber(state.data.sharedBlocksRead)}</strong></div><div><span>Toplam süre</span><strong>{formatDuration(state.data.totalTimeMs)}</strong></div>{state.data.rowsPerCall !== undefined && <div><span>Satır / çağrı</span><strong>{formatNumber(state.data.rowsPerCall)}</strong></div>}{state.data.p95DurationMs !== undefined && <div><span>Gerçek p95</span><strong>{formatDuration(state.data.p95DurationMs)}</strong></div>}</div>
                   {state.data.p95DurationMs === undefined && state.data.durationDistribution?.available === false && <div className="metric-unavailable"><Info size={15} /><span><strong>p95 gösterilemiyor.</strong> {state.data.durationDistribution.reason || 'PoWA yürütme süresi dağılımını saklamıyor.'}</span></div>}
                 </article>
@@ -846,7 +869,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                         <small>%{formatNumber(Math.abs(item.improvementPercent))} {item.improvementPercent >= 0 ? 'daha iyi' : 'daha yavaş'}</small>
                       </div>
                     ))}
-                  </div> : <div className="comparison-unavailable"><Clock3 size={18} /><div><strong>Yeterli geçmiş yok</strong><p>Karşılaştırma için önceki dönemde en az 5 çağrı gerekir.</p></div></div>}
+                  </div> : <div className="comparison-unavailable"><Clock3 size={18} /><div><strong>{comparisonStatusLabel(state.data)}</strong><p>{comparisonStatusDetail(state.data)}</p></div></div>}
                 </article>
               </main>
 

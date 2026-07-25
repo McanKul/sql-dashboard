@@ -13,6 +13,7 @@ from app.api.router import (
     _summarize_collectors,
     io_telemetry,
     overview,
+    query_detail,
     query_predicates,
     queries,
 )
@@ -44,6 +45,13 @@ BASE_ROW = {
     "cpu_percent_of_exec_time": 66.67,
     "filesystem_reads_bytes": 4096,
     "filesystem_writes_bytes": 1024,
+    "observed_from": "2026-07-24T12:00:00Z",
+    "observed_to": "2026-07-25T12:00:00Z",
+    "coverage_percent": 100.0,
+    "reset_detected": False,
+    "comparison_reliable": True,
+    "warming_up": False,
+    "previous_period_available": True,
     "previous_calls": 80,
     "previous_mean_exec_time_ms": 8.0,
     "regression_percent": 50.0,
@@ -108,6 +116,47 @@ def test_query_rows_per_call_is_real_and_p95_is_not_fabricated() -> None:
     assert item["p95ExecTimeMs"] is None
     assert item["durationDistribution"]["available"] is False
     assert "p95" in item["durationDistribution"]["reason"]
+
+
+def test_query_temporal_reliability_is_serialized_without_fabricating_history() -> None:
+    item = serialize_query(BASE_ROW, sql_visible=True)
+
+    assert item["observedFrom"] == "2026-07-24T12:00:00Z"
+    assert item["observedTo"] == "2026-07-25T12:00:00Z"
+    assert item["coveragePercent"] == 100.0
+    assert item["resetDetected"] is False
+    assert item["comparisonReliable"] is True
+    assert item["warmingUp"] is False
+    assert item["previousPeriodAvailable"] is True
+    assert item["previousCalls"] == 80
+    assert item["regressionPercent"] == 50.0
+
+
+def test_query_missing_previous_period_keeps_comparison_values_null() -> None:
+    item = serialize_query(
+        {
+            **BASE_ROW,
+            "coverage_percent": 32.5,
+            "reset_detected": True,
+            "comparison_reliable": False,
+            "warming_up": True,
+            "previous_period_available": False,
+            "previous_calls": None,
+            "previous_mean_exec_time_ms": None,
+            "regression_percent": None,
+        },
+        sql_visible=True,
+    )
+
+    assert item["coveragePercent"] == 32.5
+    assert item["resetDetected"] is True
+    assert item["comparisonReliable"] is False
+    assert item["warmingUp"] is True
+    assert item["previousPeriodAvailable"] is False
+    assert item["previousCalls"] is None
+    assert item["previousMeanExecTimeMs"] is None
+    assert item["regressionPercent"] is None
+    assert not any("es doneme" in finding for finding in item["findings"])
 
 
 def test_query_cpu_telemetry_is_explicit_and_observation_only() -> None:
@@ -496,6 +545,49 @@ async def test_queries_echoes_effective_page_size(monkeypatch: pytest.MonkeyPatc
 
     assert captured["page_size"] == 2
     assert result["pageSize"] == 2
+
+
+@pytest.mark.asyncio
+async def test_query_detail_keeps_unreliable_comparison_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        **BASE_ROW,
+        "reset_detected": True,
+        "comparison_reliable": False,
+        "warming_up": False,
+        "previous_period_available": False,
+        "previous_calls": None,
+        "previous_mean_exec_time_ms": None,
+        "regression_percent": None,
+    }
+
+    async def query_by_id(**_: object) -> dict[str, object]:
+        return row
+
+    async def trend(**_: object) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(repository, "query_by_id", query_by_id)
+    monkeypatch.setattr(repository, "trend", trend)
+
+    result = await query_detail(
+        query_id=42,
+        role="analyst",
+        window="24h",
+        server_id=1,
+        database_id=16384,
+    )
+
+    assert result["comparisonReliable"] is False
+    assert result["regressionPercent"] is None
+    assert result["comparison"] == {
+        "currentMeanMs": 12.0,
+        "previousMeanMs": None,
+        "regressionPercent": None,
+        "currentCalls": 100,
+        "previousCalls": None,
+    }
 
 
 @pytest.mark.asyncio

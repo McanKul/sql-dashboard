@@ -104,9 +104,16 @@ interface RawQuery {
     }>
     scoreIncluded?: false
   }
-  previousCalls: number
-  previousMeanExecTimeMs: number
-  regressionPercent: number
+  observedFrom?: string | null
+  observedTo?: string | null
+  coveragePercent?: number | null
+  resetDetected?: boolean
+  comparisonReliable?: boolean
+  warmingUp?: boolean
+  previousPeriodAvailable?: boolean
+  previousCalls: number | null
+  previousMeanExecTimeMs: number | null
+  regressionPercent: number | null
   impactScore: number
   priority: string
   status: string
@@ -126,10 +133,10 @@ interface RawQueryDetail extends RawQuery {
   trend: Array<{ timestamp: string; totalExecTimeMs: number; calls: number }>
   comparison: {
     currentMeanMs: number
-    previousMeanMs: number
-    regressionPercent: number
+    previousMeanMs: number | null
+    regressionPercent: number | null
     currentCalls: number
-    previousCalls: number
+    previousCalls: number | null
   }
   recommendations?: { available: boolean; label: string; reason: string } | null
 }
@@ -345,12 +352,22 @@ function queryTitle(query: RawQuery): string {
   return relation ? `${verb} · ${relation}` : `${verb} sorgusu · ${query.databaseName}`
 }
 
-function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): QuerySummary {
+function mapSummary(query: RawQuery, observedAt?: string): QuerySummary {
   const impactScore = clamp(Number(query.impactScore))
   const cpuAvailable = Boolean(query.cpu?.capability?.available)
   const cpuDataAvailable = cpuAvailable && Boolean(query.cpu?.capability?.dataAvailable)
   const waitAvailable = Boolean(query.waits?.capability?.available)
   const waitDataAvailable = waitAvailable && Boolean(query.waits?.capability?.dataAvailable)
+  const previousPeriodAvailable = query.previousPeriodAvailable
+    ?? (query.previousCalls !== null && query.previousCalls !== undefined
+      && query.previousMeanExecTimeMs !== null && query.previousMeanExecTimeMs !== undefined)
+  const resetDetected = Boolean(query.resetDetected)
+  const comparisonReliable = previousPeriodAvailable
+    && !resetDetected
+    && (query.comparisonReliable ?? true)
+  const warmingUp = query.warmingUp ?? !previousPeriodAvailable
+  const regressionPercent = comparisonReliable ? optionalNumber(query.regressionPercent) : undefined
+  const calls = Number(query.calls || 0)
   return {
     id: queryKey(query),
     queryId: String(query.queryId),
@@ -361,7 +378,7 @@ function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): Que
     title: queryTitle(query),
     sqlPreview: query.sql,
     database: query.serverAlias ? `${query.serverAlias} / ${query.databaseName}` : query.databaseName,
-    calls: Number(query.calls || 0),
+    calls,
     avgDurationMs: Number(query.meanExecTimeMs || 0),
     totalTimeMs: Number(query.totalExecTimeMs || 0),
     dbLoadPercent: Number(query.dbLoadPercent || 0),
@@ -423,12 +440,22 @@ function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): Que
       })) : [],
       scoreIncluded: false,
     },
+    observedFrom: query.observedFrom || null,
+    observedTo: query.observedTo || null,
+    coveragePercent: optionalNumber(query.coveragePercent) ?? null,
+    resetDetected,
+    comparisonReliable,
+    warmingUp,
+    previousPeriodAvailable,
     impactScore: Math.round(impactScore),
     priority: (query.priority || 'LOW').toUpperCase(),
     severity: severityFromPriority(query.priority),
-    lastSeenAt: observedAt,
-    changePercent: Number(query.regressionPercent || 0),
-    hasComparison: comparisonAvailable(Number(query.previousCalls || 0), Number(query.calls || 0)),
+    lastSeenAt: query.observedTo || observedAt || query.updatedAt || '',
+    changePercent: regressionPercent ?? null,
+    hasComparison: comparisonReliable
+      && previousPeriodAvailable
+      && regressionPercent !== undefined
+      && comparisonAvailable(Number(query.previousCalls), calls),
   }
 }
 
@@ -458,7 +485,7 @@ function labelForTimestamp(timestamp: string): string {
 }
 
 function mapDetail(query: RawQueryDetail, predicatePayload: RawPredicateResponse): QueryDetail {
-  const observedAt = query.trend.at(-1)?.timestamp || query.updatedAt || new Date().toISOString()
+  const observedAt = query.observedTo || query.trend.at(-1)?.timestamp || query.updatedAt || ''
   const summary = mapSummary(query, observedAt)
   const breakdown = Object.entries(query.scoreBreakdown || {}).map(([key, part]) => {
     const maxContribution = Math.round(Number(part.weight || 0) * 100)
@@ -475,14 +502,20 @@ function mapDetail(query: RawQueryDetail, predicatePayload: RawPredicateResponse
       unit: part.unit,
     }
   })
-  const previousTotal = Number(query.comparison?.previousMeanMs || 0) * Number(query.comparison?.previousCalls || 0)
+  const previousMean = optionalNumber(query.comparison?.previousMeanMs)
+  const previousCalls = optionalNumber(query.comparison?.previousCalls)
+  const previousTotal = previousMean !== undefined && previousCalls !== undefined
+    ? previousMean * previousCalls
+    : undefined
   const currentTotal = Number(query.comparison?.currentMeanMs || 0) * Number(query.comparison?.currentCalls || 0)
-  const regression = Number(query.comparison?.regressionPercent || 0)
+  const regression = summary.hasComparison
+    ? optionalNumber(query.comparison?.regressionPercent)
+    : undefined
 
   return {
     ...summary,
     fullSql: query.sql,
-    firstSeenAt: query.trend[0]?.timestamp || observedAt,
+    firstSeenAt: query.observedFrom || query.trend[0]?.timestamp || observedAt,
     p95DurationMs: optionalNumber(query.p95ExecTimeMs ?? query.p95DurationMs),
     rowsPerCall: optionalNumber(query.rowsPerCall),
     durationDistribution: query.durationDistribution ? { available: Boolean(query.durationDistribution.available), reason: query.durationDistribution.reason } : undefined,
@@ -492,11 +525,17 @@ function mapDetail(query: RawQueryDetail, predicatePayload: RawPredicateResponse
       impactScore: summary.impactScore,
     })),
     scoreBreakdown: breakdown,
-    comparison: [
-      { metric: 'Ort. çalışma süresi', before: Number(query.comparison?.previousMeanMs || 0), after: Number(query.comparison?.currentMeanMs || 0), unit: 'ms', improvementPercent: -regression },
-      { metric: 'Çağrı', before: Number(query.comparison?.previousCalls || 0), after: Number(query.comparison?.currentCalls || 0), unit: 'adet', improvementPercent: query.comparison?.previousCalls ? ((query.comparison.previousCalls - query.comparison.currentCalls) / query.comparison.previousCalls) * 100 : 0 },
-      { metric: 'Toplam çalışma', before: previousTotal, after: currentTotal, unit: 'ms', improvementPercent: previousTotal ? ((previousTotal - currentTotal) / previousTotal) * 100 : 0 },
-    ],
+    comparison: summary.hasComparison
+      && regression !== undefined
+      && previousMean !== undefined
+      && previousCalls !== undefined
+      && previousTotal !== undefined
+      ? [
+          { metric: 'Ort. çalışma süresi', before: previousMean, after: Number(query.comparison?.currentMeanMs || 0), unit: 'ms', improvementPercent: -regression },
+          { metric: 'Çağrı', before: previousCalls, after: Number(query.comparison?.currentCalls || 0), unit: 'adet', improvementPercent: previousCalls ? ((previousCalls - query.comparison.currentCalls) / previousCalls) * 100 : 0 },
+          { metric: 'Toplam çalışma', before: previousTotal, after: currentTotal, unit: 'ms', improvementPercent: previousTotal ? ((previousTotal - currentTotal) / previousTotal) * 100 : 0 },
+        ]
+      : [],
     findings: mapFindings(query),
     predicates: {
       capability: predicatePayload.capability,
