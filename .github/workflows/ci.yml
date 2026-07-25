@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-contracts:
+    name: Repository contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Ephemeral CI-only values. Persistent deployments must supply their own
+      # seven non-empty passwords; compose.yaml intentionally has no fallback.
+      POSTGRES_ADMIN_PASSWORD: ci-admin-not-for-deployment
+      POWA_COLLECTOR_PASSWORD: ci-collector-not-for-deployment
+      ADVISOR_API_PASSWORD: ci-api-not-for-deployment
+      ADVISOR_EVALUATOR_PASSWORD: ci-evaluator-not-for-deployment
+      ADVISOR_JOIN_SOURCE_PASSWORD: ci-join-source-not-for-deployment
+      ADVISOR_JOIN_REPOSITORY_PASSWORD: ci-join-repository-not-for-deployment
+      WORKLOAD_DB_PASSWORD: ci-workload-not-for-deployment
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Require persistent database passwords
+        run: |
+          required_passwords=(
+            POSTGRES_ADMIN_PASSWORD
+            POWA_COLLECTOR_PASSWORD
+            ADVISOR_API_PASSWORD
+            ADVISOR_EVALUATOR_PASSWORD
+            ADVISOR_JOIN_SOURCE_PASSWORD
+            ADVISOR_JOIN_REPOSITORY_PASSWORD
+            WORKLOAD_DB_PASSWORD
+          )
+          for required_password in "${required_passwords[@]}"; do
+            if missing_output="$(
+              env -u "$required_password" \
+                docker compose --env-file /dev/null config --quiet 2>&1
+            )"; then
+              echo "compose unexpectedly accepted missing $required_password" >&2
+              exit 1
+            fi
+            grep -q "$required_password" <<<"$missing_output"
+          done
+
+      - name: Validate portable Compose database settings
+        env:
+          # A common globally exported name must not override this stack.
+          DATABASE_URL: postgresql://unrelated.invalid/other
+          ADVISOR_API_DATABASE_HOST: repository.example.internal
+          ADVISOR_API_DATABASE_PORT: "5432"
+          ADVISOR_API_PASSWORD: "strong@source-db:/appdb?%5432"
+        run: |
+          docker compose config --format json | python -c '
+          import json, sys
+          environment = json.load(sys.stdin)["services"]["api"]["environment"]
+          assert environment["DATABASE_URL"] == ""
+          assert environment["DATABASE_HOST"] == "repository.example.internal"
+          assert environment["DATABASE_PORT"] == "5432"
+          assert environment["DATABASE_PASSWORD"] == "strong@source-db:/appdb?%5432"
+          '
+
+      - name: Validate migration runner and manifest checksums
+        run: python -m unittest deployment/repository/test_migration_runner.py -v
+
+      - name: Install deployment test dependency
+        run: python -m pip install "psycopg[binary]==3.2.9"
+
+      - name: Run deployment component tests
+        run: |
+          python -m unittest deployment/join-snapshotter/test_snapshotter.py -v
+          (cd deployment/workload && python -m unittest test_workload.py -v)
+          python -m unittest deployment/postgres/test_reconcile_roles.py -v
+
+      - name: Validate shell syntax
+        shell: bash
+        run: |
+          mapfile -d '' scripts < <(
+            find . -type f -name '*.sh' -not -path './.git/*' -print0
+          )
+          test "${#scripts[@]}" -gt 0
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
+
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build backend test image
+        run: >-
+          docker build
+          --file backend/Dockerfile.test
+          --tag postgresql-advisor/backend-tests:ci
+          backend
+
+      - name: Run backend test suite
+        run: docker run --rm postgresql-advisor/backend-tests:ci
+
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build

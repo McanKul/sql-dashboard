@@ -5,6 +5,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from psycopg.conninfo import conninfo_to_dict
+
+from app.conninfo import resolve_conninfo
 
 
 WINDOW_INTERVALS: dict[str, str] = {
@@ -52,11 +55,20 @@ class AuthPrincipalConfig(BaseModel):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    database_url: str = Field(
-        default="postgresql://advisor_api:advisor_dev_api@localhost:5433/powa_repository"
+    model_config = SettingsConfigDict(
+        env_file=".env", extra="ignore", hide_input_in_errors=True
     )
+
+    # DATABASE_URL remains an explicit backwards-compatible override. Normal
+    # deployments pass separate fields so reserved password characters never
+    # need URI escaping.
+    database_url: str | None = None
+    database_host: str = "localhost"
+    database_port: int = Field(default=5433, ge=1, le=65_535)
+    database_name: str = "powa_repository"
+    database_user: str = "advisor_api"
+    database_password: str = "advisor_dev_api"
+    database_sslmode: str | None = None
     default_window: str = "24h"
     max_query_page_size: int = 200
     sql_text_visibility: str = "authorized"
@@ -70,13 +82,34 @@ class Settings(BaseSettings):
     clone_evaluator_timeout_seconds: float = Field(default=90.0, gt=0, le=180)
     advisor_auth_principals: list[AuthPrincipalConfig] = Field(default_factory=list)
 
-    @field_validator("database_url")
-    @classmethod
-    def repository_only(cls, value: str) -> str:
-        lowered = value.lower()
-        if "5432" in lowered or "source-db" in lowered or "/appdb" in lowered:
+    @property
+    def database_conninfo(self) -> str:
+        return resolve_conninfo(
+            self.database_url,
+            host=self.database_host,
+            port=self.database_port,
+            dbname=self.database_name,
+            user=self.database_user,
+            password=self.database_password,
+            sslmode=self.database_sslmode,
+        )
+
+    @model_validator(mode="after")
+    def repository_only(self) -> Settings:
+        connection = conninfo_to_dict(self.database_conninfo)
+        hosts = {
+            host.strip().lower()
+            for host in (connection.get("host") or "").split(",")
+            if host.strip()
+        }
+        # Ports and database names are not identities: an external repository
+        # may legitimately use PostgreSQL's standard 5432 port and a locally
+        # chosen database name.  Reject the reference source host here; the
+        # Docker/API health gate then positively requires the advisor
+        # repository schema before the service becomes healthy.
+        if "source-db" in hosts:
             raise ValueError("API DATABASE_URL yalnizca repository instance'ini gostermelidir")
-        return value
+        return self
 
     @field_validator("default_window")
     @classmethod

@@ -7,6 +7,14 @@ web_url="${WEB_URL:-http://localhost:5173}"
 pass() { echo "[OK] $1"; }
 fail() { echo "[HATA] $1" >&2; exit 1; }
 
+verify_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/advisor-verify.XXXXXX")" \
+  || fail "Guvenli gecici dizin olusturulamadi"
+chmod 0700 "$verify_tmp_dir"
+cleanup_verify_tmp() {
+  rm -rf -- "$verify_tmp_dir"
+}
+trap cleanup_verify_tmp EXIT
+
 if python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
   python_bin=python3
 elif python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
@@ -19,7 +27,7 @@ docker compose config --quiet
 pass "Compose yapilandirmasi gecerli"
 
 for attempt in $(seq 1 30); do
-  if curl -fsS "${api_url}/api/v1/health" >/tmp/advisor-health.json 2>/dev/null; then
+  if curl -fsS "${api_url}/api/v1/health" >"${verify_tmp_dir}/health.json" 2>/dev/null; then
     break
   fi
   if (( attempt == 30 )); then
@@ -28,7 +36,7 @@ for attempt in $(seq 1 30); do
   sleep 2
 done
 
-"$python_bin" - /tmp/advisor-health.json <<'PY'
+"$python_bin" - "${verify_tmp_dir}/health.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     health = json.load(handle)
@@ -107,7 +115,7 @@ pass "Repository migration surumleri ve SHA-256 ledger kayitlari dogru"
 docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
   --username postgres --port 5433 --dbname powa_repository --file=- \
   < sql/tests/authenticated_actor_integration.sql \
-  >/tmp/advisor-authenticated-actor-integration.log
+  >"${verify_tmp_dir}/authenticated-actor-integration.log"
 pass "Annotation/export DB wrapper ACL, actor spoof ve rollback fixture'i dogru"
 
 source_hypopg_version="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
@@ -120,7 +128,7 @@ repository_hypopg_installed="$(docker compose exec -T repository-db psql -U post
   || fail "HypoPG repository database'e sizmis; extension yalniz degerlendirme kaynaginda olmali"
 pass "HypoPG 1.4.3 yalniz kaynak appdb'de etkin"
 
-evaluator_health_file=/tmp/advisor-evaluator-health.json
+evaluator_health_file="${verify_tmp_dir}/evaluator-health.json"
 for attempt in $(seq 1 30); do
   if docker compose exec -T evaluator python -c \
     "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3).read().decode())" \
@@ -396,7 +404,7 @@ restore_runtime() {
     docker compose up -d --no-deps workload >/dev/null 2>&1 || true
   fi
 }
-trap restore_runtime EXIT
+trap 'restore_runtime; cleanup_verify_tmp' EXIT
 if docker compose ps --services --status running | grep -qx workload; then
   docker compose stop workload >/dev/null
   workload_stopped=true
@@ -438,8 +446,8 @@ docker compose exec -T source-db psql -U postgres -d powa -qc \
 
 mutation_rows_before="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   'SELECT count(*) FROM workload_mutations')"
-bash scripts/run-test-workload.sh 20 >/tmp/advisor-workload-result.txt
-grep -q '"ok": true' /tmp/advisor-workload-result.txt || fail "Test fonksiyonu basarisiz"
+bash scripts/run-test-workload.sh 20 >"${verify_tmp_dir}/workload-result.txt"
+grep -q '"ok": true' "${verify_tmp_dir}/workload-result.txt" || fail "Test fonksiyonu basarisiz"
 run_join_wait_acceptance_workload
 raw_qualstats="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
   "SELECT count(*) FILTER (WHERE lrelid IS NOT NULL AND rrelid IS NOT NULL),
@@ -561,8 +569,8 @@ api_baseline_snap="$(docker compose exec -T repository-db psql -U postgres -p 54
   "SELECT extract(epoch FROM snapts) FROM \"PoWA\".powa_snapshot_metas WHERE srvid = ${demo_server_id}")"
 docker compose stop collector >/dev/null
 collector_stopped=true
-bash scripts/run-test-workload.sh 5 >/tmp/advisor-workload-second-result.txt
-grep -q '"ok": true' /tmp/advisor-workload-second-result.txt \
+bash scripts/run-test-workload.sh 5 >"${verify_tmp_dir}/workload-second-result.txt"
+grep -q '"ok": true' "${verify_tmp_dir}/workload-second-result.txt" \
   || fail "Ikinci kontrollu test fonksiyonu basarisiz"
 run_join_wait_acceptance_workload
 docker compose up -d --force-recreate --no-deps collector >/dev/null
@@ -853,7 +861,7 @@ if [[ "$workload_stopped" == true ]]; then
   docker compose up -d --no-deps workload >/dev/null
   workload_stopped=false
 fi
-trap - EXIT
+trap cleanup_verify_tmp EXIT
 
 for attempt in $(seq 1 12); do
   snapshots="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
@@ -870,10 +878,10 @@ collector_state="$(docker compose exec -T repository-db psql -U postgres -p 5433
 pass "Collector gecikmesi ve hata durumu saglikli"
 
 curl -fsS -H 'X-Advisor-Role: analyst' \
-  "${api_url}/api/v1/queries?window=1h&pageSize=10" >/tmp/advisor-queries-authorized.json
-curl -fsS "${api_url}/api/v1/queries?window=1h&pageSize=10" >/tmp/advisor-queries-viewer.json
+  "${api_url}/api/v1/queries?window=1h&pageSize=10" >"${verify_tmp_dir}/queries-authorized.json"
+curl -fsS "${api_url}/api/v1/queries?window=1h&pageSize=10" >"${verify_tmp_dir}/queries-viewer.json"
 
-read -r server_id database_id query_id < <("$python_bin" - /tmp/advisor-queries-authorized.json <<'PY'
+read -r server_id database_id query_id < <("$python_bin" - "${verify_tmp_dir}/queries-authorized.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     data = json.load(handle)
@@ -895,7 +903,7 @@ PY
 )
 query_id="${query_id%$'\r'}"
 
-"$python_bin" - /tmp/advisor-queries-viewer.json <<'PY'
+"$python_bin" - "${verify_tmp_dir}/queries-viewer.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     data = json.load(handle)
@@ -907,8 +915,8 @@ pass "Sorgu API'si gercek CPU dahil metrik donuyor ve yetkisiz SQL maskeleniyor"
 
 curl -fsS -H 'X-Advisor-Role: analyst' \
   "${api_url}/api/v1/queries/${wait_query_id}?window=1h&serverId=${demo_server_id}&databaseId=${wait_database_id}" \
-  >/tmp/advisor-wait-query.json
-"$python_bin" - /tmp/advisor-wait-query.json <<'PY'
+  >"${verify_tmp_dir}/wait-query.json"
+"$python_bin" - "${verify_tmp_dir}/wait-query.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     data = json.load(handle)
@@ -957,8 +965,8 @@ predicate_query_id="$composite_query_id"
 predicate_database_id="$composite_database_id"
 curl -fsS \
   "${api_url}/api/v1/queries/${predicate_query_id}/predicates?window=1h&serverId=${demo_server_id}&databaseId=${predicate_database_id}" \
-  >/tmp/advisor-predicates.json
-"$python_bin" - /tmp/advisor-predicates.json "$composite_candidate_id" <<'PY'
+  >"${verify_tmp_dir}/predicates.json"
+"$python_bin" - "${verify_tmp_dir}/predicates.json" "$composite_candidate_id" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     data = json.load(handle)
@@ -1030,8 +1038,8 @@ curl -fsS -X POST \
   -H 'Content-Type: application/json' \
   -H 'X-Advisor-Role: analyst' \
   "${api_url}/api/v1/queries/${composite_query_id}/composite-index-evaluations?window=1h" \
-  --data "$composite_payload" >/tmp/advisor-composite-evaluation.json
-"$python_bin" - /tmp/advisor-composite-evaluation.json <<'PY'
+  --data "$composite_payload" >"${verify_tmp_dir}/composite-evaluation.json"
+"$python_bin" - "${verify_tmp_dir}/composite-evaluation.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     data = json.load(handle)
@@ -1052,7 +1060,7 @@ assert data['confidence']['level'] in {'MEDIUM', 'HIGH'}, data
 PY
 pass "Persisted iki kolonlu aday HypoPG ile dogrulandi; gercek DDL calismadi"
 
-evaluation_candidates_file=/tmp/advisor-index-evaluation-candidates.tsv
+evaluation_candidates_file="${verify_tmp_dir}/index-evaluation-candidates.tsv"
 docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
   "SELECT m.query_id, m.database_id, m.qual_id, m.relation_id
      FROM advisor.predicate_metrics(interval '1 hour', ${demo_server_id}, ${source_appdb_oid}::oid, NULL) m
@@ -1089,7 +1097,7 @@ docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository
 
 evaluation_validated=false
 evaluation_attempts=""
-evaluation_result_file=/tmp/advisor-index-evaluation.json
+evaluation_result_file="${verify_tmp_dir}/index-evaluation.json"
 while IFS='|' read -r evaluation_query_id evaluation_database_id evaluation_qual_id evaluation_relation_id; do
   evaluation_relation_id="${evaluation_relation_id%$'\r'}"
   [[ "$evaluation_query_id" =~ ^-?[0-9]+$ \
@@ -1160,7 +1168,7 @@ done <"$evaluation_candidates_file"
   || fail "Canli predicate adaylarindan hicbiri HypoPG ile dogrulanamadi:${evaluation_attempts:- aday yok}"
 pass "Analyst POST canli predicate icin kopyalanabilir SQL ve HypoPG plan kaniti donduruyor"
 
-viewer_evaluation_file=/tmp/advisor-index-evaluation-viewer.json
+viewer_evaluation_file="${verify_tmp_dir}/index-evaluation-viewer.json"
 viewer_evaluation_http_code="$(curl -sS -o "$viewer_evaluation_file" -w '%{http_code}' \
   -X POST \
   -H 'Content-Type: application/json' \
@@ -1200,7 +1208,7 @@ evaluator_repository_rows="$(repository_evaluator_row_count)"
   || fail "advisor_evaluator EXPLAIN telemetrisi repository'ye sizdi: ${evaluator_repository_rows} satir"
 pass "HypoPG gercek index/DDL olusturmadi ve evaluator sorgulari repository'ye sizmadi"
 
-http_seconds="$(curl -fsS -o /tmp/advisor-performance.json -w '%{time_total}' \
+http_seconds="$(curl -fsS -o "${verify_tmp_dir}/performance.json" -w '%{time_total}' \
   -H 'X-Advisor-Role: analyst' "${api_url}/api/v1/queries?window=24h&pageSize=50")"
 "$python_bin" - "$http_seconds" <<'PY'
 import sys
@@ -1216,9 +1224,9 @@ if [[ "${ADVISOR_API_TOKEN:-}" =~ ^adv_pat_v1_[A-Za-z0-9_-]{43}$ ]]; then
     -H 'Content-Type: application/json' \
     "$annotation_url" \
     --data '{"status":"IN_REVIEW","note":"Otomatik kabul testi"}' \
-    >/tmp/advisor-annotation.json
+    >"${verify_tmp_dir}/annotation.json"
 
-  annotation_actor="$("$python_bin" - /tmp/advisor-annotation.json <<'PY'
+  annotation_actor="$("$python_bin" - "${verify_tmp_dir}/annotation.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     payload = json.load(handle)
@@ -1245,7 +1253,7 @@ PY
   (( audit_count >= 1 )) || fail "Dogrulanmis actor icin annotation audit kaydi olusmadi"
   pass "Annotation response, satir sahibi ve audit actor Bearer subject ile eslesti"
 else
-  annotation_http_code="$(curl -sS -o /tmp/advisor-annotation-unauthorized.json -w '%{http_code}' \
+  annotation_http_code="$(curl -sS -o "${verify_tmp_dir}/annotation-unauthorized.json" -w '%{http_code}' \
     -X PATCH -H 'Content-Type: application/json' "$annotation_url" \
     --data '{"status":"IN_REVIEW","note":"Yetkisiz kabul testi"}')"
   [[ "$annotation_http_code" == "401" ]] \
@@ -1253,9 +1261,18 @@ else
   pass "Auth registry/token verilmediginde annotation fail-closed kapali"
 fi
 
+api_database_host="$(docker compose exec -T api python - <<'PY'
+from psycopg.conninfo import conninfo_to_dict
+
+from app.config import get_settings
+
+target = conninfo_to_dict(get_settings().database_conninfo)
+print(target.get('host', ''))
+PY
+)"
+[[ "$api_database_host" != "source-db" ]] \
+  || fail "API containerinda kaynak DB hedefi bulundu: ${api_database_host}"
 api_environment="$(docker compose exec -T api env)"
-[[ "$api_environment" != *"source-db"* && "$api_environment" != *":5432"* && "$api_environment" != *"/appdb"* ]] \
-  || fail "API containerinda kaynak DB baglanti bilgisi bulundu"
 [[ "$api_environment" != *"EVALUATOR_DATABASE_URL="* \
    && "$api_environment" != *"ADVISOR_EVALUATOR_PASSWORD="* ]] \
   || fail "API containerina evaluator kaynak DSN/parolasi sizmis"

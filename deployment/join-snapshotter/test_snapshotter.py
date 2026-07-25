@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
 
 MODULE_PATH = Path(__file__).with_name("snapshotter.py")
 SPEC = importlib.util.spec_from_file_location("join_snapshotter", MODULE_PATH)
@@ -110,6 +112,94 @@ def settings() -> Any:
 
 
 class SnapshotterTests(unittest.TestCase):
+    def test_settings_build_safe_conninfo_from_separate_fields(self) -> None:
+        password = "strong@pass:/?%5432"
+        environment = {
+            "JOIN_SOURCE_ALIAS": "test-source",
+            "JOIN_SOURCE_DATABASE_URL": "",
+            "JOIN_SOURCE_DATABASE_URL_FILE": "",
+            "JOIN_SOURCE_DATABASE_HOST": "source-db",
+            "JOIN_SOURCE_DATABASE_PORT": "5432",
+            "JOIN_SOURCE_DATABASE_NAME": "powa",
+            "JOIN_SOURCE_DATABASE_USER": "advisor_join_reader",
+            "JOIN_SOURCE_DATABASE_PASSWORD": password,
+            "JOIN_SOURCE_DATABASE_SSLMODE": "disable",
+            "JOIN_REPOSITORY_DATABASE_URL": "",
+            "JOIN_REPOSITORY_DATABASE_URL_FILE": "",
+            "JOIN_REPOSITORY_DATABASE_HOST": "repository-db",
+            "JOIN_REPOSITORY_DATABASE_PORT": "5433",
+            "JOIN_REPOSITORY_DATABASE_NAME": "powa_repository",
+            "JOIN_REPOSITORY_DATABASE_USER": "advisor_join_ingest",
+            "JOIN_REPOSITORY_DATABASE_PASSWORD": password,
+            "JOIN_REPOSITORY_DATABASE_SSLMODE": "disable",
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            configured = snapshotter.Settings.from_environment()
+
+        source = conninfo_to_dict(configured.source_database_url)
+        repository = conninfo_to_dict(configured.repository_database_url)
+        self.assertEqual(source["password"], password)
+        self.assertEqual(source["host"], "source-db")
+        self.assertEqual(source["dbname"], "powa")
+        self.assertEqual(repository["password"], password)
+        self.assertEqual(repository["host"], "repository-db")
+        self.assertEqual(repository["port"], "5433")
+
+    def test_url_and_url_file_overrides_remain_supported(self) -> None:
+        password = "legacy@pass:/?%5432"
+        source_override = make_conninfo(
+            host="legacy-source",
+            port=6432,
+            dbname="powa",
+            user="legacy_reader",
+            password=password,
+        )
+        repository_override = make_conninfo(
+            host="legacy-repository",
+            port=6433,
+            dbname="powa_repository",
+            user="legacy_ingest",
+            password=password,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_url_file = Path(temp_dir) / "source-url"
+            source_url_file.write_text(f"{source_override}\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "JOIN_SOURCE_ALIAS": "legacy-source",
+                    "JOIN_SOURCE_DATABASE_URL_FILE": str(source_url_file),
+                    "JOIN_REPOSITORY_DATABASE_URL": repository_override,
+                },
+                clear=True,
+            ):
+                configured = snapshotter.Settings.from_environment()
+
+        source = conninfo_to_dict(configured.source_database_url)
+        repository = conninfo_to_dict(configured.repository_database_url)
+        self.assertEqual(source["host"], "legacy-source")
+        self.assertEqual(source["password"], password)
+        self.assertEqual(repository["host"], "legacy-repository")
+        self.assertEqual(repository["password"], password)
+
+    def test_url_and_url_file_conflict_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_url_file = Path(temp_dir) / "source-url"
+            source_url_file.write_text("host=file-source dbname=powa\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "JOIN_SOURCE_ALIAS": "test-source",
+                    "JOIN_SOURCE_DATABASE_URL": "host=direct-source dbname=powa",
+                    "JOIN_SOURCE_DATABASE_URL_FILE": str(source_url_file),
+                    "JOIN_REPOSITORY_DATABASE_URL": "host=repository-db dbname=powa_repository",
+                },
+                clear=True,
+            ):
+                with self.assertRaises(ValueError):
+                    snapshotter.Settings.from_environment()
+
     def test_ack_happens_only_after_repository_commit(self) -> None:
         events: list[str] = []
         repository = FakeConnection(events, "repository", FakeResult(one={"inserted": True}))

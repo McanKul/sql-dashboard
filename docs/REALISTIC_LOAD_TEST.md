@@ -65,10 +65,14 @@ Compose değişkenleri korunur. Örneğin yerel kabul stack'i için:
 
 ```bash
 COMPOSE_PROJECT_NAME=postgresql-advisor-final-live \
-COMPOSE_FILE="compose.yaml:/tmp/sql-dashboard-final-network.yaml" \
+COMPOSE_FILE="compose.yaml:compose.networks.fixed.yaml" \
 REALISTIC_VERIFY_RUNTIME=true \
 bash scripts/run-realistic-workload.sh normal
 ```
+
+Tracked overlay'deki subnet'ler kurumsal ağ/VPN ile çakışırsa
+`ADVISOR_NETWORK_SUBNET`, `EVALUATOR_CONTROL_SUBNET` ve aynı dosyada listelenen
+diğer subnet değişkenlerini `.env` içinde kurulum başına özelleştirin.
 
 ## Trafik modeli
 

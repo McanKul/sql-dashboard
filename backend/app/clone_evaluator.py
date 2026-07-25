@@ -22,6 +22,8 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.conninfo import resolve_conninfo
+
 
 class CloneEvaluatorSettings(BaseSettings):
     """Configuration for the clone-only runtime evaluator.
@@ -30,11 +32,18 @@ class CloneEvaluatorSettings(BaseSettings):
     configured server must be a pre-populated, isolated clone cluster.
     """
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    clone_database_url: str = (
-        "postgresql://clone_admin:advisor_dev_clone_admin@localhost:55432/postgres"
+    model_config = SettingsConfigDict(
+        env_file=".env", extra="ignore", hide_input_in_errors=True
     )
+
+    # CLONE_DATABASE_URL remains a backwards-compatible explicit override.
+    clone_database_url: str | None = None
+    clone_database_host: str = "localhost"
+    clone_database_port: int = Field(default=55_432, ge=1, le=65_535)
+    clone_database_name: str = "postgres"
+    clone_database_user: str = "clone_admin"
+    clone_database_password: str = "advisor_dev_clone_admin"
+    clone_database_sslmode: str | None = None
     clone_template_database: str = "appdb"
     clone_admin_role: str = "clone_admin"
     clone_runner_role: str = "clone_runner"
@@ -48,6 +57,18 @@ class CloneEvaluatorSettings(BaseSettings):
     clone_min_improvement_percent: float = Field(default=10.0, ge=0, le=90)
     clone_connect_timeout_seconds: int = Field(default=3, ge=1, le=15)
 
+    @property
+    def clone_database_conninfo(self) -> str:
+        return resolve_conninfo(
+            self.clone_database_url,
+            host=self.clone_database_host,
+            port=self.clone_database_port,
+            dbname=self.clone_database_name,
+            user=self.clone_database_user,
+            password=self.clone_database_password,
+            sslmode=self.clone_database_sslmode,
+        )
+
     @field_validator(
         "clone_template_database",
         "clone_admin_role",
@@ -59,7 +80,7 @@ class CloneEvaluatorSettings(BaseSettings):
 
     @model_validator(mode="after")
     def admin_connection_is_not_the_template(self) -> CloneEvaluatorSettings:
-        connection = conninfo_to_dict(self.clone_database_url)
+        connection = conninfo_to_dict(self.clone_database_conninfo)
         if connection.get("dbname") == self.clone_template_database:
             raise ValueError("CLONE_DATABASE_URL appdb template'i yerine yonetim database'ini gostermeli")
         return self
@@ -328,7 +349,7 @@ def _connection_dsn(
             user=settings.clone_runner_role,
             password=settings.clone_runner_password,
         )
-    return make_conninfo(settings.clone_database_url, **overrides)
+    return make_conninfo(settings.clone_database_conninfo, **overrides)
 
 
 def _connect(
@@ -372,7 +393,7 @@ def _guard_clone_connection(
 
 
 def _assert_clone_ready(settings: CloneEvaluatorSettings) -> dict[str, Any]:
-    admin_database = conninfo_to_dict(settings.clone_database_url).get("dbname") or "postgres"
+    admin_database = conninfo_to_dict(settings.clone_database_conninfo).get("dbname") or "postgres"
     with _connect(settings, admin_database) as connection:
         with connection.cursor() as cursor:
             guard = _guard_clone_connection(
@@ -424,7 +445,7 @@ def _assert_clone_ready(settings: CloneEvaluatorSettings) -> dict[str, Any]:
 
 def _create_job_database(settings: CloneEvaluatorSettings, database_name: str) -> None:
     _validated_identifier(database_name)
-    admin_database = conninfo_to_dict(settings.clone_database_url).get("dbname") or "postgres"
+    admin_database = conninfo_to_dict(settings.clone_database_conninfo).get("dbname") or "postgres"
     with _connect(settings, admin_database) as connection:
         with connection.cursor() as cursor:
             _guard_clone_connection(cursor, settings, expected_role=settings.clone_admin_role)
@@ -446,7 +467,7 @@ def _create_job_database(settings: CloneEvaluatorSettings, database_name: str) -
 
 def _grant_runner_connect(settings: CloneEvaluatorSettings, database_name: str) -> None:
     _validated_identifier(database_name)
-    admin_database = conninfo_to_dict(settings.clone_database_url).get("dbname") or "postgres"
+    admin_database = conninfo_to_dict(settings.clone_database_conninfo).get("dbname") or "postgres"
     with _connect(settings, admin_database) as connection:
         with connection.cursor() as cursor:
             _guard_clone_connection(cursor, settings, expected_role=settings.clone_admin_role)
@@ -791,7 +812,7 @@ def _benchmark(
 def _destroy_job_databases(settings: CloneEvaluatorSettings, database_names: list[str]) -> bool:
     if not database_names:
         return True
-    admin_database = conninfo_to_dict(settings.clone_database_url).get("dbname") or "postgres"
+    admin_database = conninfo_to_dict(settings.clone_database_conninfo).get("dbname") or "postgres"
     cleanup_ok = True
     for database_name in reversed(database_names):
         try:

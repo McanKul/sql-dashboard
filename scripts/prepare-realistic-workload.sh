@@ -105,8 +105,8 @@ else
 fi
 
 # Read the fully resolved value that Compose will pass to the workload service.
-# This covers shell variables, .env/COMPOSE_ENV_FILES and the Compose default
-# without sourcing an operator-controlled env file as shell code.
+# This covers shell variables and .env/COMPOSE_ENV_FILES without sourcing an
+# operator-controlled env file as shell code.
 if ! workload_db_password="$(
   docker compose --profile realistic-load config --format json \
     | "$python_bin" -c \
@@ -116,6 +116,11 @@ if ! workload_db_password="$(
 fi
 (( ${#workload_db_password} >= 16 )) \
   || fail "WORKLOAD_DB_PASSWORD en az 16 karakter olmali."
+case "$workload_db_password" in
+  advisor_dev_workload|change-me-workload|change-me-*)
+    fail "WORKLOAD_DB_PASSWORD bilinen ornek/gelistirme degeri olamaz."
+    ;;
+esac
 export WORKLOAD_DB_PASSWORD="$workload_db_password"
 if ! compose_project_name="$(
   docker compose --profile realistic-load config --format json \

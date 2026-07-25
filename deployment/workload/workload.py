@@ -522,6 +522,13 @@ class WorkloadConfig:
         database_url = values.get("DATABASE_URL", "").strip()
         if not database_url:
             raise ValueError("DATABASE_URL is required")
+        workload_password = values.get("PGPASSWORD", "")
+        if len(workload_password) < 16:
+            raise ValueError("WORKLOAD_DB_PASSWORD must contain at least 16 characters")
+        if workload_password == "advisor_dev_workload" or workload_password.startswith(
+            "change-me-"
+        ):
+            raise ValueError("WORKLOAD_DB_PASSWORD cannot use a known development value")
 
         profile = values.get("WORKLOAD_PROFILE", "normal").strip().lower()
         if profile not in PROFILE_DEFAULTS:

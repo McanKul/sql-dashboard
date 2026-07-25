@@ -1,6 +1,12 @@
 \set ON_ERROR_STOP on
 \pset pager off
 
+-- Protect the secret-bearing validation and ALTER ROLE statements even when
+-- the target enables verbose statement/error logging.
+SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+SET log_parameter_max_length_on_error = 0;
+
 \getenv workload_db_password WORKLOAD_DB_PASSWORD
 \if :{?workload_db_password}
 \else
@@ -9,11 +15,14 @@
   END $abort$;
 \endif
 
-SELECT length(:'workload_db_password') >= 16 AS workload_password_valid \gset
+SELECT length(:'workload_db_password') >= 16
+   AND :'workload_db_password' <> 'advisor_dev_workload'
+   AND :'workload_db_password' NOT LIKE 'change-me-%'
+   AS workload_password_valid \gset
 \if :workload_password_valid
 \else
   DO $abort$ BEGIN
-      RAISE EXCEPTION 'WORKLOAD_DB_PASSWORD must contain at least 16 characters';
+      RAISE EXCEPTION 'WORKLOAD_DB_PASSWORD must be strong and not use a known development value';
   END $abort$;
 \endif
 
@@ -99,7 +108,7 @@ ALTER ROLE advisor_workload_reporter
 
 SELECT format(
     'ALTER ROLE advisor_workload_login WITH LOGIN NOINHERIT NOSUPERUSER '
-    'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 70 PASSWORD %L',
+    'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 70 PASSWORD %L VALID UNTIL ''infinity''',
     :'workload_db_password'
 )
 \gexec

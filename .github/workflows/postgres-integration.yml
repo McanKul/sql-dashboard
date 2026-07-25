@@ -1,0 +1,79 @@
+name: PostgreSQL integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fresh-stack:
+    name: Fresh PostgreSQL stack (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE_PROJECT_NAME: advisor-ci-integration
+      POSTGRES_ADMIN_PASSWORD: integration-admin-strong-value
+      POWA_COLLECTOR_PASSWORD: integration-collector-strong-value
+      ADVISOR_API_PASSWORD: integration-api-strong-value
+      ADVISOR_EVALUATOR_PASSWORD: integration-evaluator-strong-value
+      ADVISOR_JOIN_SOURCE_PASSWORD: integration-join-source-strong-value
+      ADVISOR_JOIN_REPOSITORY_PASSWORD: integration-join-repository-strong-value
+      WORKLOAD_DB_PASSWORD: integration-workload-strong-value
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build the complete core stack
+        run: docker compose build
+
+      - name: Boot fresh named volumes
+        run: docker compose up -d --wait --wait-timeout 240
+
+      - name: Verify health and migration idempotency
+        run: |
+          curl --fail --silent --show-error \
+            http://127.0.0.1:8000/api/v1/health \
+            | python -c '
+          import json, sys
+          health = json.load(sys.stdin)
+          assert health["status"] == "healthy", health
+          assert health["repository"] == "healthy", health
+          assert health["collector"] == "healthy", health
+          '
+          docker compose run --rm repository-migrate
+          bash scripts/verify-temporal-reliability.sh
+
+      - name: Verify real role drift reconciliation
+        run: |
+          docker compose exec -T source-db \
+            psql -X -U postgres -d appdb --set=ON_ERROR_STOP=1 \
+              --command="ALTER ROLE advisor_evaluator SUPERUSER CONNECTION LIMIT 17 VALID UNTIL '2020-01-01'"
+          for attempt in $(seq 1 20); do
+            role_state="$(
+              docker compose exec -T source-db \
+                psql -X -U postgres -d appdb --tuples-only --no-align \
+                  --command="SELECT rolsuper::text || '|' || rolconnlimit::text || '|' || rolvaliduntil::text FROM pg_authid WHERE rolname='advisor_evaluator'"
+            )"
+            if [[ "$role_state" == "false|2|infinity" ]]; then
+              exit 0
+            fi
+            printf 'drift check attempt=%s state=%s\n' "$attempt" "$role_state"
+            sleep 1
+          done
+          echo "role drift was not reconciled: $role_state" >&2
+          exit 1
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=300
+
+      - name: Remove disposable CI volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans

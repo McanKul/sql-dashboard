@@ -9,20 +9,32 @@ INSERT INTO "PoWA".powa_servers (
     id, hostname, alias, port, username, dbname, frequency, powa_coalesce,
     retention, allow_ui_connection
 )
-VALUES (
-    2147483000, 'reset-coverage-fixture.invalid', 'reset-coverage-fixture',
-    5432, 'fixture', 'fixture', 10, 100, interval '7 days', false
-);
+VALUES
+    (
+        2147483000, 'reset-coverage-fixture.invalid',
+        'reset-coverage-fixture', 5432, 'fixture', 'fixture',
+        10, 100, interval '7 days', false
+    ),
+    (
+        2147483001, 'overlap-fixture.invalid', 'overlap-fixture',
+        5432, 'fixture', 'fixture', 600, 100, interval '7 days', false
+    );
 
 INSERT INTO "PoWA".powa_databases(srvid, oid, datname)
-VALUES (2147483000, 2147483000::oid, 'reset_coverage_fixture');
+VALUES
+    (2147483000, 2147483000::oid, 'reset_coverage_fixture'),
+    (2147483001, 2147483001::oid, 'overlap_fixture');
 
 INSERT INTO "PoWA".powa_statements(srvid, queryid, dbid, userid, query)
 VALUES
     (2147483000, 9001, 2147483000::oid, 10::oid, 'SELECT reset_inside_chunk'),
     (2147483000, 9002, 2147483000::oid, 10::oid, 'SELECT collector_gap'),
     (2147483000, 9003, 2147483000::oid, 10::oid, 'SELECT missing_previous_period'),
-    (2147483000, 9004, 2147483000::oid, 10::oid, 'SELECT normal_coalesced_chunk');
+    (2147483000, 9004, 2147483000::oid, 10::oid, 'SELECT normal_coalesced_chunk'),
+    (2147483000, 9005, 2147483000::oid, 10::oid, 'SELECT healthy_chunk_boundaries'),
+    (2147483000, 9006, 2147483000::oid, 10::oid, 'SELECT multi_user_coverage_cap'),
+    (2147483000, 9006, 2147483000::oid, 11::oid, 'SELECT multi_user_coverage_cap'),
+    (2147483001, 9007, 2147483001::oid, 10::oid, 'SELECT overlapping_chunks');
 
 -- The middle record resets to five.  The final value (120) is higher than the
 -- first value (100), proving that endpoint-only delta logic would miss it.
@@ -66,6 +78,203 @@ SELECT
     tstzrange(now() - interval '40 minutes', now() - interval '39 minutes 40 seconds', '[]'),
     records, records[1], records[3]
 FROM fixture;
+
+-- A continuously sampled series is split across three physical PoWA chunks.
+-- Every first record has a NULL chunk-local lag, but chunks two and three have
+-- valid boundary predecessors and must not make the query look like warm-up.
+WITH chunk_bounds(chunk_number, first_index, last_index) AS (
+    VALUES
+        (1, 0, 240),
+        (2, 241, 480),
+        (3, 481, 720)
+), samples AS (
+    SELECT
+        chunk.chunk_number,
+        sample_index,
+        now() - interval '2 hours 10 seconds'
+            + make_interval(secs => sample_index * 10) AS sample_at,
+        jsonb_populate_record(
+            NULL::"PoWA".powa_statements_history_record,
+            jsonb_build_object(
+                'ts', now() - interval '2 hours 10 seconds'
+                    + make_interval(secs => sample_index * 10),
+                'calls', 1000 + sample_index,
+                'total_exec_time', 10000 + sample_index * 10,
+                'rows', 2000 + sample_index,
+                'shared_blks_hit', 3000 + sample_index,
+                'shared_blks_read', 400 + sample_index,
+                'temp_blks_written', 50 + sample_index,
+                'wal_bytes', 50000 + sample_index * 100
+            )
+        ) AS sample_record
+    FROM chunk_bounds AS chunk
+    CROSS JOIN LATERAL generate_series(
+        chunk.first_index,
+        chunk.last_index
+    ) AS generated(sample_index)
+), chunks AS (
+    SELECT
+        chunk_number,
+        min(sample_at) AS first_sample_at,
+        max(sample_at) AS last_sample_at,
+        array_agg(sample_record ORDER BY sample_index)
+            ::"PoWA".powa_statements_history_record[] AS records
+    FROM samples
+    GROUP BY chunk_number
+)
+INSERT INTO "PoWA".powa_statements_history (
+    srvid, queryid, dbid, toplevel, userid, coalesce_range,
+    records, mins_in_range, maxs_in_range
+)
+SELECT
+    2147483000, 9005, 2147483000::oid, true, 10::oid,
+    tstzrange(first_sample_at, last_sample_at, '[]'),
+    records, records[1], records[array_length(records, 1)]
+FROM chunks
+ORDER BY chunk_number;
+
+-- Two roles run the same query on interleaved timestamps.  The legacy
+-- temporal rollup caps their combined represented intervals at one window;
+-- the optimized multi-user fallback must preserve that cap.
+WITH users(user_id, offset_seconds) AS (
+    VALUES (10::oid, 0), (11::oid, 5)
+), samples AS (
+    SELECT
+        fixture_user.user_id,
+        sample_index,
+        now() - interval '2 hours 10 seconds'
+            + make_interval(
+                secs => sample_index * 10 + fixture_user.offset_seconds
+            ) AS sample_at,
+        jsonb_populate_record(
+            NULL::"PoWA".powa_statements_history_record,
+            jsonb_build_object(
+                'ts', now() - interval '2 hours 10 seconds'
+                    + make_interval(
+                        secs => sample_index * 10
+                            + fixture_user.offset_seconds
+                    ),
+                'calls', 5000 + sample_index,
+                'total_exec_time', 50000 + sample_index * 10,
+                'rows', 6000 + sample_index,
+                'shared_blks_hit', 7000 + sample_index,
+                'shared_blks_read', 800 + sample_index,
+                'temp_blks_written', 90 + sample_index,
+                'wal_bytes', 90000 + sample_index * 100
+            )
+        ) AS sample_record
+    FROM users AS fixture_user
+    CROSS JOIN generate_series(0, 720) AS generated(sample_index)
+), user_chunks AS (
+    SELECT
+        user_id,
+        min(sample_at) AS first_sample_at,
+        max(sample_at) AS last_sample_at,
+        array_agg(sample_record ORDER BY sample_index)
+            ::"PoWA".powa_statements_history_record[] AS records
+    FROM samples
+    GROUP BY user_id
+)
+INSERT INTO "PoWA".powa_statements_history (
+    srvid, queryid, dbid, toplevel, userid, coalesce_range,
+    records, mins_in_range, maxs_in_range
+)
+SELECT
+    2147483000, 9006, 2147483000::oid, true, user_id,
+    tstzrange(first_sample_at, last_sample_at, '[]'),
+    records, records[1], records[array_length(records, 1)]
+FROM user_chunks
+ORDER BY user_id;
+
+-- PoWA's writer keeps chunks non-overlapping, but the tables do not enforce
+-- that invariant for manual imports.  An overlapping shape must be clamped
+-- and marked unreliable rather than silently enabling regression comparison.
+WITH chunks(chunk_number, records) AS (
+    VALUES
+    (
+        1,
+        ARRAY[
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '2 hours 10 minutes',
+                    'calls', 1, 'total_exec_time', 10, 'rows', 1,
+                    'shared_blks_hit', 1, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '1 hour 50 minutes',
+                    'calls', 2, 'total_exec_time', 20, 'rows', 2,
+                    'shared_blks_hit', 2, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '1 hour 30 minutes',
+                    'calls', 3, 'total_exec_time', 30, 'rows', 3,
+                    'shared_blks_hit', 3, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '1 hour 10 minutes',
+                    'calls', 4, 'total_exec_time', 40, 'rows', 4,
+                    'shared_blks_hit', 4, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            )
+        ]::"PoWA".powa_statements_history_record[]
+    ),
+    (
+        2,
+        ARRAY[
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '1 hour 30 minutes',
+                    'calls', 3, 'total_exec_time', 30, 'rows', 3,
+                    'shared_blks_hit', 3, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '1 hour 10 minutes',
+                    'calls', 4, 'total_exec_time', 40, 'rows', 4,
+                    'shared_blks_hit', 4, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '50 minutes',
+                    'calls', 5, 'total_exec_time', 50, 'rows', 5,
+                    'shared_blks_hit', 5, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '30 minutes',
+                    'calls', 6, 'total_exec_time', 60, 'rows', 6,
+                    'shared_blks_hit', 6, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            ),
+            jsonb_populate_record(
+                NULL::"PoWA".powa_statements_history_record,
+                jsonb_build_object('ts', now() - interval '10 minutes',
+                    'calls', 7, 'total_exec_time', 70, 'rows', 7,
+                    'shared_blks_hit', 7, 'shared_blks_read', 0,
+                    'temp_blks_written', 0, 'wal_bytes', 0)
+            )
+        ]::"PoWA".powa_statements_history_record[]
+    )
+)
+INSERT INTO "PoWA".powa_statements_history (
+    srvid, queryid, dbid, toplevel, userid, coalesce_range,
+    records, mins_in_range, maxs_in_range
+)
+SELECT
+    2147483001, 9007, 2147483001::oid, true, 10::oid,
+    tstzrange((records[1]).ts, (records[array_length(records, 1)]).ts, '[]'),
+    records, records[1], records[array_length(records, 1)]
+FROM chunks
+ORDER BY chunk_number;
 
 -- A healthy coalesced chunk must not be mistaken for a collector gap.
 WITH fixture AS (
@@ -134,10 +343,16 @@ FROM fixture;
 
 WITH fixture AS (
     SELECT ARRAY[
+        -- Physical ordinality is deliberately not chronological.  Optimized
+        -- chunk rollups must order by record.ts like the public delta API.
+        ROW(now() - interval '39 minutes 40 seconds', 120)::"PoWA".powa_wait_sampling_history_record,
         ROW(now() - interval '40 minutes', 100)::"PoWA".powa_wait_sampling_history_record,
-        ROW(now() - interval '39 minutes 50 seconds', 3)::"PoWA".powa_wait_sampling_history_record,
-        ROW(now() - interval '39 minutes 40 seconds', 120)::"PoWA".powa_wait_sampling_history_record
-    ] AS records
+        ROW(now() - interval '39 minutes 50 seconds', 3)::"PoWA".powa_wait_sampling_history_record
+    ] AS records,
+    ROW(now() - interval '40 minutes', 100)
+        ::"PoWA".powa_wait_sampling_history_record AS oldest_record,
+    ROW(now() - interval '39 minutes 40 seconds', 120)
+        ::"PoWA".powa_wait_sampling_history_record AS newest_record
 )
 INSERT INTO "PoWA".powa_wait_sampling_history (
     srvid, coalesce_range, queryid, dbid, event_type, event,
@@ -146,8 +361,39 @@ INSERT INTO "PoWA".powa_wait_sampling_history (
 SELECT
     2147483000,
     tstzrange(now() - interval '40 minutes', now() - interval '39 minutes 40 seconds', '[]'),
-    9001, 2147483000::oid, 'IO', 'DataFileRead', records, records[1], records[3]
+    9001, 2147483000::oid, 'IO', 'DataFileRead', records,
+    oldest_record, newest_record
 FROM fixture;
+
+-- Wait-only/orphan series model extensions or stale query ids that have no
+-- current statement activity.  Active-key pushdown must discard them before
+-- expanding their arrays.
+INSERT INTO "PoWA".powa_wait_sampling_history (
+    srvid, coalesce_range, queryid, dbid, event_type, event,
+    records, mins_in_range, maxs_in_range
+)
+SELECT
+    2147483000,
+    tstzrange(
+        now() - interval '40 minutes',
+        now() - interval '39 minutes 50 seconds',
+        '[]'
+    ),
+    910000 + orphan_id,
+    2147483000::oid,
+    'IO',
+    'OrphanDataFileRead',
+    ARRAY[
+        ROW(now() - interval '40 minutes', 1)
+            ::"PoWA".powa_wait_sampling_history_record,
+        ROW(now() - interval '39 minutes 50 seconds', 2)
+            ::"PoWA".powa_wait_sampling_history_record
+    ],
+    ROW(now() - interval '40 minutes', 1)
+        ::"PoWA".powa_wait_sampling_history_record,
+    ROW(now() - interval '39 minutes 50 seconds', 2)
+        ::"PoWA".powa_wait_sampling_history_record
+FROM generate_series(1, 64) AS orphan(orphan_id);
 
 -- The predecessor and resume samples intentionally share one coalesced row.
 -- maxs_in_range is component-wise/synthetic, so the delta code must select a
@@ -347,5 +593,574 @@ BEGIN
     END IF;
 END
 $assert$;
+
+DO $query_rollup_boundary_parity$
+DECLARE
+    legacy_boundary record;
+    optimized_boundary record;
+    boundary_quality record;
+    legacy_multi_user record;
+    optimized_multi_user record;
+    multi_user_quality record;
+    overlap_quality record;
+BEGIN
+    WITH delta_source AS MATERIALIZED (
+        SELECT *
+        FROM advisor.query_deltas(now() - interval '2 hours')
+        WHERE server_id = 2147483000
+          AND query_id = 9005
+          AND toplevel
+    ), temporal_samples AS (
+        SELECT
+            sample_at,
+            bool_and(predecessor_available) AS predecessor_available,
+            bool_or(reset_detected) AS reset_detected,
+            bool_or(gap_detected) AS gap_detected
+        FROM delta_source
+        GROUP BY sample_at
+    )
+    SELECT
+        sum(calls) FILTER (
+            WHERE sample_at >= now() - interval '1 hour'
+              AND predecessor_available
+              AND NOT (
+                  gap_detected
+                  AND previous_sample_at < now() - interval '1 hour'
+              )
+        )::bigint AS calls,
+        sum(calls) FILTER (
+            WHERE sample_at >= now() - interval '2 hours'
+              AND sample_at < now() - interval '1 hour'
+              AND predecessor_available
+              AND NOT (
+                  gap_detected
+                  AND previous_sample_at < now() - interval '2 hours'
+              )
+        )::bigint AS previous_calls_raw,
+        COALESCE(bool_or(reset_detected) FILTER (
+            WHERE sample_at >= now() - interval '2 hours'
+        ), false) AS reset_detected,
+        COALESCE((
+            SELECT bool_or(sample.gap_detected)
+            FROM temporal_samples AS sample
+            WHERE sample.sample_at >= now() - interval '2 hours'
+        ), false) AS gap_detected,
+        COALESCE((
+            SELECT bool_or(NOT sample.predecessor_available)
+            FROM temporal_samples AS sample
+            WHERE sample.sample_at >= now() - interval '2 hours'
+        ), false) AS predecessor_missing
+      INTO STRICT legacy_boundary
+      FROM delta_source;
+
+    SELECT calls, previous_calls_raw, query_reset_detected AS reset_detected,
+           query_gap_detected AS gap_detected, predecessor_missing
+      INTO STRICT optimized_boundary
+      FROM advisor.query_rollups_for_metrics(interval '1 hour')
+     WHERE server_id = 2147483000 AND query_id = 9005;
+
+    IF legacy_boundary.calls <> 360
+       OR legacy_boundary.previous_calls_raw <> 360
+       OR legacy_boundary.reset_detected
+       OR legacy_boundary.gap_detected
+       OR legacy_boundary.predecessor_missing
+       OR legacy_boundary.calls IS DISTINCT FROM optimized_boundary.calls
+       OR legacy_boundary.previous_calls_raw
+            IS DISTINCT FROM optimized_boundary.previous_calls_raw
+       OR legacy_boundary.reset_detected
+            IS DISTINCT FROM optimized_boundary.reset_detected
+       OR legacy_boundary.gap_detected
+            IS DISTINCT FROM optimized_boundary.gap_detected
+       OR legacy_boundary.predecessor_missing
+            IS DISTINCT FROM optimized_boundary.predecessor_missing THEN
+        RAISE EXCEPTION 'multi-chunk boundary parity failed: legacy=%, optimized=%',
+            legacy_boundary, optimized_boundary;
+    END IF;
+
+    SELECT calls, previous_calls, coverage_percent,
+           previous_period_available, warming_up, comparison_reliable
+      INTO STRICT boundary_quality
+      FROM advisor.query_metrics(interval '1 hour')
+     WHERE server_id = 2147483000 AND query_id = 9005;
+
+    IF boundary_quality.calls <> 360
+       OR boundary_quality.previous_calls <> 360
+       OR boundary_quality.coverage_percent < 99
+       OR boundary_quality.coverage_percent > 100
+       OR NOT boundary_quality.previous_period_available
+       OR boundary_quality.warming_up
+       OR NOT boundary_quality.comparison_reliable THEN
+        RAISE EXCEPTION 'multi-chunk quality parity failed: %', boundary_quality;
+    END IF;
+
+    WITH delta_source AS MATERIALIZED (
+        SELECT *
+        FROM advisor.query_deltas(now() - interval '2 hours')
+        WHERE server_id = 2147483000
+          AND query_id = 9006
+          AND toplevel
+    ), temporal_samples AS (
+        SELECT
+            sample_at,
+            max(previous_sample_at) AS previous_sample_at,
+            bool_and(predecessor_available) AS predecessor_available,
+            bool_or(gap_detected) AS gap_detected
+        FROM delta_source
+        GROUP BY sample_at
+    )
+    SELECT
+        least(3600, sum(CASE
+            WHEN sample_at >= now() - interval '1 hour'
+             AND previous_sample_at < now()
+             AND predecessor_available
+             AND NOT gap_detected
+            THEN greatest(extract(epoch FROM (
+                least(sample_at, now())
+                - greatest(previous_sample_at, now() - interval '1 hour')
+            )), 0)
+            ELSE 0
+        END))::double precision AS current_covered_seconds,
+        least(3600, sum(CASE
+            WHEN sample_at >= now() - interval '1 hour'
+             AND previous_sample_at < now()
+             AND predecessor_available
+            THEN greatest(extract(epoch FROM (
+                least(sample_at, now())
+                - greatest(previous_sample_at, now() - interval '1 hour')
+            )), 0)
+            ELSE 0
+        END))::double precision AS current_represented_seconds,
+        least(3600, sum(CASE
+            WHEN sample_at >= now() - interval '2 hours'
+             AND sample_at < now() - interval '1 hour'
+             AND previous_sample_at < now() - interval '1 hour'
+             AND predecessor_available
+             AND NOT gap_detected
+            THEN greatest(extract(epoch FROM (
+                least(sample_at, now() - interval '1 hour')
+                - greatest(previous_sample_at, now() - interval '2 hours')
+            )), 0)
+            ELSE 0
+        END))::double precision AS previous_covered_seconds
+      INTO STRICT legacy_multi_user
+      FROM temporal_samples;
+
+    SELECT user_id, current_covered_seconds, current_represented_seconds,
+           previous_covered_seconds, predecessor_missing,
+           query_gap_detected, query_reset_detected
+      INTO STRICT optimized_multi_user
+      FROM advisor.query_rollups_for_metrics(interval '1 hour')
+     WHERE server_id = 2147483000 AND query_id = 9006;
+
+    IF legacy_multi_user.current_covered_seconds <> 3600
+       OR legacy_multi_user.current_represented_seconds <> 3600
+       OR legacy_multi_user.previous_covered_seconds <> 3600
+       OR optimized_multi_user.user_id IS NOT NULL
+       OR abs(legacy_multi_user.current_covered_seconds
+            - optimized_multi_user.current_covered_seconds) > 1e-6
+       OR abs(legacy_multi_user.current_represented_seconds
+            - optimized_multi_user.current_represented_seconds) > 1e-6
+       OR abs(legacy_multi_user.previous_covered_seconds
+            - optimized_multi_user.previous_covered_seconds) > 1e-6
+       OR optimized_multi_user.predecessor_missing
+       OR optimized_multi_user.query_gap_detected
+       OR optimized_multi_user.query_reset_detected THEN
+        RAISE EXCEPTION 'multi-user coverage cap parity failed: legacy=%, optimized=%',
+            legacy_multi_user, optimized_multi_user;
+    END IF;
+
+    SELECT user_id, coverage_percent, previous_period_available,
+           warming_up, comparison_reliable
+      INTO STRICT multi_user_quality
+      FROM advisor.query_metrics(interval '1 hour')
+     WHERE server_id = 2147483000 AND query_id = 9006;
+
+    IF multi_user_quality.user_id IS NOT NULL
+       OR abs(multi_user_quality.coverage_percent - 100) > 1e-6
+       OR NOT multi_user_quality.previous_period_available
+       OR multi_user_quality.warming_up
+       OR NOT multi_user_quality.comparison_reliable THEN
+        RAISE EXCEPTION 'multi-user quality cap failed: %', multi_user_quality;
+    END IF;
+
+    SELECT rollup.current_covered_seconds,
+           rollup.current_represented_seconds,
+           rollup.previous_covered_seconds,
+           rollup.predecessor_missing,
+           metric.coverage_percent,
+           metric.warming_up,
+           metric.comparison_reliable
+      INTO STRICT overlap_quality
+      FROM advisor.query_rollups_for_metrics(interval '1 hour') AS rollup
+      JOIN advisor.query_metrics(interval '1 hour') AS metric
+        USING (server_id, database_id, query_id)
+     WHERE rollup.server_id = 2147483001
+       AND rollup.query_id = 9007;
+
+    IF overlap_quality.current_covered_seconds > 3600
+       OR overlap_quality.current_represented_seconds > 3600
+       OR overlap_quality.previous_covered_seconds > 3600
+       OR NOT overlap_quality.predecessor_missing
+       OR overlap_quality.coverage_percent > 100
+       OR NOT overlap_quality.warming_up
+       OR overlap_quality.comparison_reliable THEN
+        RAISE EXCEPTION 'overlapping chunks did not fail closed: %', overlap_quality;
+    END IF;
+END
+$query_rollup_boundary_parity$;
+
+DO $performance_parity$
+DECLARE
+    selected_window interval;
+    active_keys jsonb;
+    difference_count bigint;
+BEGIN
+    -- The optimized helpers intentionally change floating-point aggregation
+    -- order. Integer/numeric counters remain exact; double precision values
+    -- are compared at a tolerance far below pg_stat_statements precision.
+    FOR selected_window IN
+        SELECT unnest(ARRAY[interval '1 hour', interval '24 hours'])
+    LOOP
+        SELECT jsonb_agg(jsonb_build_object(
+            'server_id', rollup.server_id,
+            'database_id', rollup.database_id,
+            'query_id', rollup.query_id
+        ))
+          INTO active_keys
+          FROM advisor.query_rollups_for_metrics(selected_window) AS rollup
+         WHERE rollup.server_id = 2147483000;
+
+        WITH legacy AS (
+            SELECT
+                delta.server_id,
+                delta.database_id,
+                delta.query_id,
+                sum(delta.calls) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS calls,
+                sum(delta.rows) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS rows,
+                sum(delta.total_exec_time_ms) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::double precision AS total_exec_time_ms,
+                sum(delta.shared_blocks_hit) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS shared_blocks_hit,
+                sum(delta.shared_blocks_read) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS shared_blocks_read,
+                sum(delta.temp_blocks_written) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS temp_blocks_written,
+                sum(delta.wal_bytes) FILTER (
+                    WHERE delta.sample_at >= now() - selected_window
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::numeric AS wal_bytes
+            FROM advisor.query_deltas(now() - (selected_window * 2)) AS delta
+            WHERE delta.server_id = 2147483000
+              AND delta.query_id BETWEEN 9001 AND 9006
+              AND delta.toplevel
+            GROUP BY delta.server_id, delta.database_id, delta.query_id
+            HAVING COALESCE(sum(delta.calls) FILTER (
+                WHERE delta.sample_at >= now() - selected_window
+                  AND delta.predecessor_available
+                  AND NOT (
+                      delta.gap_detected
+                      AND delta.previous_sample_at < now() - selected_window
+                  )
+            ), 0) > 0
+        ), optimized AS (
+            SELECT
+                server_id,
+                database_id,
+                query_id,
+                calls,
+                rows,
+                total_exec_time_ms,
+                shared_blocks_hit,
+                shared_blocks_read,
+                temp_blocks_written,
+                wal_bytes
+            FROM advisor.query_rollups_for_metrics(selected_window)
+            WHERE server_id = 2147483000
+        )
+        SELECT count(*)
+          INTO difference_count
+          FROM legacy
+          FULL JOIN optimized USING (server_id, database_id, query_id)
+         WHERE legacy.server_id IS NULL
+            OR optimized.server_id IS NULL
+            OR legacy.calls IS DISTINCT FROM optimized.calls
+            OR legacy.rows IS DISTINCT FROM optimized.rows
+            OR legacy.shared_blocks_hit IS DISTINCT FROM optimized.shared_blocks_hit
+            OR legacy.shared_blocks_read IS DISTINCT FROM optimized.shared_blocks_read
+            OR legacy.temp_blocks_written IS DISTINCT FROM optimized.temp_blocks_written
+            OR legacy.wal_bytes IS DISTINCT FROM optimized.wal_bytes
+            OR abs(legacy.total_exec_time_ms - optimized.total_exec_time_ms) > 1e-6;
+
+        IF difference_count <> 0 THEN
+            RAISE EXCEPTION 'query rollup parity failed for %: % rows',
+                selected_window, difference_count;
+        END IF;
+
+        WITH delta_source AS MATERIALIZED (
+            SELECT *
+            FROM advisor.query_deltas(now() - (selected_window * 2))
+            WHERE server_id = 2147483000
+              AND query_id BETWEEN 9001 AND 9006
+              AND toplevel
+        ), temporal_samples AS (
+            SELECT
+                server_id,
+                database_id,
+                query_id,
+                sample_at,
+                max(previous_sample_at) AS previous_sample_at,
+                bool_and(predecessor_available) AS predecessor_available,
+                bool_or(gap_detected) AS gap_detected
+            FROM delta_source
+            GROUP BY server_id, database_id, query_id, sample_at
+        ), legacy AS (
+            SELECT
+                server_id,
+                database_id,
+                query_id,
+                least(extract(epoch FROM selected_window), sum(CASE
+                    WHEN sample_at >= now() - selected_window
+                     AND previous_sample_at < now()
+                     AND predecessor_available
+                     AND NOT gap_detected
+                    THEN greatest(extract(epoch FROM (
+                        least(sample_at, now())
+                        - greatest(previous_sample_at, now() - selected_window)
+                    )), 0)
+                    ELSE 0
+                END))::double precision AS current_covered_seconds,
+                least(extract(epoch FROM selected_window), sum(CASE
+                    WHEN sample_at >= now() - selected_window
+                     AND previous_sample_at < now()
+                     AND predecessor_available
+                    THEN greatest(extract(epoch FROM (
+                        least(sample_at, now())
+                        - greatest(previous_sample_at, now() - selected_window)
+                    )), 0)
+                    ELSE 0
+                END))::double precision AS current_represented_seconds,
+                least(extract(epoch FROM selected_window), sum(CASE
+                    WHEN sample_at >= now() - (selected_window * 2)
+                     AND sample_at < now() - selected_window
+                     AND previous_sample_at < now() - selected_window
+                     AND predecessor_available
+                     AND NOT gap_detected
+                    THEN greatest(extract(epoch FROM (
+                        least(sample_at, now() - selected_window)
+                        - greatest(
+                            previous_sample_at,
+                            now() - (selected_window * 2)
+                        )
+                    )), 0)
+                    ELSE 0
+                END))::double precision AS previous_covered_seconds
+            FROM temporal_samples
+            GROUP BY server_id, database_id, query_id
+        ), optimized AS (
+            SELECT
+                server_id,
+                database_id,
+                query_id,
+                current_covered_seconds,
+                current_represented_seconds,
+                previous_covered_seconds
+            FROM advisor.query_rollups_for_metrics(selected_window)
+            WHERE server_id = 2147483000
+        )
+        SELECT count(*)
+          INTO difference_count
+          FROM legacy
+          JOIN optimized USING (server_id, database_id, query_id)
+         WHERE abs(
+                   legacy.current_covered_seconds
+                   - optimized.current_covered_seconds
+               ) > 1e-6
+            OR abs(
+                   legacy.current_represented_seconds
+                   - optimized.current_represented_seconds
+               ) > 1e-6
+            OR abs(
+                   legacy.previous_covered_seconds
+                   - optimized.previous_covered_seconds
+               ) > 1e-6;
+
+        IF difference_count <> 0 THEN
+            RAISE EXCEPTION 'coverage rollup parity failed for %: % rows',
+                selected_window, difference_count;
+        END IF;
+
+        WITH legacy AS (
+            SELECT
+                delta.server_id,
+                delta.database_id,
+                delta.query_id,
+                delta.event_type,
+                delta.event,
+                COALESCE(sum(delta.samples) FILTER (
+                    WHERE delta.samples > 0
+                      AND delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                ), 0)::bigint AS samples,
+                COALESCE(bool_or(delta.reset_detected), false) AS reset_detected,
+                COALESCE(bool_or(delta.gap_detected), false) AS reliability_issue
+            FROM advisor.wait_deltas(now() - selected_window) AS delta
+            WHERE delta.server_id = 2147483000
+              AND delta.query_id BETWEEN 9001 AND 9006
+            GROUP BY
+                delta.server_id,
+                delta.database_id,
+                delta.query_id,
+                delta.event_type,
+                delta.event
+        ), optimized AS (
+            SELECT *
+            FROM advisor.wait_rollups_for_queries(
+                now() - selected_window,
+                COALESCE(active_keys, '[]'::jsonb)
+            )
+            WHERE server_id = 2147483000
+        ), differences AS (
+            (SELECT * FROM legacy EXCEPT ALL SELECT * FROM optimized)
+            UNION ALL
+            (SELECT * FROM optimized EXCEPT ALL SELECT * FROM legacy)
+        )
+        SELECT count(*) INTO difference_count FROM differences;
+
+        IF difference_count <> 0 THEN
+            RAISE EXCEPTION 'wait rollup parity failed for %: % rows',
+                selected_window, difference_count;
+        END IF;
+
+        WITH legacy AS (
+            SELECT
+                delta.server_id,
+                delta.database_id,
+                delta.query_id,
+                sum(delta.exec_user_time_seconds) FILTER (
+                    WHERE delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                ) * 1000.0 AS cpu_user_time_ms,
+                sum(delta.exec_system_time_seconds) FILTER (
+                    WHERE delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                ) * 1000.0 AS cpu_system_time_ms,
+                sum(delta.filesystem_reads_bytes) FILTER (
+                    WHERE delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS filesystem_reads_bytes,
+                sum(delta.filesystem_writes_bytes) FILTER (
+                    WHERE delta.predecessor_available
+                      AND NOT (
+                          delta.gap_detected
+                          AND delta.previous_sample_at < now() - selected_window
+                      )
+                )::bigint AS filesystem_writes_bytes,
+                bool_or(
+                    delta.predecessor_available
+                    AND NOT (
+                        delta.gap_detected
+                        AND delta.previous_sample_at < now() - selected_window
+                    )
+                ) AS data_available,
+                bool_or(delta.reset_detected) AS reset_detected,
+                bool_or(delta.gap_detected) AS reliability_issue
+            FROM advisor.kcache_deltas(now() - selected_window) AS delta
+            WHERE delta.server_id = 2147483000
+              AND delta.query_id BETWEEN 9001 AND 9006
+              AND delta.toplevel
+            GROUP BY delta.server_id, delta.database_id, delta.query_id
+        ), optimized AS (
+            SELECT *
+            FROM advisor.kcache_rollups_for_queries(
+                now() - selected_window,
+                COALESCE(active_keys, '[]'::jsonb)
+            )
+            WHERE server_id = 2147483000
+        )
+        SELECT count(*)
+          INTO difference_count
+          FROM legacy
+          FULL JOIN optimized USING (server_id, database_id, query_id)
+         WHERE legacy.server_id IS NULL
+            OR optimized.server_id IS NULL
+            OR legacy.filesystem_reads_bytes IS DISTINCT FROM optimized.filesystem_reads_bytes
+            OR legacy.filesystem_writes_bytes IS DISTINCT FROM optimized.filesystem_writes_bytes
+            OR legacy.data_available IS DISTINCT FROM optimized.data_available
+            OR legacy.reset_detected IS DISTINCT FROM optimized.reset_detected
+            OR legacy.reliability_issue IS DISTINCT FROM optimized.reliability_issue
+            OR abs(legacy.cpu_user_time_ms - optimized.cpu_user_time_ms) > 1e-6
+            OR abs(legacy.cpu_system_time_ms - optimized.cpu_system_time_ms) > 1e-6;
+
+        IF difference_count <> 0 THEN
+            RAISE EXCEPTION 'kcache rollup parity failed for %: % rows',
+                selected_window, difference_count;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM advisor.query_metrics(selected_window)
+            WHERE server_id = 2147483000
+              AND query_id BETWEEN 910001 AND 910064
+        ) THEN
+            RAISE EXCEPTION 'orphan wait-only query leaked into query_metrics for %',
+                selected_window;
+        END IF;
+    END LOOP;
+END
+$performance_parity$;
 
 ROLLBACK;

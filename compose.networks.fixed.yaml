@@ -1,0 +1,48 @@
+# Optional fixed-subnet overlay.
+#
+# Normal installations should use only compose.yaml and let Docker allocate
+# non-conflicting subnets.  Use this tracked overlay only when several stacks
+# on one host need deterministic, explicitly separated address ranges:
+#
+#   COMPOSE_FILE=compose.yaml:compose.networks.fixed.yaml docker compose up -d
+#
+# Every subnet can be overridden in .env to avoid VPN/corporate network
+# collisions.  Keeping this file in the repository avoids a running stack
+# depending on an ephemeral /tmp override.
+networks:
+  advisor:
+    ipam:
+      config:
+        - subnet: ${ADVISOR_NETWORK_SUBNET:-10.222.101.0/24}
+  evaluator_control:
+    ipam:
+      config:
+        - subnet: ${EVALUATOR_CONTROL_SUBNET:-10.222.102.0/24}
+  evaluator_source:
+    ipam:
+      config:
+        - subnet: ${EVALUATOR_SOURCE_SUBNET:-10.222.103.0/24}
+  collector_source:
+    ipam:
+      config:
+        - subnet: ${COLLECTOR_SOURCE_SUBNET:-10.222.104.0/24}
+  join_source:
+    ipam:
+      config:
+        - subnet: ${JOIN_SOURCE_SUBNET:-10.222.105.0/24}
+  join_repository:
+    ipam:
+      config:
+        - subnet: ${JOIN_REPOSITORY_SUBNET:-10.222.106.0/24}
+  workload_source:
+    ipam:
+      config:
+        - subnet: ${WORKLOAD_SOURCE_SUBNET:-10.222.107.0/24}
+  clone_control:
+    ipam:
+      config:
+        - subnet: ${CLONE_CONTROL_SUBNET:-10.222.108.0/24}
+  clone_data:
+    ipam:
+      config:
+        - subnet: ${CLONE_DATA_SUBNET:-10.222.109.0/24}

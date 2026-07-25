@@ -7,14 +7,19 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest import mock
 
 import workload
 
 
+SEED_SQL = Path(__file__).with_name("seed.sql").read_text(encoding="utf-8")
+
+
 def config_env(**overrides: str) -> dict[str, str]:
     values = {
         "DATABASE_URL": "postgresql://postgres:test@source-db:5432/appdb",
+        "PGPASSWORD": "unit-test-workload-password",
         "WORKLOAD_PROFILE": "normal",
     }
     values.update(overrides)
@@ -139,6 +144,9 @@ class ConfigTests(unittest.TestCase):
             {"WORKLOAD_WORKERS": "2"},
             {"WORKLOAD_DURATION_SECONDS": "-1"},
             {"WORKLOAD_INTERVAL_SECONDS": "nan"},
+            {"PGPASSWORD": ""},
+            {"PGPASSWORD": "advisor_dev_workload"},
+            {"PGPASSWORD": "change-me-workload"},
             {
                 "WORKLOAD_STATEMENT_TIMEOUT_MS": "1000",
                 "WORKLOAD_LOCK_HOLD_MS": "1000",
@@ -159,6 +167,22 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertIsNone(payload["remainingSeconds"])
 
+
+class SeedSecurityTests(unittest.TestCase):
+    def test_password_sql_is_guarded_from_server_logging(self) -> None:
+        first_secret_sql = SEED_SQL.index("SELECT length(:'workload_db_password')")
+        self.assertLess(SEED_SQL.index("SET log_statement = 'none'"), first_secret_sql)
+        self.assertLess(
+            SEED_SQL.index("SET log_min_error_statement = 'panic'"),
+            first_secret_sql,
+        )
+        self.assertLess(
+            SEED_SQL.index("SET log_parameter_max_length_on_error = 0"),
+            first_secret_sql,
+        )
+        self.assertIn("<> 'advisor_dev_workload'", SEED_SQL)
+        self.assertIn("NOT LIKE 'change-me-%'", SEED_SQL)
+        self.assertIn("VALID UNTIL ''infinity''", SEED_SQL)
 
 class RoleAndRandomnessTests(unittest.TestCase):
     def test_role_allocation_is_reproducible_and_covers_every_role(self) -> None:

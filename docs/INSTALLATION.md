@@ -177,6 +177,12 @@ cp .env.example .env
 chmod 600 .env
 ```
 
+Aynı Docker hostunda birden fazla kurulum varsa her `.env` için benzersiz
+`COMPOSE_PROJECT_NAME` seçin. Normal kurulumda Docker'ın çakışmayan subnet
+atamasını kullanın; deterministik subnet gerçekten gerekiyorsa
+`COMPOSE_FILE=compose.yaml:compose.networks.fixed.yaml` overlay'ini açıp subnet
+değerlerini VPN/kurum ağına göre özelleştirin.
+
 `.env` dosyasında en az şu değerleri güçlü ve birbirinden farklı parolalarla değiştirin:
 
 ```dotenv
@@ -187,11 +193,45 @@ ADVISOR_EVALUATOR_PASSWORD=GUCLU_EVALUATOR_PAROLASI
 EVALUATOR_TOKEN=GUCLU_RASTGELE_IC_SERVIS_TOKENI
 ADVISOR_JOIN_SOURCE_PASSWORD=GUCLU_JOIN_SOURCE_PAROLASI
 ADVISOR_JOIN_REPOSITORY_PASSWORD=GUCLU_JOIN_REPOSITORY_PAROLASI
+WORKLOAD_DB_PASSWORD=GUCLU_WORKLOAD_PAROLASI
 CLONE_ADMIN_PASSWORD=GUCLU_CLONE_ADMIN_PAROLASI
 CLONE_RUNNER_PASSWORD=GUCLU_CLONE_RUNNER_PAROLASI
 CLONE_EVALUATOR_TOKEN=GUCLU_CLONE_IC_SERVIS_TOKENI
 ADVISOR_AUTH_PRINCIPALS='[{"credential_id":"operator-cli","subject":"user:operator","token_sha256":"64_KARAKTER_LOWERCASE_SHA256","roles":["analyst","annotator","admin"]}]'
 ```
+
+Kalıcı kaynak/repository ve opt-in workload parolalarının Compose fallback'i yoktur;
+eksik veya boş bırakılırsa `docker compose config` container oluşturmadan hata
+verir. Böylece `.env` dosyasının yanlışlıkla yüklenmemesi mevcut volume'ü genel
+bir geliştirme parolasına geri döndüremez. Rol reconciler ayrıca eski
+`advisor_dev_*` parolalarını ve `change-me-*` örneklerini PostgreSQL'e
+bağlanmadan reddeder.
+
+Compose `.env` içindeki `$` karakterini yorumlayabildiği için `$` içeren
+secret'ları tek tırnakla yazın. TLS-doğrulamalı build ve mevcut-volume parola
+rotasyonu ayrıntıları [portable deployment hardening belgesindedir](PORTABLE_DEPLOYMENT_HARDENING.md).
+
+Compose, veritabanı parolalarını bağlantı URI'sine eklemez; host, port,
+database, kullanıcı ve parola alanlarını container'a ayrı geçirir ve servisler
+libpq conninfo değerini güvenli biçimde üretir. Bu nedenle `@`, `:`, `/`, `?`,
+`%` veya `5432` içeren parolalar URI kaçışına ihtiyaç duymadan kullanılabilir.
+Referans dışı Compose topolojilerinde `ADVISOR_API_DATABASE_*`,
+`ADVISOR_EVALUATOR_DATABASE_*`, `ADVISOR_JOIN_SOURCE_DATABASE_*`,
+`ADVISOR_JOIN_REPOSITORY_DATABASE_*` ve `ADVISOR_CLONE_DATABASE_*`
+host/port/name/user/sslmode alanları `.env` üzerinden ayrı ayrı
+değiştirilebilir; repository'nin standart PostgreSQL portu `5432` olması
+desteklenir. Bu stack-prefix'i, geliştirici makinesinde tesadüfen export edilmiş
+genel bir `DATABASE_URL` değerinin Compose hedefini değiştirmesini önler.
+Bu alanlar tek başına ağ veya migration sınırını genişletmez: referans
+servisler yerel DB'lere `depends_on` uygular; evaluator, JOIN snapshotter ve
+clone ayrıca yalnız `internal` Compose ağlarına bağlıdır. API repository dahil
+harici bir hedef için kuruma özel bir Compose override ile yalnız gereken
+egress ağı/allowlist, migration hedefi ve bağımlılık düzeni tanımlanmalıdır;
+`.env` tek başına harici DB erişimi açmaz.
+Eski `DATABASE_URL`, `EVALUATOR_DATABASE_URL`, `CLONE_DATABASE_URL` ve JOIN
+`*_DATABASE_URL`/`*_DATABASE_URL_FILE` override'ları uyumluluk için korunur;
+tam URL kullanılırsa URI özel karakterlerini encode etmek yine operatörün
+sorumluluğundadır.
 
 Varsayılan bind ayarlarını ilk iterasyon için koruyun:
 

@@ -9,7 +9,7 @@ from app.config import get_settings
 settings = get_settings()
 
 pool = AsyncConnectionPool(
-    conninfo=settings.database_url,
+    conninfo=settings.database_conninfo,
     min_size=1,
     max_size=8,
     open=False,
@@ -27,4 +27,3 @@ async def open_pool() -> None:
 
 async def close_pool() -> None:
     await pool.close()
-

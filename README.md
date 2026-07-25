@@ -39,6 +39,10 @@ checksum'ını doğrular; collector, JOIN snapshotter ve API ancak migration
 başarısından sonra başlar. Elle upgrade/tekrar doğrulama için
 `bash scripts/migrate-repository.sh` kullanılabilir. Ayrıntılı model
 [docs/REPOSITORY_MIGRATIONS.md](docs/REPOSITORY_MIGRATIONS.md) içindedir.
+TLS-doğrulamalı image build'i, özel karakterli secret kullanımı ve mevcut
+named volume parola/rol drift uzlaştırması
+[portable deployment hardening belgesinde](docs/PORTABLE_DEPLOYMENT_HARDENING.md)
+açıklanır.
 
 Query/kcache/wait sayaç resetleri ile gerçek pencere kapsamının kabul testi:
 
@@ -267,7 +271,7 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 
 - Repository'deki kaynak kayıtlarında parola tutulmaz (`password = NULL`); collector Git dışında tutulan alias-bazlı `0600` pgpass secret'larını açılışta geçici `.pgpass` dosyasında birleştirir.
 - `powa_collector`, PostgreSQL'ün hazır PoWA rollerini ve kaynakta `pg_read_all_stats` yetkisini kullanır.
-- `advisor_api` yalnız repository DSN'i alır. Yapılandırma doğrulaması `source-db`, `5432` veya `appdb` içeren API DSN'ini reddeder.
+- `advisor_api` yalnız repository DSN'i alır. Yapılandırma bilinen `source-db` hostunu reddeder; repository standart `5432` dahil herhangi bir geçerli port ve database adını kullanabilir. API health gate'i `advisor` repository şemasını pozitif olarak doğrulamadan container sağlıklı sayılmaz.
 - Kaynak DSN'i yalnız ayrı `evaluator` servisindedir. Bu servis `advisor_evaluator` rolü, read-only transaction, kısa timeout, connection limit, internal network ve token korumalı iç endpoint ile sınırlandırılır; ana API'ye kaynak parolası verilmez.
 - HypoPG fonksiyonlarının PUBLIC yetkileri kaldırılmıştır. Evaluator yalnız sanal index oluşturur ve plain `EXPLAIN` çalıştırır; kopyalanabilir SQL'in kullanıcıya dönmesi gerçek DDL çalıştığı anlamına gelmez.
 - Header gönderilmeyen API isteği `viewer` sayılır ve tam SQL maskelenir. Referans web istemcisi analiz ekranları için demonstrasyon amaçlı `analyst` header'ı gönderir; bu gerçek kullanıcı kimliği değildir.
@@ -285,6 +289,20 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 - Docker port publish kuralları bazı firewall araçlarından önce uygulanabilir. Uzak web erişimini özellikle açtıysanız Linux sunucuda `DOCKER-USER` zinciri veya kurumun network policy katmanıyla yalnız web portuna izin verildiğini ayrıca doğrulayın.
 
 ## Testler
+
+Her pull request ve `main` push'ında çalışan [hafif GitHub Actions CI](.github/workflows/ci.yml),
+Compose yapılandırmasını, migration runner/manifest checksum sözleşmesini,
+bütün shell scriptlerinin sözdizimini, JOIN snapshotter/workload/rol-rotasyonu
+component testlerini, backend test image'ındaki tam pytest paketini ve Node.js
+22 ile frontend test/build adımlarını doğrular. Bu hızlı
+kapı PostgreSQL/PoWA image'ını derlemez ve tam stack'i başlatmaz. Aşağıdaki
+gerçek PostgreSQL, telemetri, performans ve disposable clone kontrolleri ayrı
+integration kabulü olarak çalıştırılmalıdır.
+
+Haftalık ve manuel [PostgreSQL integration workflow'u](.github/workflows/postgres-integration.yml)
+Ubuntu amd64 runner'da PostgreSQL/PoWA image'ını sıfırdan derler, temiz named
+volume'leri başlatır, migration idempotency/temporal fixture'ı ve gerçek rol
+drift onarımını doğrular; sonunda yalnız kendi disposable CI volume'lerini siler.
 
 Temel stack çalışma zamanı kabul kontrolleri:
 

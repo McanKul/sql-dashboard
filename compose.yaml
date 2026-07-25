@@ -10,10 +10,11 @@ services:
     environment:
       POSTGRES_DB: appdb
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
-      POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:-advisor_dev_collector}
-      ADVISOR_EVALUATOR_PASSWORD: ${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}
-      ADVISOR_JOIN_SOURCE_PASSWORD: ${ADVISOR_JOIN_SOURCE_PASSWORD:-advisor_dev_join_source}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD in .env}
+      POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:?Set POWA_COLLECTOR_PASSWORD in .env}
+      ADVISOR_EVALUATOR_PASSWORD: ${ADVISOR_EVALUATOR_PASSWORD:?Set ADVISOR_EVALUATOR_PASSWORD in .env}
+      ADVISOR_JOIN_SOURCE_PASSWORD: ${ADVISOR_JOIN_SOURCE_PASSWORD:?Set ADVISOR_JOIN_SOURCE_PASSWORD in .env}
+      WORKLOAD_DB_PASSWORD: ${WORKLOAD_DB_PASSWORD:?Set WORKLOAD_DB_PASSWORD in .env}
     command:
       - postgres
       - -c
@@ -59,7 +60,7 @@ services:
       - ./deployment/source/init-source.sh:/docker-entrypoint-initdb.d/10-init-source.sh:ro,Z
       - ./sql/003_join_snapshot_source.sql:/opt/advisor/sql/003_join_snapshot_source.sql:ro,Z
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb -p 5432 && psql -U postgres -d powa -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
+      test: ["CMD-SHELL", "export PGOPTIONS='-c pg_stat_statements.track=none'; /usr/local/bin/advisor-reconcile-roles source && pg_isready -U postgres -d appdb -p 5432 && psql -U postgres -d powa -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -73,10 +74,10 @@ services:
       PGPORT: 5433
       POSTGRES_DB: powa_repository
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
-      POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:-advisor_dev_collector}
-      ADVISOR_API_PASSWORD: ${ADVISOR_API_PASSWORD:-advisor_dev_api}
-      ADVISOR_JOIN_REPOSITORY_PASSWORD: ${ADVISOR_JOIN_REPOSITORY_PASSWORD:-advisor_dev_join_repository}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD in .env}
+      POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:?Set POWA_COLLECTOR_PASSWORD in .env}
+      ADVISOR_API_PASSWORD: ${ADVISOR_API_PASSWORD:?Set ADVISOR_API_PASSWORD in .env}
+      ADVISOR_JOIN_REPOSITORY_PASSWORD: ${ADVISOR_JOIN_REPOSITORY_PASSWORD:?Set ADVISOR_JOIN_REPOSITORY_PASSWORD in .env}
       JOIN_SOURCE_ALIAS: ${JOIN_SOURCE_ALIAS:-test-source}
       REGISTER_DEMO_SOURCE: ${REGISTER_DEMO_SOURCE:-true}
       # register-source preflight/prepare psql komutlari icin; PGSSLMODE adi
@@ -90,7 +91,7 @@ services:
       - ./deployment/repository/init-repository.sh:/docker-entrypoint-initdb.d/10-init-repository.sh:ro,Z
       - ./sql:/opt/advisor/sql:ro,z
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d powa_repository -p 5433 && psql -U postgres -d powa_repository -p 5433 -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
+      test: ["CMD-SHELL", "export PGOPTIONS='-c pg_stat_statements.track=none'; /usr/local/bin/advisor-reconcile-roles repository && pg_isready -U postgres -d powa_repository -p 5433 && psql -U postgres -d powa_repository -p 5433 -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -109,7 +110,7 @@ services:
       PGPORT: "5433"
       PGDATABASE: powa_repository
       PGUSER: postgres
-      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
+      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD in .env}
       JOIN_SOURCE_ALIAS: ${JOIN_SOURCE_ALIAS:-test-source}
       MIGRATION_LOCK_TIMEOUT_SECONDS: ${MIGRATION_LOCK_TIMEOUT_SECONDS:-60}
     volumes:
@@ -135,7 +136,7 @@ services:
       dockerfile: deployment/collector/Dockerfile
     image: postgresql-advisor/powa-collector:1.3.2
     environment:
-      POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:-advisor_dev_collector}
+      POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:?Set POWA_COLLECTOR_PASSWORD in .env}
       # Repository Docker aginda SSL kullanmaz; dis kaynaklar ortak libpq
       # sslmode ayarini kullanir. Uretimde kaynaklar TLS ise require/verify-full.
       POWA_REPOSITORY_DSN: postgresql://powa_collector@repository-db:5433/powa_repository?sslmode=disable
@@ -173,8 +174,23 @@ services:
     image: postgresql-advisor/join-snapshotter:iteration-2.5
     environment:
       JOIN_SOURCE_ALIAS: ${JOIN_SOURCE_ALIAS:-test-source}
-      JOIN_SOURCE_DATABASE_URL: postgresql://advisor_join_reader:${ADVISOR_JOIN_SOURCE_PASSWORD:-advisor_dev_join_source}@source-db:5432/powa?sslmode=disable
-      JOIN_REPOSITORY_DATABASE_URL: postgresql://advisor_join_ingest:${ADVISOR_JOIN_REPOSITORY_PASSWORD:-advisor_dev_join_repository}@repository-db:5433/powa_repository?sslmode=disable
+      # Full URL / URL_FILE remain optional backwards-compatible overrides.
+      JOIN_SOURCE_DATABASE_URL: ${ADVISOR_JOIN_SOURCE_DATABASE_URL:-}
+      JOIN_SOURCE_DATABASE_URL_FILE: ${ADVISOR_JOIN_SOURCE_DATABASE_URL_FILE:-}
+      JOIN_SOURCE_DATABASE_HOST: ${ADVISOR_JOIN_SOURCE_DATABASE_HOST:-source-db}
+      JOIN_SOURCE_DATABASE_PORT: ${ADVISOR_JOIN_SOURCE_DATABASE_PORT:-5432}
+      JOIN_SOURCE_DATABASE_NAME: ${ADVISOR_JOIN_SOURCE_DATABASE_NAME:-powa}
+      JOIN_SOURCE_DATABASE_USER: ${ADVISOR_JOIN_SOURCE_DATABASE_USER:-advisor_join_reader}
+      JOIN_SOURCE_DATABASE_PASSWORD: ${ADVISOR_JOIN_SOURCE_PASSWORD:?Set ADVISOR_JOIN_SOURCE_PASSWORD in .env}
+      JOIN_SOURCE_DATABASE_SSLMODE: ${ADVISOR_JOIN_SOURCE_DATABASE_SSLMODE:-disable}
+      JOIN_REPOSITORY_DATABASE_URL: ${ADVISOR_JOIN_REPOSITORY_DATABASE_URL:-}
+      JOIN_REPOSITORY_DATABASE_URL_FILE: ${ADVISOR_JOIN_REPOSITORY_DATABASE_URL_FILE:-}
+      JOIN_REPOSITORY_DATABASE_HOST: ${ADVISOR_JOIN_REPOSITORY_DATABASE_HOST:-repository-db}
+      JOIN_REPOSITORY_DATABASE_PORT: ${ADVISOR_JOIN_REPOSITORY_DATABASE_PORT:-5433}
+      JOIN_REPOSITORY_DATABASE_NAME: ${ADVISOR_JOIN_REPOSITORY_DATABASE_NAME:-powa_repository}
+      JOIN_REPOSITORY_DATABASE_USER: ${ADVISOR_JOIN_REPOSITORY_DATABASE_USER:-advisor_join_ingest}
+      JOIN_REPOSITORY_DATABASE_PASSWORD: ${ADVISOR_JOIN_REPOSITORY_PASSWORD:?Set ADVISOR_JOIN_REPOSITORY_PASSWORD in .env}
+      JOIN_REPOSITORY_DATABASE_SSLMODE: ${ADVISOR_JOIN_REPOSITORY_DATABASE_SSLMODE:-disable}
       JOIN_POLL_INTERVAL_SECONDS: ${JOIN_POLL_INTERVAL_SECONDS:-2}
       JOIN_BATCH_LIMIT: ${JOIN_BATCH_LIMIT:-20}
       JOIN_RETENTION_DAYS: ${JOIN_RETENTION_DAYS:-30}
@@ -210,7 +226,14 @@ services:
       context: ./backend
     image: postgresql-advisor/api:iteration-2.7
     environment:
-      DATABASE_URL: postgresql://advisor_api:${ADVISOR_API_PASSWORD:-advisor_dev_api}@repository-db:5433/powa_repository
+      # DATABASE_URL remains an optional backwards-compatible override.
+      DATABASE_URL: ${ADVISOR_API_DATABASE_URL:-}
+      DATABASE_HOST: ${ADVISOR_API_DATABASE_HOST:-repository-db}
+      DATABASE_PORT: ${ADVISOR_API_DATABASE_PORT:-5433}
+      DATABASE_NAME: ${ADVISOR_API_DATABASE_NAME:-powa_repository}
+      DATABASE_USER: ${ADVISOR_API_DATABASE_USER:-advisor_api}
+      DATABASE_PASSWORD: ${ADVISOR_API_PASSWORD:?Set ADVISOR_API_PASSWORD in .env}
+      DATABASE_SSLMODE: ${ADVISOR_API_DATABASE_SSLMODE:-disable}
       DEFAULT_WINDOW: ${DEFAULT_WINDOW:-24h}
       MAX_QUERY_PAGE_SIZE: "200"
       RETENTION_DAYS: ${RETENTION_DAYS:-90}
@@ -251,7 +274,13 @@ services:
     image: postgresql-advisor/api:iteration-2.7
     command: ["uvicorn", "app.evaluator:app", "--host", "0.0.0.0", "--port", "8010"]
     environment:
-      EVALUATOR_DATABASE_URL: postgresql://advisor_evaluator:${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}@source-db:5432/appdb
+      EVALUATOR_DATABASE_URL: ${ADVISOR_EVALUATOR_DATABASE_URL:-}
+      EVALUATOR_DATABASE_HOST: ${ADVISOR_EVALUATOR_DATABASE_HOST:-source-db}
+      EVALUATOR_DATABASE_PORT: ${ADVISOR_EVALUATOR_DATABASE_PORT:-5432}
+      EVALUATOR_DATABASE_NAME: ${ADVISOR_EVALUATOR_DATABASE_NAME:-appdb}
+      EVALUATOR_DATABASE_USER: ${ADVISOR_EVALUATOR_DATABASE_USER:-advisor_evaluator}
+      EVALUATOR_DATABASE_PASSWORD: ${ADVISOR_EVALUATOR_PASSWORD:?Set ADVISOR_EVALUATOR_PASSWORD in .env}
+      EVALUATOR_DATABASE_SSLMODE: ${ADVISOR_EVALUATOR_DATABASE_SSLMODE:-disable}
       EVALUATOR_ALLOWED_SERVER_ALIAS: ${EVALUATOR_ALLOWED_SERVER_ALIAS:-test-source}
       EVALUATOR_ALLOWED_DATABASE: ${EVALUATOR_ALLOWED_DATABASE:-appdb}
       EVALUATOR_TOKEN: ${EVALUATOR_TOKEN:-advisor-dev-evaluator-token}
@@ -321,7 +350,7 @@ services:
       - ./sql/003_join_snapshot_source.sql:/opt/advisor/sql/003_join_snapshot_source.sql:ro,Z
       - ./deployment/clone/init-clone.sh:/docker-entrypoint-initdb.d/20-init-clone.sh:ro,Z
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U clone_admin -d postgres -p 5432 && psql -U clone_admin -d postgres -Atqc \"SELECT current_setting('advisor.validation_clone', true) = 'on' AND EXISTS (SELECT 1 FROM pg_database WHERE datname='appdb' AND datistemplate)\" | grep -q '^t$'"]
+      test: ["CMD-SHELL", "export PGOPTIONS='-c pg_stat_statements.track=none'; /usr/local/bin/advisor-reconcile-roles clone && pg_isready -U clone_admin -d postgres -p 5432 && psql -U clone_admin -d postgres -Atqc \"SELECT current_setting('advisor.validation_clone', true) = 'on' AND EXISTS (SELECT 1 FROM pg_database WHERE datname='appdb' AND datistemplate)\" | grep -q '^t$'"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -345,7 +374,13 @@ services:
     image: postgresql-advisor/clone-evaluator:iteration-2.7
     profiles: [real-validation]
     environment:
-      CLONE_DATABASE_URL: postgresql://clone_admin:${CLONE_ADMIN_PASSWORD:-advisor_dev_clone_admin}@clone-db:5432/postgres?sslmode=disable
+      CLONE_DATABASE_URL: ${ADVISOR_CLONE_DATABASE_URL:-}
+      CLONE_DATABASE_HOST: ${ADVISOR_CLONE_DATABASE_HOST:-clone-db}
+      CLONE_DATABASE_PORT: ${ADVISOR_CLONE_DATABASE_PORT:-5432}
+      CLONE_DATABASE_NAME: ${ADVISOR_CLONE_DATABASE_NAME:-postgres}
+      CLONE_DATABASE_USER: ${ADVISOR_CLONE_DATABASE_USER:-clone_admin}
+      CLONE_DATABASE_PASSWORD: ${CLONE_ADMIN_PASSWORD:-advisor_dev_clone_admin}
+      CLONE_DATABASE_SSLMODE: ${ADVISOR_CLONE_DATABASE_SSLMODE:-disable}
       CLONE_TEMPLATE_DATABASE: appdb
       CLONE_ADMIN_ROLE: clone_admin
       CLONE_RUNNER_ROLE: clone_runner
@@ -383,7 +418,7 @@ services:
     image: postgresql-advisor/workload:realistic-v1
     environment:
       DATABASE_URL: postgresql://advisor_workload_login@source-db:5432/appdb?sslmode=disable
-      PGPASSWORD: ${WORKLOAD_DB_PASSWORD:-advisor_dev_workload}
+      PGPASSWORD: ${WORKLOAD_DB_PASSWORD:?Set WORKLOAD_DB_PASSWORD in .env}
       WORKLOAD_PROFILE: ${WORKLOAD_PROFILE:-normal}
       WORKLOAD_DURATION_SECONDS: ${WORKLOAD_DURATION_SECONDS:-0}
       WORKLOAD_INTERVAL_SECONDS: ${WORKLOAD_INTERVAL_SECONDS:-0.25}

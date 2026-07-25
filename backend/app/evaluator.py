@@ -14,24 +14,49 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from psycopg import sql
 from psycopg.rows import dict_row
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.conninfo import resolve_conninfo
 from app.schemas import IndexAdvice, InternalIndexEvaluationRequest
 
 
 class EvaluatorSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    evaluator_database_url: str = (
-        "postgresql://advisor_evaluator:advisor_dev_evaluator@localhost:5432/appdb"
+    model_config = SettingsConfigDict(
+        env_file=".env", extra="ignore", hide_input_in_errors=True
     )
+
+    # EVALUATOR_DATABASE_URL remains a backwards-compatible explicit override.
+    evaluator_database_url: str | None = None
+    evaluator_database_host: str = "localhost"
+    evaluator_database_port: int = Field(default=5432, ge=1, le=65_535)
+    evaluator_database_name: str = "appdb"
+    evaluator_database_user: str = "advisor_evaluator"
+    evaluator_database_password: str = "advisor_dev_evaluator"
+    evaluator_database_sslmode: str | None = None
     evaluator_allowed_server_alias: str = "test-source"
     evaluator_allowed_database: str = "appdb"
     evaluator_token: str = "advisor-dev-evaluator-token"
     evaluator_statement_timeout_ms: int = Field(default=2_000, ge=100, le=10_000)
     evaluator_lock_timeout_ms: int = Field(default=250, ge=50, le=2_000)
     evaluator_min_improvement_percent: float = Field(default=10.0, ge=1, le=90)
+
+    @property
+    def evaluator_database_conninfo(self) -> str:
+        return resolve_conninfo(
+            self.evaluator_database_url,
+            host=self.evaluator_database_host,
+            port=self.evaluator_database_port,
+            dbname=self.evaluator_database_name,
+            user=self.evaluator_database_user,
+            password=self.evaluator_database_password,
+            sslmode=self.evaluator_database_sslmode,
+        )
+
+    @model_validator(mode="after")
+    def database_connection_is_valid(self) -> EvaluatorSettings:
+        _ = self.evaluator_database_conninfo
+        return self
 
 
 @lru_cache
@@ -200,7 +225,7 @@ def _evaluate(payload: InternalIndexEvaluationRequest) -> dict[str, Any]:
     connection: psycopg.Connection[Any] | None = None
     try:
         connection = psycopg.connect(
-            settings.evaluator_database_url,
+            settings.evaluator_database_conninfo,
             autocommit=True,
             row_factory=dict_row,
             connect_timeout=3,
@@ -443,7 +468,7 @@ def _authorized(token: str | None) -> None:
 async def health() -> dict[str, Any]:
     settings = get_evaluator_settings()
     try:
-        with psycopg.connect(settings.evaluator_database_url, connect_timeout=3) as connection:
+        with psycopg.connect(settings.evaluator_database_conninfo, connect_timeout=3) as connection:
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     "SELECT current_database() AS database_name, current_user AS role_name, "

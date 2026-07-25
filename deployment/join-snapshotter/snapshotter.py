@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 import psycopg
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -69,8 +70,20 @@ class Settings:
         max_backoff = _float_setting("JOIN_MAX_BACKOFF_SECONDS", 60.0, minimum=poll_interval)
         return cls(
             source_alias=alias,
-            source_database_url=_secret_setting("JOIN_SOURCE_DATABASE_URL"),
-            repository_database_url=_secret_setting("JOIN_REPOSITORY_DATABASE_URL"),
+            source_database_url=_database_conninfo(
+                "JOIN_SOURCE_DATABASE",
+                default_host="source-db",
+                default_port=5432,
+                default_name="powa",
+                default_user="advisor_join_reader",
+            ),
+            repository_database_url=_database_conninfo(
+                "JOIN_REPOSITORY_DATABASE",
+                default_host="repository-db",
+                default_port=5433,
+                default_name="powa_repository",
+                default_user="advisor_join_ingest",
+            ),
             poll_interval_seconds=poll_interval,
             max_backoff_seconds=max_backoff,
             batch_limit=_int_setting("JOIN_BATCH_LIMIT", 20, minimum=1, maximum=100),
@@ -130,6 +143,55 @@ def _secret_setting(name: str) -> str:
     if not value:
         raise ValueError(f"{name} or {name}_FILE is required")
     return value
+
+
+def _password_setting(name: str) -> str:
+    direct = os.getenv(name)
+    file_name = os.getenv(f"{name}_FILE", "").strip()
+    if direct not in (None, "") and file_name:
+        raise ValueError(f"set only one of {name} and {name}_FILE")
+    if file_name:
+        lines = Path(file_name).read_text(encoding="utf-8").splitlines()
+        value = lines[0] if lines else ""
+    else:
+        value = direct or ""
+    if not value:
+        raise ValueError(f"{name} or {name}_FILE is required")
+    return value
+
+
+def _database_conninfo(
+    prefix: str,
+    *,
+    default_host: str,
+    default_port: int,
+    default_name: str,
+    default_user: str,
+) -> str:
+    """Resolve a legacy URL override or safely build libpq keyword conninfo."""
+
+    url_name = f"{prefix}_URL"
+    if os.getenv(url_name, "").strip() or os.getenv(f"{url_name}_FILE", "").strip():
+        try:
+            return make_conninfo(_secret_setting(url_name))
+        except Exception:
+            raise ValueError(f"{url_name} is invalid") from None
+
+    try:
+        return make_conninfo(
+            host=os.getenv(f"{prefix}_HOST", default_host).strip(),
+            port=_int_setting(
+                f"{prefix}_PORT", default_port, minimum=1, maximum=65_535
+            ),
+            dbname=os.getenv(f"{prefix}_NAME", default_name).strip(),
+            user=os.getenv(f"{prefix}_USER", default_user).strip(),
+            password=_password_setting(f"{prefix}_PASSWORD"),
+            sslmode=os.getenv(f"{prefix}_SSLMODE", "disable").strip() or "disable",
+        )
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc).endswith("is required"):
+            raise
+        raise ValueError(f"{prefix} connection settings are invalid") from None
 
 
 def _int_setting(name: str, default: int, *, minimum: int, maximum: int) -> int:
