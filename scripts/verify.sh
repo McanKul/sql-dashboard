@@ -400,6 +400,12 @@ SET pg_qualstats.sample_rate = 1;
 SELECT 'SELECT count(*) FROM public.customers AS c JOIN public.orders AS o ON o.customer_id = c.id WHERE o.status = ''paid'''
   FROM generate_series(1, 10)
 \gexec
+-- The scaled realistic dataset makes status intentionally low-selectivity.
+-- A high-cardinality numeric predicate keeps this single-column HypoPG
+-- acceptance deterministic without relying on a particular seed size.
+SELECT 'SELECT count(*) FROM public.orders WHERE total = 199.99'
+  FROM generate_series(1, 10)
+\gexec
 SELECT pg_sleep(2);
 SQL
 }
@@ -409,6 +415,8 @@ SQL
 docker compose exec -T source-db psql -U postgres -d powa -qc \
   'SELECT advisor_join.capture_and_reset()' >/dev/null
 
+mutation_rows_before="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
+  'SELECT count(*) FROM workload_mutations')"
 bash scripts/run-test-workload.sh 20 >/tmp/advisor-workload-result.txt
 grep -q '"ok": true' /tmp/advisor-workload-result.txt || fail "Test fonksiyonu basarisiz"
 run_join_wait_acceptance_workload
@@ -432,9 +440,9 @@ dml_pattern_count="$(docker compose exec -T source-db psql -U postgres -d powa -
     WHERE query ~* '^[[:space:]]*(INSERT INTO|UPDATE|DELETE FROM)[[:space:]]+workload_mutations'")"
 mutation_rows="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   'SELECT count(*) FROM workload_mutations')"
-[[ "$dml_pattern_count" == "3" && "$mutation_rows" == "0" ]] \
-  || fail "Kontrollu DML desenleri hatali: patterns=$dml_pattern_count, rows=$mutation_rows"
-pass "INSERT/UPDATE/DELETE desenleri olculuyor ve test tablosu birikmiyor"
+[[ "$dml_pattern_count" == "3" && "$mutation_rows" == "$mutation_rows_before" ]] \
+  || fail "Kontrollu DML desenleri hatali: patterns=$dml_pattern_count, before=$mutation_rows_before, after=$mutation_rows"
+pass "INSERT/UPDATE/DELETE desenleri olculuyor ve test tablosu yeni satir biriktirmiyor"
 
 # Collector yeniden LISTEN durumuna gecmeden gonderilen tek bir NOTIFY kaybolabilir.
 # Bekleme boyunca istegi tekrar gonderip hem genel snapshot'i hem qualstats

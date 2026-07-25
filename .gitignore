@@ -11,5 +11,7 @@ htmlcov/
 backups/
 runtime/collector/sources/*
 !runtime/collector/sources/.gitkeep
+runtime/load-reports/*
+!runtime/load-reports/.gitkeep
 *.pass
 *.pgpass

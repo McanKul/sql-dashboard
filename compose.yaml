@@ -350,19 +350,39 @@ services:
   workload:
     build:
       context: ./deployment/workload
-    image: postgresql-advisor/workload:iteration-1
+    image: postgresql-advisor/workload:realistic-v1
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}@source-db:5432/appdb
+      DATABASE_URL: postgresql://advisor_workload_login@source-db:5432/appdb?sslmode=disable
+      PGPASSWORD: ${WORKLOAD_DB_PASSWORD:-advisor_dev_workload}
+      WORKLOAD_PROFILE: ${WORKLOAD_PROFILE:-normal}
+      WORKLOAD_DURATION_SECONDS: ${WORKLOAD_DURATION_SECONDS:-0}
       WORKLOAD_INTERVAL_SECONDS: ${WORKLOAD_INTERVAL_SECONDS:-0.25}
       WORKLOAD_WORKERS: ${WORKLOAD_WORKERS:-6}
-      WORKLOAD_REPEAT_MIN: ${WORKLOAD_REPEAT_MIN:-4}
-      WORKLOAD_REPEAT_MAX: ${WORKLOAD_REPEAT_MAX:-10}
-      WORKLOAD_FUNCTION_ITERATIONS: ${WORKLOAD_FUNCTION_ITERATIONS:-8}
+      WORKLOAD_REPORT_INTERVAL_SECONDS: ${WORKLOAD_REPORT_INTERVAL_SECONDS:-10}
+      WORKLOAD_RANDOM_SEED: ${WORKLOAD_RANDOM_SEED:-20260725}
+      WORKLOAD_STATEMENT_TIMEOUT_MS: ${WORKLOAD_STATEMENT_TIMEOUT_MS:-15000}
+      WORKLOAD_LOCK_TIMEOUT_MS: ${WORKLOAD_LOCK_TIMEOUT_MS:-5000}
+      WORKLOAD_LOCK_HOLD_MS: ${WORKLOAD_LOCK_HOLD_MS:-75}
+      WORKLOAD_MAX_MUTATION_ROWS: ${WORKLOAD_MAX_MUTATION_ROWS:-10000}
+      WORKLOAD_MUTATION_CLEANUP_BATCH: ${WORKLOAD_MUTATION_CLEANUP_BATCH:-250}
+      WORKLOAD_MAX_EVENT_ROWS: ${WORKLOAD_MAX_EVENT_ROWS:-20000}
+      WORKLOAD_EVENT_CLEANUP_BATCH: ${WORKLOAD_EVENT_CLEANUP_BATCH:-250}
+      WORKLOAD_CONNECT_TIMEOUT_SECONDS: ${WORKLOAD_CONNECT_TIMEOUT_SECONDS:-5}
     depends_on:
       source-db:
         condition: service_healthy
-    profiles: [demo]
-    restart: unless-stopped
+    profiles: [realistic-load]
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 160
+    mem_limit: 1g
+    stop_grace_period: 30s
+    restart: "no"
     networks: [workload_source]
 
   web:

@@ -86,17 +86,42 @@ bash scripts/run-test-workload.sh 20
 
 `iterations` değeri `1–1000` arasında olmalıdır. Script yalnız bu test oturumunda `pg_qualstats.sample_rate=1` kullanır; global varsayılan `0.1` kalır. Collector frekansı demo için 5 saniyedir; iki snapshot oluşması ve fark metriklerinin görünmesi için komuttan sonra yaklaşık 10 saniye bekleyin.
 
-Varsayılan kurulum **sürekli sentetik trafik üretmez**. Sürekli demo trafiğini özellikle açmak isterseniz:
+Varsayılan kurulum **sürekli sentetik trafik üretmez**. Küçük fixture üzerinde
+trafik gerektiğinde yukarıdaki komut tekrarlanabilir; sürekli ve hacimli karma
+trafik ise aşağıdaki opt-in realistic profilinden önce mutlaka seed edilir.
+
+### Gerçekçi toplu yük
+
+Küçük acceptance fixture'ını büyütmeden, mevcut source volume'ünü hedef-count
+bazlı büyüten ve wrapper üzerinden süreli karma trafik çalıştıran ayrı profil
+vardır. Varsayılan `normal` koşu 100 bin müşteri, 1 milyon sipariş, 4 milyon
+kalem ve 6 milyon event hedefler; ardından read/write, ağır JOIN, JSON filtre,
+temp spill, CPU ve kontrollü row-lock trafiğini 24 worker ile 10 dakika birlikte
+üretir:
 
 ```bash
-docker compose --profile demo up -d workload
+bash scripts/run-realistic-workload.sh normal
 ```
 
-Durdurmak için:
+Bu komut yalnız yerel/izole test source'u içindir: veriyi küçültmez, otomatik
+rollback veya cleanup yapmaz ve makinenin CPU/disk I/O kapasitesini bilinçli
+olarak doyurabilir. `stress` gerçek production kaynağında çalıştırılmamalıdır.
+Wrapper süreyi sınırlar; `docker compose --profile realistic-load up workload`
+komutu ise `WORKLOAD_DURATION_SECONDS=0` varsayılanıyla elle durdurulana kadar
+çalışır.
+
+Kısa makine kontrolü için `quick`, açık kapasite testi için `stress` seçilebilir.
+PoWA snapshot, CPU/wait/JOIN/composite ve API kabul kontrolleri koşunun sonunda
+otomatik çalışır. `real-validation` servisleri ve admin token hazırsa izole gerçek
+index testini de aynı zincire eklemek için:
 
 ```bash
-docker compose stop workload
+REALISTIC_VERIFY_RUNTIME=true bash scripts/run-realistic-workload.sh normal
 ```
+
+Çıktılar `runtime/load-reports/` altında tutulur ve Git'e girmez. Profil hedefleri,
+kaynak bütçesi, hard/soft kabul kuralları ve özel Compose proje kullanımı
+[gerçekçi yük runbook'unda](docs/REALISTIC_LOAD_TEST.md) açıklanır.
 
 ## İterasyon 2.1-B — `pg_qualstats` altyapı durumu
 
@@ -141,7 +166,7 @@ Denetim sırasında agresif demo yükü 6 worker ile yaklaşık 1.164 statement 
 5. Bir saatlik rolling index penceresinde ölçülen aralık pratikte `1 saat`ten birkaç saniye kısa kaldığı için `observed_hours < 1` kontrolü indexleri sürekli `INSUFFICIENT_DATA` durumunda bırakabilir. Snapshot frekansını tolere eden kapsam kontrolü kullanılmalıdır.
 6. Bir saatlik grafik etiketleri dakika içermeli; sıfır hareketli `pg_stat_io` bağlamları varsayılan görünümden çıkarılmalı; Genel Bakış sorgu önizlemesi Sorgular ekranındaki eski filtrelerden etkilenmemelidir.
 7. Sistem Sağlığı sinyalleri kümülatif sayaç ve küçük demo tabloları nedeniyle fazla hassastır. `stats_reset`, gözlem süresi, tablo boyutu ve zaman penceresi sinyal açıklamasına dahil edilmelidir.
-8. Sürekli workload için `normal` ve `stress` profilleri ayrılmalıdır. Kabul testi normal profille, doygunluk ve kapasite testi stress profiliyle çalışmalıdır.
+8. Sürekli workload için gerekli `quick`, `normal` ve açık opt-in `stress` ayrımı artık gerçekçi yük runbook'u ve bounded generator ile uygulanmıştır; mutlak TPS hosttan bağımsız bir hard gate değildir.
 
 **25 Temmuz 2026 kısa kalibrasyon kapanışı:** En yüksek doğruluk etkili iki madde kapatıldı. Ana dashboard/trend yalnız top-level statement toplamını kullanıyor; regresyon puanı ve “yavaşlayan sorgu” sayısı için her iki dönemde en az 20 çağrı ve en az `%20` artış gerekiyor, büyüklük katsayısı `%50`de tam değere ulaşıyor. Observation-hour hacim modeli ve 85/70/40 priority sınırları korundu. Ortam profili, coverage ve uzun süreli production dağılım kalibrasyonu ayrı ürün işi olarak kalır; 2.3 CPU sinyali ölçüm görmeden skora eklenmedi.
 
@@ -199,7 +224,7 @@ Komut tekrar çalıştırılabilir: aynı alias yeni satır açmaz; bağlantı/f
 | `api` | Repository-only FastAPI okuma/annotation katmanı | Repository'de |
 | `evaluator` | Yapılandırılmış kaynakta salt-okunur HypoPG/plain-EXPLAIN doğrulaması | Yok |
 | `clone-db`, `clone-evaluator` | Yalnız `real-validation` profilinde tmpfs disposable clone + gerçek test | Tmpfs; kalıcı değil |
-| `workload` | Yalnız `demo` profili açıldığında sürekli sentetik sorgu yükü | Yok |
+| `workload` | Yalnız `realistic-load` profilinde; wrapper ile süreli veya açıkça `0` seçilirse sürekli karma yük | Yok |
 | `web` | React + TypeScript arayüzü ve Nginx API proxy | Yok |
 
 ```text

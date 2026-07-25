@@ -37,7 +37,7 @@ Ana telemetry akışı tek yönlüdür: kaynak istatistikleri collector tarafın
 - PoWA sürüm yükseltme ve retention işlemleri uygulama şemasından bağımsız kalır.
 - Aynı tasarım daha sonra fiziksel olarak ayrı bir repository hostuna taşınabilir.
 
-Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımında kaynak PostgreSQL çoğunlukla zaten başka bir sunucudadır; mevcut Compose'taki `source-db` bu senaryonun güvenli, tekrarlanabilir simülasyonudur. `workload` sürekli çalışmaz ve yalnız `demo` profiliyle özellikle açılır.
+Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımında kaynak PostgreSQL çoğunlukla zaten başka bir sunucudadır; mevcut Compose'taki `source-db` bu senaryonun güvenli, tekrarlanabilir simülasyonudur. `workload` normal başlangıçta çalışmaz; milyonlarca satırlı karma trafik için yalnız `realistic-load` profiliyle ve seed sonrasında özellikle açılır. Küçük fixture trafiğini `run-test-workload.sh` üretir. Resmî run wrapper'ı süreyi sınırlar; servisi doğrudan profille açarken `WORKLOAD_DURATION_SECONDS=0` elle durdurulana kadar çalışır. Hacimli ve monotonik seed baz init'ten ayrıdır, otomatik cleanup yapmaz ve gerçek production source üzerinde kullanılmamalıdır; böylece fresh acceptance ve 1 GiB tmpfs clone template'i küçük ve deterministik kalır.
 
 ## Bileşen sorumlulukları
 
@@ -197,6 +197,7 @@ Sorgu analiz listesi `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE` ve `MERGE` i
 | `advisor_evaluator` | Yalnız yapılandırılmış DB/schema/table SELECT ve üç HypoPG fonksiyonu; read-only, connection limit 2 | Yok | İsteğe bağlı plain-EXPLAIN plan doğrulaması |
 | `advisor_join_reader` | Yalnız JOIN outbox `fetch/ack` fonksiyonları | Yok | Source batch okuma ve teslim sonrası ack |
 | `advisor_join_ingest` | Yok | Tek server kimliğine bağlı private ingest/status/source-purge wrapper'ları; tablo ve global purge erişimi yok | JOIN batch yazımı |
+| `advisor_workload_login` | Yalnız opt-in realistic test rollerine `SET ROLE` ve stats okuma; admin yetkisi yok | Yok | İzole source üzerinde karma yük oturumlarını açma |
 | `advisor_api` | Bağlantı yok | PoWA read + advisor kontrollü write | API sorguları ve not/audit |
 | `clone_admin` / `clone_runner` | Yalnız tmpfs clone cluster'ı; kaynak ağa yol yok | Yok | Clone oluşturma/index ve read-only gerçek plan ölçümü |
 | API isteği `viewer` | Yok | API üzerinden maskeli SQL | Varsayılan görüntüleme |
@@ -224,3 +225,4 @@ gönderilmez.
 - Bütün dış kaynaklar bir collector deployment'ında ortak libpq `PGSSLMODE` kullanır. Kaynak başına farklı client certificate/SSL profili gerekirse ayrı collector deployment'ı gerekir.
 - Analyst header modeli, TLS terminasyonu, SSO, rate limit ve merkezi secret store üretim öncesi tamamlanmalıdır.
 - Server-side admin token tarayıcının kendi kendine yetki vermesini engeller ama kullanıcı kimliği/SSO değildir. `real-validation` profili güvenilir kullanıcı sınırı, rate limit ve kimlik doğrulayan proxy olmadan internet erişimine açılmamalıdır.
+- Realistic workload kabulündeki API gecikmesi yük bittikten sonraki repository/UI toparlanmasını ölçer; yük altındaki kullanıcı deneyimi için ayrı eşzamanlı performans testi gerekir. `REALISTIC_VERIFY_RUNTIME=true` ise büyük source'u kopyalamaz, küçük deterministik tmpfs fixture üzerinde izolasyon ve gerçek-index mekanizmasını kanıtlar.

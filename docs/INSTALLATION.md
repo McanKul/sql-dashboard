@@ -9,7 +9,7 @@ Bu repo varsayılan olarak tek bir fiziksel/virtual host üzerinde iki PostgreSQ
 1. Kaynak PostgreSQL: host loopback `15432`, container `5432`
 2. Repository PostgreSQL: host loopback `15433`, container `5433`
 
-Bunlara collector, repository-only API, ayrı salt-okunur HypoPG evaluator ve web container'ları eklenir. Sürekli sentetik trafik üreten `workload` container'ı yalnız isteğe bağlı `demo` profiliyle açılır. Bu ayrım PDF'deki “tek test sunucusu, iki PostgreSQL instance” kararının çalıştırılabilir halidir.
+Bunlara collector, repository-only API, ayrı salt-okunur HypoPG evaluator ve web container'ları eklenir. Hacimli sentetik trafik üreten `workload` container'ı yalnız seed sonrasında ve isteğe bağlı `realistic-load` profiliyle açılır. Bu ayrım PDF'deki “tek test sunucusu, iki PostgreSQL instance” kararının çalıştırılabilir halidir.
 
 DB, API ve web portları `.env.example` içinde varsayılan olarak `127.0.0.1`
 adresine bağlıdır. Web container'ındaki Nginx, `/api` isteklerini Docker iç
@@ -272,7 +272,7 @@ Beklenen sonuç: çıktı ve hata olmadan tamamlanmasıdır. Bir environment de�
 docker compose up --build -d
 ```
 
-Bu komut yedi ana servisi (`source-db`, `repository-db`, `collector`, `join-snapshotter`, `evaluator`, `api`, `web`) başlatır; `demo` ve `real-validation` profilleri seçilmediği için sürekli workload ile disposable clone başlamaz. İlk build şu kontrolleri içerir:
+Bu komut yedi ana servisi (`source-db`, `repository-db`, `collector`, `join-snapshotter`, `evaluator`, `api`, `web`) başlatır; `realistic-load` ve `real-validation` profilleri seçilmediği için workload ile disposable clone başlamaz. İlk build şu kontrolleri içerir:
 
 - `postgres:18-trixie` tabanı indirilir.
 - PoWA Archivist `REL_5_2_0` kaynak arşivi indirilir ve SHA-256 doğrulanır.
@@ -330,12 +330,10 @@ bash scripts/run-test-workload.sh 20
 
 Collector 5 saniyede bir snapshot alır. İki ölçüm farkı için yaklaşık 10 saniye bekleyin. Komut deterministik predicate kabulü için yalnız kendi oturumunda `pg_qualstats.sample_rate=1` kullanır; cluster varsayılanı `0.1` olarak kalır.
 
-Bu komut tek seferlik kontrollü trafik üretir. Sürekli sentetik trafik varsayılan olarak kapalıdır. Yalnız demo ihtiyacında:
-
-```bash
-docker compose --profile demo up -d workload
-docker compose stop workload
-```
+Bu komut tek seferlik kontrollü trafik üretir. Sürekli sentetik trafik varsayılan
+olarak kapalıdır. Hacimli ve süreli karma trafik için önce
+`scripts/run-realistic-workload.sh` kullanılmalıdır; fresh fixture üzerinde
+`workload` servisini doğrudan açmak desteklenmez.
 
 ### Adım 8 — Uçtan uca kabul testini çalıştırın
 

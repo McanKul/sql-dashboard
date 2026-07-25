@@ -109,7 +109,7 @@ Repository kaynak kaydında düz metin parola yoktur; libpq `.pgpass` kullanıl�
 
 ### 10. Çoklu gerçek kaynak kaydı idempotent hale getirildi
 
-PDF'deki tek hard-coded source örneği demo için yeterlidir, fakat ürün entegrasyonu için yeterli değildir. Repo `scripts/register-source.sh` ile host, port, monitoring DB, collector rolü, frequency ve retention'ı config/CLI üzerinden alır; aynı alias tekrar verildiğinde server id ve geçmiş korunarak kayıt güncellenir. Hazırlık SQL'i opsiyonel olarak uygulanabilir, parola repository'ye yazılmaz ve ilk snapshot ayrıca doğrulanır. Sürekli sentetik workload yalnız `demo` Compose profiliyle açılır.
+PDF'deki tek hard-coded source örneği demo için yeterlidir, fakat ürün entegrasyonu için yeterli değildir. Repo `scripts/register-source.sh` ile host, port, monitoring DB, collector rolü, frequency ve retention'ı config/CLI üzerinden alır; aynı alias tekrar verildiğinde server id ve geçmiş korunarak kayıt güncellenir. Hazırlık SQL'i opsiyonel olarak uygulanabilir, parola repository'ye yazılmaz ve ilk snapshot ayrıca doğrulanır. Küçük trafik `run-test-workload.sh` ile, hacimli karma trafik ise seed zorunlu `realistic-load` akışıyla üretilir.
 
 ### 11. Predicate/index-adayı gözlem katmanı eklendi
 
