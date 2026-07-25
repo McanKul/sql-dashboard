@@ -52,6 +52,7 @@ export interface QuerySummary {
   tempBlocksWritten: number
   walBytes: number
   cpu: QueryCpuTelemetry
+  waits: QueryWaitTelemetry
   impactScore: number
   priority: string
   severity: Severity
@@ -75,6 +76,44 @@ export interface QueryCpuTelemetry {
   percentOfExecTime: number | null
   filesystemReadsBytes: number | null
   filesystemWritesBytes: number | null
+  scoreIncluded: false
+}
+
+export interface QueryWaitTelemetry {
+  capability: {
+    available: boolean
+    version?: string | null
+    release: string
+    dataAvailable: boolean
+    source: string
+    coverage: 'TOP_LEVEL_SAMPLED_WAITS'
+    reason: string
+  }
+  totalSamples: number | null
+  categories: {
+    io: number
+    lock: number
+    lwlock: number
+    client: number
+    ipc: number
+    timeout: number
+    activity: number
+    extension: number
+    other: number
+  } | null
+  dominant: {
+    category: string
+    event: string
+    sharePercent: number
+    confidence: 'LOW' | 'MEDIUM'
+  } | null
+  events: Array<{
+    category: string
+    eventType: string
+    event: string
+    samples: number
+    sharePercent: number
+  }>
   scoreIncluded: false
 }
 
@@ -103,9 +142,9 @@ export interface PredicateCapability {
   available: boolean
   version?: string | null
   dataAvailable: boolean
-  coverage: 'WHERE_FILTER_ONLY'
-  joinsAvailable: false
-  ddlGenerated: false
+  coverage: 'WHERE_FILTER_ONLY' | 'WHERE_AND_JOIN_SNAPSHOT'
+  joinsAvailable: boolean
+  ddlGenerated: boolean
   reason: string
   observedFrom?: string | null
   observedTo?: string | null
@@ -133,6 +172,69 @@ export interface QueryPredicate {
 export interface PredicateInsights {
   capability: PredicateCapability
   items: QueryPredicate[]
+  joinCapability: JoinSnapshotCapability
+  joins: QueryJoinPredicate[]
+  candidates: CompositeIndexCandidate[]
+}
+
+export interface JoinSnapshotCapability {
+  available: boolean
+  dataAvailable: boolean
+  status: 'STARTING' | 'HEALTHY' | 'DEGRADED' | 'ERROR' | 'UNAVAILABLE'
+  lastSnapshotAt?: string | null
+  lagSeconds?: number | null
+  captureMode: 'QUALSTATS_RESET_BOUNDARY'
+  reason: string
+}
+
+export interface QueryJoinPredicate {
+  qualId: string
+  qualNodeId: string
+  leftRelationId: number
+  leftSchemaName: string
+  leftTableName: string
+  leftColumnName: string
+  rightRelationId: number
+  rightSchemaName: string
+  rightTableName: string
+  rightColumnName: string
+  operatorOid: number
+  operatorName?: string | null
+  btreeStrategy?: number | null
+  occurrences: number
+  rowsProcessed: number
+  sampleCount: number
+  observedFrom: string
+  observedTo: string
+  signal: 'FREQUENT_JOIN' | 'OBSERVED_JOIN' | 'INSUFFICIENT_DATA'
+  scoreIncluded: false
+}
+
+export interface CompositeIndexCandidate {
+  candidateId: string
+  serverId: number
+  databaseId: number
+  queryId: string
+  relationId: number
+  schemaName: string
+  tableName: string
+  method: 'btree'
+  columns: [string, string]
+  operatorOids: number[]
+  orderingRule: 'SELECTIVE_EQUALITY_FILTER_THEN_JOIN' | 'EQUALITY_JOIN_THEN_FILTER' | 'EQUALITY_JOIN_THEN_RANGE_FILTER'
+  joinOccurrences: number
+  filterOccurrences: number
+  rowsProcessed: number
+  rowsFiltered: number
+  filterRatio?: number | null
+  sampleCount: number
+  observedFrom: string
+  observedTo: string
+  confidence: 'LOW' | 'MEDIUM' | 'HIGH'
+  createIndexSql: string
+  existingIndexChecked: boolean
+  runtimeFixtureAvailable: boolean
+  scoreIncluded: false
 }
 
 export interface QueryIndexAdvice {
@@ -163,6 +265,32 @@ export interface QueryIndexAdvice {
     reasons: string[]
   } | null
   ddlExecuted: false
+}
+
+export interface QueryRuntimeValidation {
+  status: 'RUNTIME_VALIDATED' | 'NO_RUNTIME_IMPROVEMENT' | 'UNAVAILABLE' | 'UNSAFE'
+  reasonCode: string
+  message: string
+  candidateId: string
+  validation?: {
+    mode: 'EXPLAIN_ANALYZE'
+    cacheProfile: 'ALTERNATING_WARM'
+    measuredRuns: number
+    warmupRuns: number
+    postgresVersion: string
+    baseline: { medianExecutionTimeMs: number; accessMethod?: string | null }
+    candidate: { medianExecutionTimeMs: number; accessMethod?: string | null }
+    executionImprovementPercent: number
+    candidateIndexUsed: boolean
+    indexBuildTimeMs: number
+    actualIndexSizeBytes: number
+    tableSizeBytes: number
+    evaluatedAt: string
+  } | null
+  ddlTarget: 'DISPOSABLE_CLONE'
+  sourceDdlExecuted: false
+  cloneDdlExecuted: boolean
+  cloneDestroyed: boolean
 }
 
 export interface QueryDetail extends QuerySummary {
@@ -240,7 +368,7 @@ export interface QueryListParams {
   databaseId?: number
   minCalls?: number
   minDurationMs?: number
-  sort?: 'impact' | 'regression' | 'meanTime' | 'calls' | 'totalTime' | 'reads' | 'cpu'
+  sort?: 'impact' | 'regression' | 'meanTime' | 'calls' | 'totalTime' | 'reads' | 'cpu' | 'waits'
 }
 
 export interface ServerOption {

@@ -9,18 +9,28 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 
 from app.config import WINDOW_INTERVALS, get_settings
+from app.clone_evaluator import (
+    CloneIndexEvaluationResult,
+    InternalCloneIndexEvaluationRequest,
+    ValidatedCloneIndexCandidate,
+    _production_index_sql,
+)
+from app.evaluator import _proposed_index_name
 from app.repositories.powa import repository, serialize_query
 from app.schemas import (
     AnnotationUpdate,
+    CompositeIndexEvaluationRequest,
     IndexAdvice,
     IndexEvaluationRequest,
     IndexResponse,
     InternalIndexEvaluationRequest,
     IoResponse,
     PredicateResponse,
+    RuntimeIndexValidationRequest,
 )
 from app.security import can_view_sql, request_role, require_admin
 from app.services.evaluator import evaluate_index_candidate
+from app.services.clone_evaluator import validate_index_on_clone
 
 
 router = APIRouter(prefix="/api/v1")
@@ -177,6 +187,66 @@ def _predicate_payload(row: dict[str, Any]) -> dict[str, Any]:
         "sampleCount": int(row.get("sample_count") or 0),
         "signal": row.get("signal") or "INSUFFICIENT_DATA",
         "recommendation": row.get("recommendation") or "Daha fazla predicate verisi toplayin.",
+    }
+
+
+def _join_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "serverId": row["server_id"],
+        "serverAlias": row["server_alias"],
+        "databaseId": row["database_id"],
+        "databaseName": row["database_name"],
+        "queryId": str(row["query_id"]),
+        "qualId": str(row["qual_id"]),
+        "qualNodeId": str(row["qual_node_id"]),
+        "leftRelationId": row["left_relation_id"],
+        "leftSchemaName": row["left_schema_name"],
+        "leftTableName": row["left_table_name"],
+        "leftColumnName": row["left_column_name"],
+        "rightRelationId": row["right_relation_id"],
+        "rightSchemaName": row["right_schema_name"],
+        "rightTableName": row["right_table_name"],
+        "rightColumnName": row["right_column_name"],
+        "operatorOid": int(row["operator_oid"]),
+        "operatorName": row.get("operator_name"),
+        "btreeStrategy": row.get("btree_strategy"),
+        "occurrences": int(row.get("occurrences") or 0),
+        "rowsProcessed": int(row.get("rows_processed") or 0),
+        "sampleCount": int(row.get("sample_count") or 0),
+        "observedFrom": row["observed_from"],
+        "observedTo": row["observed_to"],
+        "signal": row["signal"],
+        "scoreIncluded": False,
+    }
+
+
+def _candidate_payload(row: dict[str, Any]) -> dict[str, Any]:
+    ratio = row.get("filter_ratio")
+    return {
+        "candidateId": str(row["candidate_id"]),
+        "serverId": row["server_id"],
+        "databaseId": row["database_id"],
+        "queryId": str(row["query_id"]),
+        "relationId": row["relation_id"],
+        "schemaName": row["schema_name"],
+        "tableName": row["table_name"],
+        "method": row["method"],
+        "columns": list(row["key_column_names"]),
+        "operatorOids": [int(value) for value in row["operator_oids"]],
+        "orderingRule": row["ordering_rule"],
+        "joinOccurrences": int(row.get("join_occurrences") or 0),
+        "filterOccurrences": int(row.get("filter_occurrences") or 0),
+        "rowsProcessed": int(row.get("rows_processed") or 0),
+        "rowsFiltered": int(row.get("rows_filtered") or 0),
+        "filterRatio": None if ratio is None else round(float(ratio), 6),
+        "sampleCount": int(row.get("sample_count") or 0),
+        "observedFrom": row["observed_from"],
+        "observedTo": row["observed_to"],
+        "confidence": row["confidence"],
+        "createIndexSql": row["create_index_sql"],
+        "existingIndexChecked": bool(row.get("existing_index_checked")),
+        "runtimeFixtureAvailable": bool(row.get("runtime_fixture_available")),
+        "scoreIncluded": False,
     }
 
 
@@ -426,18 +496,59 @@ async def query_predicates(
         database_id=database_id,
         query_id=query_id,
     )
+    join_rows, raw_join_capability = await repository.join_evidence(
+        window=window,
+        server_id=server_id,
+        database_id=database_id,
+        query_id=query_id,
+    )
+    candidate_rows = await repository.composite_candidates(
+        window=window,
+        server_id=server_id,
+        database_id=database_id,
+        query_id=query_id,
+    )
+    if candidate_rows:
+        query = await repository.query_by_id(
+            query_id=query_id,
+            window=window,
+            server_id=server_id,
+            database_id=database_id,
+        )
+        fixture_candidates = (
+            set()
+            if query is None
+            else await repository.runtime_replay_fixture_status(
+                candidate_ids=[str(row["candidate_id"]) for row in candidate_rows],
+                server_id=server_id,
+                database_id=database_id,
+                query_id=query_id,
+                normalized_sql=str(query["sql_text"]),
+            )
+        )
+        for candidate_row in candidate_rows:
+            candidate_row["runtime_fixture_available"] = (
+                str(candidate_row["candidate_id"]) in fixture_candidates
+            )
     available = bool(raw_capability.get("available"))
+    joins_available = bool(raw_join_capability.get("available"))
     observed_from = min((row["observed_from"] for row in rows), default=None)
     observed_to = max((row["observed_to"] for row in rows), default=None)
     if not available:
         reason = "pg_qualstats bu kaynakta etkin degil; predicate/index adayi verisi uretilemiyor."
     elif not rows:
         reason = "pg_qualstats etkin, ancak secili pencerede bu sorgu icin predicate ornegi yok."
+    elif joins_available:
+        reason = (
+            "WHERE filtreleri PoWA pg_qualstats gecmisinden, JOIN iliskileri ise "
+            "pg_qualstats reset sinirinda atomik outbox snapshot'larindan gelir. "
+            "Occurrence degeri statement cagri sayisi degildir."
+        )
     else:
         reason = (
-            "PoWA 5.2 repository hatti yalniz WHERE/filter predicate gecmisini tasir; "
-            "JOIN verisi yoklugu sorguda JOIN olmadigi anlamina gelmez. Occurrence degeri "
-            "orneklenen predicate calismasidir, statement cagri sayisi degildir."
+            "PoWA 5.2 repository hatti WHERE/filter predicate gecmisini tasir; JOIN "
+            "snapshotter yapilandirilmadigi icin JOIN yoklugu sorguda JOIN olmadigi "
+            "anlamina gelmez. Occurrence degeri statement cagri sayisi degildir."
         )
     return {
         "window": window,
@@ -445,15 +556,27 @@ async def query_predicates(
         "capability": {
             "available": available,
             "version": raw_capability.get("version"),
-            "dataAvailable": bool(rows),
-            "coverage": "WHERE_FILTER_ONLY",
-            "joinsAvailable": False,
-            "ddlGenerated": False,
+            "dataAvailable": bool(rows or join_rows),
+            "coverage": "WHERE_AND_JOIN_SNAPSHOT" if joins_available else "WHERE_FILTER_ONLY",
+            "joinsAvailable": joins_available,
+            "ddlGenerated": bool(candidate_rows),
             "reason": reason,
             "observedFrom": observed_from,
             "observedTo": observed_to,
         },
         "items": [_predicate_payload(row) for row in rows],
+        "joinCapability": {
+            "available": joins_available,
+            "dataAvailable": bool(raw_join_capability.get("data_available")),
+            "status": raw_join_capability.get("status") or "UNAVAILABLE",
+            "lastSnapshotAt": raw_join_capability.get("last_snapshot_at"),
+            "lagSeconds": raw_join_capability.get("lag_seconds"),
+            "captureMode": raw_join_capability.get("capture_mode") or "QUALSTATS_RESET_BOUNDARY",
+            "reason": raw_join_capability.get("reason")
+            or "JOIN snapshotter bu kaynak icin yapilandirilmamis.",
+        },
+        "joins": [_join_payload(row) for row in join_rows],
+        "candidates": [_candidate_payload(row) for row in candidate_rows],
     }
 
 
@@ -564,6 +687,202 @@ async def evaluate_query_index(
         sampleCount=int(predicate.get("sample_count") or 0),
     )
     return await evaluate_index_candidate(request)
+
+
+@router.post("/queries/{query_id}/composite-index-evaluations", response_model=IndexAdvice)
+async def evaluate_composite_query_index(
+    query_id: int,
+    payload: CompositeIndexEvaluationRequest,
+    role: Annotated[str, Depends(request_role)],
+    window: Window = "24h",
+) -> dict[str, Any]:
+    if not can_view_sql(role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Composite HypoPG plan dogrulamasi analyst yetkisi gerektirir.",
+        )
+
+    candidate = await repository.composite_candidate(
+        candidate_id=payload.candidateId,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+        query_id=query_id,
+        window=window,
+    )
+    if candidate is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Composite index adayi secili pencerede bulunamadi.",
+        )
+    columns = list(candidate.get("key_column_names") or [])
+    operator_oids = [int(value) for value in (candidate.get("operator_oids") or [])]
+    if len(columns) != 2 or not operator_oids or candidate.get("schema_name") == "unknown":
+        return {
+            "status": "UNSAFE",
+            "reasonCode": "UNRESOLVED_COMPOSITE_CANDIDATE",
+            "message": "Composite aday katalog kimlikleri guvenle cozumlenemedi.",
+            "ddlExecuted": False,
+        }
+
+    query = await repository.query_by_id(
+        query_id=query_id,
+        window=window,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+    )
+    if query is None:
+        raise HTTPException(status_code=404, detail="Sorgu secili pencerede bulunamadi.")
+
+    request = InternalIndexEvaluationRequest(
+        serverId=payload.serverId,
+        serverAlias=str(query.get("server_alias") or f"server-{payload.serverId}"),
+        databaseId=payload.databaseId,
+        databaseName=str(query.get("database_name") or f"db-{payload.databaseId}"),
+        queryId=str(query_id),
+        normalizedSql=str(query["sql_text"]),
+        qualId="0",
+        relationId=int(candidate["relation_id"]),
+        schemaName=str(candidate["schema_name"]),
+        tableName=str(candidate["table_name"]),
+        columns=columns,
+        operatorOids=operator_oids,
+        occurrences=int(candidate.get("join_occurrences") or 0)
+        + int(candidate.get("filter_occurrences") or 0),
+        rowsProcessed=int(candidate.get("rows_processed") or 0),
+        filterRatio=(
+            None
+            if candidate.get("filter_ratio") is None
+            else float(candidate["filter_ratio"])
+        ),
+        sampleCount=int(candidate.get("sample_count") or 0),
+    )
+    return await evaluate_index_candidate(request)
+
+
+@router.post(
+    "/queries/{query_id}/runtime-index-validations",
+    response_model=CloneIndexEvaluationResult,
+)
+async def validate_query_index_runtime(
+    query_id: int,
+    payload: RuntimeIndexValidationRequest,
+    role: Annotated[str, Depends(request_role)],
+    window: Window = "24h",
+) -> dict[str, Any]:
+    require_admin(role)
+    candidate = await repository.composite_candidate(
+        candidate_id=payload.candidateId,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+        query_id=query_id,
+        window=window,
+    )
+    if candidate is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Runtime dogrulama icin persisted composite aday bulunamadi.",
+        )
+    query = await repository.query_by_id(
+        query_id=query_id,
+        window=window,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+    )
+    if query is None:
+        raise HTTPException(status_code=404, detail="Sorgu secili pencerede bulunamadi.")
+
+    fixture = await repository.runtime_replay_fixture(
+        candidate_id=payload.candidateId,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+        query_id=query_id,
+        normalized_sql=str(query["sql_text"]),
+    )
+    if fixture is None:
+        return {
+            "status": "UNAVAILABLE",
+            "reasonCode": "REPLAY_FIXTURE_REQUIRED",
+            "message": (
+                "Bu normalize sorgu ve persisted aday icin operator onayli sentetik "
+                "replay fixture yok; clone'da EXPLAIN ANALYZE baslatilmadi."
+            ),
+            "candidateId": payload.candidateId,
+            "validation": None,
+            "ddlTarget": "DISPOSABLE_CLONE",
+            "sourceDdlExecuted": False,
+            "cloneDdlExecuted": False,
+            "cloneDestroyed": True,
+        }
+
+    columns = list(candidate.get("key_column_names") or [])
+    operator_oids = [int(value) for value in (candidate.get("operator_oids") or [])]
+    planner_request = InternalIndexEvaluationRequest(
+        serverId=payload.serverId,
+        serverAlias=str(query.get("server_alias") or f"server-{payload.serverId}"),
+        databaseId=payload.databaseId,
+        databaseName=str(query.get("database_name") or f"db-{payload.databaseId}"),
+        queryId=str(query_id),
+        normalizedSql=str(query["sql_text"]),
+        qualId="0",
+        relationId=int(candidate["relation_id"]),
+        schemaName=str(candidate["schema_name"]),
+        tableName=str(candidate["table_name"]),
+        columns=columns,
+        operatorOids=operator_oids,
+        occurrences=int(candidate.get("join_occurrences") or 0)
+        + int(candidate.get("filter_occurrences") or 0),
+        rowsProcessed=int(candidate.get("rows_processed") or 0),
+        filterRatio=(
+            None
+            if candidate.get("filter_ratio") is None
+            else float(candidate["filter_ratio"])
+        ),
+        sampleCount=int(candidate.get("sample_count") or 0),
+    )
+    planner_result = await evaluate_index_candidate(planner_request)
+    if planner_result.get("status") != "VALIDATED":
+        return {
+            "status": "UNAVAILABLE",
+            "reasonCode": "PLANNER_VALIDATION_REQUIRED",
+            "message": (
+                "Gercek clone testi oncesinde ayni persisted aday HypoPG tarafindan "
+                "dogrulanmali: " + str(planner_result.get("message") or "planner dogrulamadi")
+            ),
+            "candidateId": payload.candidateId,
+            "validation": None,
+            "ddlTarget": "DISPOSABLE_CLONE",
+            "sourceDdlExecuted": False,
+            "cloneDdlExecuted": False,
+            "cloneDestroyed": True,
+        }
+
+    index_name = _proposed_index_name(
+        planner_request.schemaName,
+        planner_request.tableName,
+        planner_request.columns,
+    )
+    clone_candidate = ValidatedCloneIndexCandidate(
+        candidateId=payload.candidateId,
+        plannerValidation="VALIDATED",
+        method="btree",
+        schemaName=planner_request.schemaName,
+        tableName=planner_request.tableName,
+        columns=planner_request.columns,
+        indexName=index_name,
+        createIndexSql="placeholder",
+    )
+    clone_candidate = clone_candidate.model_copy(
+        update={"createIndexSql": _production_index_sql(clone_candidate)}
+    )
+    clone_request = InternalCloneIndexEvaluationRequest(
+        serverAlias=planner_request.serverAlias,
+        databaseName=planner_request.databaseName,
+        queryId=planner_request.queryId,
+        normalizedSql=planner_request.normalizedSql,
+        bindValues=list(fixture["bind_values"]),
+        candidate=clone_candidate,
+    )
+    return await validate_index_on_clone(clone_request)
 
 
 @router.patch("/queries/{query_id}/annotation")
@@ -852,6 +1171,10 @@ async def export_queries(
             "cpu_percent_of_exec_time",
             "filesystem_reads_bytes",
             "filesystem_writes_bytes",
+            "wait_total_samples",
+            "dominant_wait_category",
+            "dominant_wait_event",
+            "dominant_wait_share_percent",
             "impact_score",
             "priority",
             "regression_percent",
@@ -874,6 +1197,10 @@ async def export_queries(
                 row["cpu_percent_of_exec_time"],
                 row["filesystem_reads_bytes"],
                 row["filesystem_writes_bytes"],
+                row["wait_total_samples"],
+                row["dominant_wait_category"],
+                row["dominant_wait_event"],
+                row["dominant_wait_share_percent"],
                 row["impact_score"],
                 row["priority"],
                 row["regression_percent"],

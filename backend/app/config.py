@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     evaluator_url: str | None = None
     evaluator_token: str = "advisor-dev-evaluator-token"
     evaluator_timeout_seconds: float = Field(default=4.0, gt=0, le=15)
+    clone_evaluator_url: str | None = None
+    clone_evaluator_token: str = "advisor-dev-clone-evaluator-token"
+    clone_evaluator_timeout_seconds: float = Field(default=90.0, gt=0, le=180)
+    runtime_admin_token: str | None = None
 
     @field_validator("database_url")
     @classmethod
@@ -51,8 +55,21 @@ class Settings(BaseSettings):
             raise ValueError(f"default_window sunlardan biri olmali: {', '.join(WINDOW_INTERVALS)}")
         return value
 
+    @field_validator("runtime_admin_token", mode="before")
+    @classmethod
+    def strong_or_disabled_runtime_admin_token(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("runtime_admin_token en az 16 karakter olmali")
+        value = value.strip()
+        if not value:
+            return None
+        if len(value) < 16:
+            raise ValueError("runtime_admin_token en az 16 karakter olmali")
+        return value
+
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

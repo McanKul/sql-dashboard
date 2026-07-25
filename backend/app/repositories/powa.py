@@ -17,6 +17,7 @@ SORT_COLUMNS = {
     "regression": "regression_percent",
     "reads": "shared_blocks_read",
     "cpu": "cpu_total_time_ms",
+    "waits": "wait_total_samples",
 }
 
 
@@ -98,6 +99,14 @@ def findings_for(row: Mapping[str, Any]) -> list[str]:
             findings.append(
                 "CPU payi dusuk; kalan sure bekleme veya I/O kaynakli olabilir ve wait telemetrisiyle ayrilmalidir."
             )
+    wait_samples = int(row.get("wait_total_samples") or 0)
+    wait_share = _as_float(row.get("dominant_wait_share_percent"))
+    if row.get("wait_sampling_data_available") and wait_samples >= 10 and wait_share >= 40:
+        category = str(row.get("dominant_wait_category") or "OTHER")
+        event = str(row.get("dominant_wait_event") or "unknown")
+        findings.append(
+            f"Orneklenen beklemelerin %{wait_share:.0f} kadari {category}/{event}; baskin wait kaniti incelenmeli."
+        )
     if not findings:
         findings.append("Belirgin bir risk esigi asilmadi; trend izlenmeli.")
     return findings
@@ -115,6 +124,31 @@ def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, A
         kcache_reason = (
             "CPU user/system ve filesystem I/O degerleri PoWA pg_stat_kcache gecmisinden gelir; "
             "paralel calismada toplam CPU suresi duvar saatini asabilir."
+        )
+    wait_available = bool(row.get("wait_sampling_available"))
+    wait_data_available = wait_available and bool(row.get("wait_sampling_data_available"))
+    wait_total_samples = int(row.get("wait_total_samples") or 0)
+    wait_share = _as_float(row.get("dominant_wait_share_percent"))
+    raw_wait_events = row.get("wait_events")
+    wait_events = list(raw_wait_events) if isinstance(raw_wait_events, list) else []
+    for event in wait_events:
+        if isinstance(event, dict):
+            event["sharePercent"] = round(
+                100.0 * int(event.get("samples") or 0) / wait_total_samples,
+                2,
+            ) if wait_total_samples else 0.0
+    if not wait_available:
+        wait_reason = "pg_wait_sampling bu kaynakta etkin degil."
+    elif not wait_data_available:
+        wait_reason = "pg_wait_sampling etkin, ancak collector hatti henuz ilk snapshot'i tamamlamadi."
+    elif wait_total_samples == 0:
+        wait_reason = (
+            "Collector hatti hazir; secili sorgu ve pencerede sampled wait yok. "
+            "Bu durum tek basina CPU darboğazi kaniti degildir."
+        )
+    else:
+        wait_reason = (
+            "Oranlar yalniz sampled wait dagilimini gosterir; CPU suresiyle veya duvar saatiyle toplanmaz."
         )
     return {
         "serverId": row["server_id"],
@@ -165,6 +199,37 @@ def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, A
                 if kcache_data_available and row.get("filesystem_writes_bytes") is not None
                 else None
             ),
+            "scoreIncluded": False,
+        },
+        "waits": {
+            "capability": {
+                "available": wait_available,
+                "version": row.get("wait_sampling_version"),
+                "release": "1.1.11",
+                "dataAvailable": wait_data_available,
+                "source": "PoWA pg_wait_sampling",
+                "coverage": "TOP_LEVEL_SAMPLED_WAITS",
+                "reason": wait_reason,
+            },
+            "totalSamples": wait_total_samples if wait_data_available else None,
+            "categories": {
+                "io": int(row.get("wait_io_samples") or 0),
+                "lock": int(row.get("wait_lock_samples") or 0),
+                "lwlock": int(row.get("wait_lwlock_samples") or 0),
+                "client": int(row.get("wait_client_samples") or 0),
+                "ipc": int(row.get("wait_ipc_samples") or 0),
+                "timeout": int(row.get("wait_timeout_samples") or 0),
+                "activity": int(row.get("wait_activity_samples") or 0),
+                "extension": int(row.get("wait_extension_samples") or 0),
+                "other": int(row.get("wait_other_samples") or 0),
+            } if wait_data_available else None,
+            "dominant": {
+                "category": row.get("dominant_wait_category"),
+                "event": row.get("dominant_wait_event"),
+                "sharePercent": round(wait_share, 2),
+                "confidence": "MEDIUM" if wait_total_samples >= 50 and wait_share >= 50 else "LOW",
+            } if wait_data_available and wait_total_samples >= 10 and row.get("dominant_wait_event") else None,
+            "events": wait_events if wait_data_available else [],
             "scoreIncluded": False,
         },
         "previousCalls": int(row.get("previous_calls") or 0),
@@ -592,6 +657,130 @@ class PowaRepository:
                 )
                 capability = dict(await cursor.fetchone())
         return rows, capability
+
+    async def join_evidence(
+        self,
+        *,
+        window: str,
+        server_id: int,
+        database_id: int,
+        query_id: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT *
+                    FROM advisor.join_predicate_metrics(
+                        %s::interval,
+                        %s::integer,
+                        %s::oid,
+                        %s::bigint
+                    )
+                    """,
+                    (interval, server_id, database_id, query_id),
+                )
+                rows = [dict(row) for row in await cursor.fetchall()]
+                await cursor.execute(
+                    "SELECT * FROM advisor.join_snapshot_capability(%s::integer)",
+                    (server_id,),
+                )
+                capability = dict(await cursor.fetchone())
+        return rows, capability
+
+    async def composite_candidates(
+        self,
+        *,
+        window: str,
+        server_id: int,
+        database_id: int,
+        query_id: int,
+    ) -> list[dict[str, Any]]:
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT *
+                    FROM advisor.composite_index_candidates(
+                        %s::interval,
+                        %s::integer,
+                        %s::oid,
+                        %s::bigint
+                    )
+                    """,
+                    (interval, server_id, database_id, query_id),
+                )
+                return [dict(row) for row in await cursor.fetchall()]
+
+    async def composite_candidate(
+        self,
+        *,
+        candidate_id: str,
+        server_id: int,
+        database_id: int,
+        query_id: int,
+        window: str,
+    ) -> dict[str, Any] | None:
+        rows = await self.composite_candidates(
+            window=window,
+            server_id=server_id,
+            database_id=database_id,
+            query_id=query_id,
+        )
+        return next(
+            (row for row in rows if str(row["candidate_id"]) == candidate_id),
+            None,
+        )
+
+    async def runtime_replay_fixture_status(
+        self,
+        *,
+        candidate_ids: list[str],
+        server_id: int,
+        database_id: int,
+        query_id: int,
+        normalized_sql: str,
+    ) -> set[str]:
+        if not candidate_ids:
+            return set()
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT candidate_id
+                    FROM advisor.runtime_replay_fixture_status(
+                        %s::uuid[], %s::integer, %s::oid, %s::bigint, %s::text
+                    )
+                    WHERE available
+                    """,
+                    (candidate_ids, server_id, database_id, query_id, normalized_sql),
+                )
+                return {str(row["candidate_id"]) for row in await cursor.fetchall()}
+
+    async def runtime_replay_fixture(
+        self,
+        *,
+        candidate_id: str,
+        server_id: int,
+        database_id: int,
+        query_id: int,
+        normalized_sql: str,
+    ) -> dict[str, Any] | None:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT *
+                    FROM advisor.runtime_replay_fixture(
+                        %s::uuid, %s::integer, %s::oid, %s::bigint, %s::text
+                    )
+                    """,
+                    (candidate_id, server_id, database_id, query_id, normalized_sql),
+                )
+                row = await cursor.fetchone()
+                return None if row is None else dict(row)
 
     async def annotate(
         self,

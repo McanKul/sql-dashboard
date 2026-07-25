@@ -32,6 +32,7 @@ import {
 import { advisorApi, ApiClientError, demoModeEnabled } from './api'
 import type {
   ApiList,
+  CompositeIndexCandidate,
   DatabaseOption,
   OperationsData,
   OverviewStats,
@@ -368,7 +369,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
     <section className="page-section" aria-labelledby="queries-title">
       <PageHeading eyebrow={`Sorgu envanteri · ${windowLabels[window]}`} title="Etkiyi bulun, nedeni anlayın" description={`${formatNumber(state.data?.total || 0)} benzersiz sorgu; repository telemetrisiyle sunucu tarafında filtrelenir.`} />
 
-      <ReadingGuide>Etki puanı seçili penceredeki diğer sorgulara göre inceleme önceliğini gösterir. Ham DB yükü, gerçek CPU, süre, blok, temp ve WAL değerlerini birlikte okuyun; göreli puan tek başına mutlak bir sorun kanıtı değildir.</ReadingGuide>
+      <ReadingGuide>Etki puanı seçili penceredeki diğer sorgulara göre inceleme önceliğini gösterir. DB yükü, gerçek CPU ve sampled wait dağılımını birlikte okuyun; CPU süresi ile wait örnekleri aynı paydada toplanmaz.</ReadingGuide>
 
       <div className="query-toolbar query-toolbar-expanded" role="search" onKeyDown={(event) => { if (event.key === 'Enter' && (event.target as HTMLElement).tagName === 'INPUT') applyFilters() }}>
         <label className="search-field"><Search size={18} aria-hidden="true" /><span className="sr-only">Sorgularda ara</span><input value={draft.search || ''} onChange={(event) => setDraft((value) => ({ ...value, search: event.target.value || undefined }))} placeholder="SQL veya sorgu kimliği ara…" /></label>
@@ -377,7 +378,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
         <label className="select-field"><CircleDot size={15} /><span className="sr-only">Öncelik</span><select value={draft.priority || ''} onChange={(event) => setDraft((value) => ({ ...value, priority: event.target.value || undefined }))}><option value="">Tüm öncelikler</option><option value="CRITICAL">Kritik</option><option value="HIGH">Yüksek</option><option value="MEDIUM">Orta</option><option value="LOW">Düşük</option></select><ChevronDown size={14} /></label>
         <label className="number-field"><span>Min. çağrı</span><input type="number" min="0" value={draft.minCalls ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minCalls: event.target.value ? Number(event.target.value) : undefined }))} /></label>
         <label className="number-field"><span>Min. toplam süre</span><input type="number" min="0" step="10" value={draft.minDurationMs ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minDurationMs: event.target.value ? Number(event.target.value) : undefined }))} /><small>ms</small></label>
-        <label className="select-field sort-field"><span>Sırala:</span><select value={draft.sort || 'impact'} onChange={(event) => setDraft((value) => ({ ...value, sort: event.target.value as QueryListParams['sort'] }))}><option value="impact">Etki</option><option value="totalTime">Toplam süre</option><option value="meanTime">Ortalama süre</option><option value="cpu">Gerçek CPU</option><option value="calls">Çağrı</option><option value="reads">Fiziksel okuma</option><option value="regression">Regresyon</option></select><ChevronDown size={14} /></label>
+        <label className="select-field sort-field"><span>Sırala:</span><select value={draft.sort || 'impact'} onChange={(event) => setDraft((value) => ({ ...value, sort: event.target.value as QueryListParams['sort'] }))}><option value="impact">Etki</option><option value="totalTime">Toplam süre</option><option value="meanTime">Ortalama süre</option><option value="cpu">Gerçek CPU</option><option value="waits">Wait örneği</option><option value="calls">Çağrı</option><option value="reads">Fiziksel okuma</option><option value="regression">Regresyon</option></select><ChevronDown size={14} /></label>
         <button type="button" className="primary-button filter-button" onClick={applyFilters}>Uygula</button>
       </div>
 
@@ -387,7 +388,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
         <div className="query-table-card">
           <table className="query-table query-metrics-table">
             <caption className="sr-only">Analiz edilen PostgreSQL sorguları ve ham performans metrikleri</caption>
-            <thead><tr><th scope="col">Sorgu</th><th scope="col">İnceleme puanı</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Gerçek CPU</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
+            <thead><tr><th scope="col">Sorgu</th><th scope="col">İnceleme puanı</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Gerçek CPU</th><th scope="col">Baskın wait</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
             <tbody>
               {state.data.items.map((query) => (
                 <tr key={query.id} onClick={() => onOpenQuery(query.id)}>
@@ -398,6 +399,11 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
                   <td>{query.cpu.capability.dataAvailable && query.cpu.totalTimeMs !== null
                     ? <><strong className="tabular">{formatDuration(query.cpu.totalTimeMs)}</strong><small>%{formatNumber(query.cpu.percentOfExecTime ?? 0)} DB süresi</small></>
                     : <><strong>—</strong><small>{query.cpu.capability.available ? 'veri birikiyor' : 'kcache kapalı'}</small></>}</td>
+                  <td>{query.waits.capability.dataAvailable
+                    ? query.waits.dominant
+                      ? <><strong>{query.waits.dominant.category}</strong><small>{query.waits.dominant.event} · %{formatNumber(query.waits.dominant.sharePercent)}</small></>
+                      : <><strong>Wait yok</strong><small>{formatLargeNumber(query.waits.totalSamples ?? 0)} örnek</small></>
+                    : <><strong>—</strong><small>{query.waits.capability.available ? 'veri birikiyor' : 'waits kapalı'}</small></>}</td>
                   <td><strong className="tabular">{formatLargeNumber(query.sharedBlocksRead)} okuma</strong><small>{formatLargeNumber(query.sharedBlocksHit)} cache hit</small></td>
                   <td><strong className="tabular">{formatLargeNumber(query.tempBlocksWritten)} temp blok</strong><small>{formatBytes(query.walBytes)} WAL</small></td>
                   <td><strong className="tabular">{formatLargeNumber(query.calls)} çağrı</strong>{query.hasComparison
@@ -535,6 +541,57 @@ function PredicateIndexEvaluation({
   )
 }
 
+function compositeOrderingLabel(rule: CompositeIndexCandidate['orderingRule']): string {
+  return {
+    SELECTIVE_EQUALITY_FILTER_THEN_JOIN: 'Seçici eşitlik filtresi → JOIN kolonu',
+    EQUALITY_JOIN_THEN_FILTER: 'JOIN kolonu → eşitlik filtresi',
+    EQUALITY_JOIN_THEN_RANGE_FILTER: 'JOIN kolonu → range filtresi',
+  }[rule]
+}
+
+export function CompositeIndexEvaluation({
+  candidate,
+  state,
+  copied,
+  onEvaluate,
+  onCopy,
+}: {
+  candidate: CompositeIndexCandidate
+  state?: Loadable<QueryIndexAdvice>
+  copied: boolean
+  onEvaluate: () => void
+  onCopy: (statement: string) => void
+}) {
+  const advice = state?.data
+  return (
+    <div className="predicate-item review composite-candidate">
+      <div className="predicate-item-heading">
+        <div><strong>{candidate.schemaName}.{candidate.tableName}</strong><span>{candidate.columns.join(' → ')}</span></div>
+        <SeverityBadge severity={candidate.confidence === 'HIGH' ? 'healthy' : 'warning'} label={`${candidate.confidence === 'HIGH' ? 'Yüksek' : 'Orta'} kanıt`} />
+      </div>
+      <div className="predicate-metrics">
+        <div><span>JOIN gözlemi</span><strong>{formatLargeNumber(candidate.joinOccurrences)}</strong></div>
+        <div><span>WHERE gözlemi</span><strong>{formatLargeNumber(candidate.filterOccurrences)}</strong></div>
+        <div><span>Eleme oranı</span><strong>{candidate.filterRatio == null ? '—' : `%${formatNumber(candidate.filterRatio * 100)}`}</strong></div>
+        <div><span>Snapshot</span><strong>{formatLargeNumber(candidate.sampleCount)}</strong></div>
+      </div>
+      <div className="predicate-recommendation"><Network size={16} /><div><strong>Kolon sırası</strong><span>{compositeOrderingLabel(candidate.orderingRule)}</span></div></div>
+      {!state && <div className="index-evaluation-start"><div><strong>Önce canlı katalog + HypoPG kontrolü</strong><span>Mevcut index prefix’i ve planner maliyeti salt-okunur doğrulanır.</span></div><button type="button" className="hypopg-button" onClick={onEvaluate}><Sparkles size={15} /> Composite adayı doğrula</button></div>}
+      {state?.status === 'loading' && <div className="index-evaluation-loading"><LoaderCircle className="spin" size={17} /> Composite baseline ve sanal plan karşılaştırılıyor…</div>}
+      {state?.status === 'error' && <div className="index-evaluation-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
+      {state?.status === 'success' && advice && <div className={`index-evaluation-result ${advice.status.toLowerCase()}`}>
+        <div className="index-evaluation-status">{advice.status === 'VALIDATED' ? <CheckCircle2 size={18} /> : <Info size={18} />}<div><strong>{indexAdviceLabel(advice.status)}</strong><span>{advice.message}</span></div></div>
+        {advice.validation && <div className="index-plan-metrics"><div><span>Başlangıç cost</span><strong>{formatNumber(advice.validation.baselineTotalCost)}</strong></div><div><span>Composite cost</span><strong>{formatNumber(advice.validation.hypotheticalTotalCost)}</strong></div><div><span>Tahmini düşüş</span><strong>%{formatNumber(advice.validation.costReductionPercent)}</strong></div><div><span>Tahmini boyut</span><strong>{formatBytes(advice.validation.estimatedIndexSizeBytes)}</strong></div></div>}
+        {advice.status === 'VALIDATED' && advice.candidate && <><div className="index-sql-heading"><div><strong>Kopyalanabilir composite SQL</strong><span>Uygulama kaynakta DDL çalıştırmadı.</span></div><button type="button" className="copy-sql-button" onClick={() => onCopy(advice.candidate!.createIndexSql)}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'SQL’i kopyala'}</button></div><pre className="index-sql"><code>{advice.candidate.createIndexSql}</code></pre></>}
+        <small className="ddl-safety-note"><ShieldAlert size={13} /> ddlExecuted=false</small>
+      </div>}
+      {advice?.status === 'VALIDATED' && (candidate.runtimeFixtureAvailable
+        ? <div className="index-evaluation-start runtime-validation-start"><div><strong>Operator doğrulamasına hazır</strong><span>Replay fixture onaylı. Browser admin secret’ı taşımaz; disposable clone testi yalnız server-side token kullanan operator API/CLI akışından başlatılır.</span></div><button type="button" className="hypopg-button" disabled><ShieldAlert size={15} /> Operator API</button></div>
+        : <div className="index-evaluation-start runtime-validation-start"><div><strong>Replay fixture gerekli</strong><span>Normalize bind değerleri saklanmaz. DBA bu sorgu ve aday için sentetik/anonymize fixture onayladığında operator API akışı açılır.</span></div><button type="button" className="hypopg-button" disabled><ShieldAlert size={15} /> Fixture yok</button></div>)}
+    </div>
+  )
+}
+
 function QueryDetailModal({ queryId, window, onClose }: { queryId: string; window: TimeWindow; onClose: () => void }) {
   const [state, setState] = useState<Loadable<QueryDetail>>({ status: 'loading' })
   const [copied, setCopied] = useState(false)
@@ -587,6 +644,20 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
       setIndexAdvice((current) => ({
         ...current,
         [key]: { status: 'error', error: error instanceof Error ? error.message : 'HypoPG doğrulaması alınamadı.' },
+      }))
+    }
+  }
+
+  const evaluateCompositeIndex = async (candidate: CompositeIndexCandidate) => {
+    const key = `composite:${candidate.candidateId}`
+    setIndexAdvice((current) => ({ ...current, [key]: { status: 'loading' } }))
+    try {
+      const { data } = await advisorApi.evaluateCompositeIndex(queryId, window, candidate)
+      setIndexAdvice((current) => ({ ...current, [key]: { status: 'success', data } }))
+    } catch (error: unknown) {
+      setIndexAdvice((current) => ({
+        ...current,
+        [key]: { status: 'error', error: error instanceof Error ? error.message : 'Composite HypoPG doğrulaması alınamadı.' },
       }))
     }
   }
@@ -665,6 +736,29 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                   )}
                 </article>
 
+                <article className="detail-card wait-card">
+                  <div className="detail-card-heading"><div><span className="panel-kicker">pg_wait_sampling {state.data.waits.capability.release}</span><h2>Sampled wait profili</h2></div><span className="simulation-label"><Clock3 size={14} /> Skora dahil değil</span></div>
+                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.waits.capability.reason}</span></div>
+                  {!state.data.waits.capability.available ? (
+                    <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>Wait telemetrisi kapalı</strong><p>Kaynakta pg_wait_sampling preload, extension ve PoWA datasource kaydı gerekir.</p></div></div>
+                  ) : !state.data.waits.capability.dataAvailable ? (
+                    <div className="predicate-empty"><Clock3 size={20} /><div><strong>Wait hattı hazırlanıyor</strong><p>Collector ilk snapshot'ı tamamladığında sıfır wait ile veri yokluğu ayrılacaktır.</p></div></div>
+                  ) : !state.data.waits.totalSamples ? (
+                    <div className="predicate-empty"><CheckCircle2 size={20} /><div><strong>Sampled wait görülmedi</strong><p>Bu tek başına CPU darboğazı kanıtı değildir; kcache CPU oranıyla birlikte okuyun.</p></div></div>
+                  ) : (
+                    <>
+                      <div className="cpu-metric-grid">
+                        <div><span>Toplam wait örneği</span><strong>{formatLargeNumber(state.data.waits.totalSamples)}</strong><small>duvar saati değildir</small></div>
+                        <div><span>Baskın kategori</span><strong>{state.data.waits.dominant?.category || 'Karışık'}</strong><small>{state.data.waits.dominant ? `%${formatNumber(state.data.waits.dominant.sharePercent)} wait dağılımı` : 'düşük örnek'}</small></div>
+                        <div><span>Baskın event</span><strong>{state.data.waits.dominant?.event || '—'}</strong><small>{state.data.waits.dominant?.confidence === 'MEDIUM' ? 'orta kanıt' : 'düşük kanıt'}</small></div>
+                      </div>
+                      <div className="wait-event-list">
+                        {state.data.waits.events.slice(0, 8).map((event) => <div key={`${event.eventType}:${event.event}`}><span>{event.category} · {event.event}</span><strong>{formatLargeNumber(event.samples)} · %{formatNumber(event.sharePercent)}</strong></div>)}
+                      </div>
+                    </>
+                  )}
+                </article>
+
                 <article className="detail-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">Advisor bulguları</span><h2>Neden öncelikli?</h2></div><span className="finding-count">{state.data.findings.length} bulgu</span></div>
                   <div className="findings-list">
@@ -714,6 +808,31 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                   ) : (
                     <div className="predicate-empty"><Info size={20} /><div><strong>Bu pencerede predicate örneği yok</strong><p>Sorgu yeniden çalışıp collector snapshot aldığında bu alan otomatik dolar.</p></div></div>
                   )}
+                </article>
+
+                <article className="detail-card predicate-card">
+                  <div className="detail-card-heading">
+                    <div><span className="panel-kicker">JOIN snapshotter · reset boundary</span><h2>JOIN ilişkileri ve composite index adayları</h2></div>
+                    <span className="finding-count">{state.data.predicates.joins.length} JOIN · {state.data.predicates.candidates.length} aday</span>
+                  </div>
+                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.predicates.joinCapability.reason} JOIN ve aday kanıtları skora dahil değildir; hiçbir DDL kaynakta otomatik çalışmaz.</span></div>
+                  {!state.data.predicates.joinCapability.available ? (
+                    <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>JOIN snapshotter kapalı</strong><p>Kaynak outbox ve düşük yetkili snapshotter servisini etkinleştirin.</p></div></div>
+                  ) : <>
+                    {state.data.predicates.joins.length ? <div className="predicate-list join-list">
+                      {state.data.predicates.joins.map((join) => <div className={`predicate-item ${join.signal.toLowerCase()}`} key={`${join.qualNodeId}:${join.leftRelationId}:${join.rightRelationId}`}>
+                        <div className="predicate-item-heading"><div><strong>{join.leftSchemaName}.{join.leftTableName}.{join.leftColumnName}</strong><span>{join.operatorName || `operator ${join.operatorOid}`} → {join.rightSchemaName}.{join.rightTableName}.{join.rightColumnName}</span></div><SeverityBadge severity={join.signal === 'FREQUENT_JOIN' ? 'healthy' : 'warning'} label={join.signal === 'FREQUENT_JOIN' ? 'Sık JOIN' : join.signal === 'OBSERVED_JOIN' ? 'JOIN gözlendi' : 'Yetersiz örnek'} /></div>
+                        <div className="predicate-metrics"><div><span>Örneklenen çalışma</span><strong>{formatLargeNumber(join.occurrences)}</strong></div><div><span>İşlenen satır</span><strong>{formatLargeNumber(join.rowsProcessed)}</strong></div><div><span>Snapshot</span><strong>{formatLargeNumber(join.sampleCount)}</strong></div><div><span>B-tree stratejisi</span><strong>{join.btreeStrategy ?? '—'}</strong></div></div>
+                        <small className="predicate-footnote">qualnode {join.qualNodeId} · scoreIncluded=false</small>
+                      </div>)}
+                    </div> : <div className="predicate-empty"><Info size={20} /><div><strong>Bu sorgu için JOIN örneği yok</strong><p>Bu sonuç sorguda JOIN olmadığını kanıtlamaz; örnekleme ve pencere kapsamını da kontrol edin.</p></div></div>}
+                    {state.data.predicates.candidates.length > 0 && <div className="predicate-list composite-list">
+                      {state.data.predicates.candidates.map((candidate) => {
+                        const key = `composite:${candidate.candidateId}`
+                        return <CompositeIndexEvaluation key={candidate.candidateId} candidate={candidate} state={indexAdvice[key]} copied={copiedIndexKey === key} onEvaluate={() => evaluateCompositeIndex(candidate)} onCopy={(statement) => copyIndexSql(key, statement)} />
+                      })}
+                    </div>}
+                  </>}
                 </article>
 
                 <article className="detail-card comparison-card">

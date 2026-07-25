@@ -22,13 +22,14 @@ PoWA:
   --frequency SECONDS         Snapshot araligi; varsayilan: 60, minimum: 5
   --coalesce COUNT            Arsiv birlestirme araligi; varsayilan: 100, minimum: 5
   --retention INTERVAL        PostgreSQL interval; varsayilan: "90 days"
-  pg_qualstats + kcache      Iterasyon 2.3'te zorunlu datasource'lar
+  qualstats+kcache+waits     Iterasyon 2.4'te zorunlu datasource'lar
 
 Kaynak hazirlama (opsiyonel):
   --prepare                   Monitoring DB, rol, extension ve grant'lari uygula
   --admin-user USER           Varsayilan: postgres
   --admin-database DB         Varsayilan: postgres
   --admin-password-file FILE  Kaynak DBA parola dosyasi
+  --join-password-file FILE   advisor_join_reader icin ayri 0600 parola dosyasi
 
 Diger:
   --env-file FILE             config/source.env.example biciminde config
@@ -71,7 +72,7 @@ if [[ -n "$config_file" ]]; then
     config_key="${config_line%%=*}"
     config_value="${config_line#*=}"
     case "$config_key" in
-      SOURCE_ALIAS|SOURCE_HOST|SOURCE_PORT|SOURCE_MONITORING_DB|SOURCE_COLLECTOR_USER|SOURCE_PASSWORD_FILE|SOURCE_FREQUENCY|SOURCE_COALESCE|SOURCE_RETENTION|PREPARE_SOURCE|SOURCE_ADMIN_USER|SOURCE_ADMIN_DB|SOURCE_ADMIN_PASSWORD_FILE)
+      SOURCE_ALIAS|SOURCE_HOST|SOURCE_PORT|SOURCE_MONITORING_DB|SOURCE_COLLECTOR_USER|SOURCE_PASSWORD_FILE|SOURCE_FREQUENCY|SOURCE_COALESCE|SOURCE_RETENTION|PREPARE_SOURCE|SOURCE_ADMIN_USER|SOURCE_ADMIN_DB|SOURCE_ADMIN_PASSWORD_FILE|SOURCE_JOIN_PASSWORD_FILE)
         if [[ -z "${!config_key+x}" ]]; then
           printf -v "$config_key" '%s' "$config_value"
         fi
@@ -96,6 +97,8 @@ admin_user="${SOURCE_ADMIN_USER:-postgres}"
 admin_db="${SOURCE_ADMIN_DB:-postgres}"
 admin_password_file="${SOURCE_ADMIN_PASSWORD_FILE:-}"
 admin_password="${SOURCE_ADMIN_PASSWORD:-}"
+join_password_file="${SOURCE_JOIN_PASSWORD_FILE:-}"
+join_password="${SOURCE_JOIN_PASSWORD:-}"
 password_stdin=false
 skip_snapshot_wait=false
 
@@ -116,6 +119,7 @@ while (($#)); do
     --admin-user) admin_user="${2:?--admin-user degeri eksik}"; shift 2 ;;
     --admin-database) admin_db="${2:?--admin-database degeri eksik}"; shift 2 ;;
     --admin-password-file) admin_password_file="${2:?--admin-password-file degeri eksik}"; shift 2 ;;
+    --join-password-file) join_password_file="${2:?--join-password-file degeri eksik}"; shift 2 ;;
     --skip-snapshot-wait) skip_snapshot_wait=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Bilinmeyen arguman: $1" ;;
@@ -165,6 +169,12 @@ if [[ "$prepare_source" == true ]]; then
   fi
   [[ -n "$admin_password" ]] || fail "Admin parolasi bos olamaz"
   [[ "$admin_password" != *$'\n'* && "$admin_password" != *$'\r'* ]] || fail "Admin parolasi satir sonu iceremez"
+  if [[ -n "$join_password_file" ]]; then
+    [[ -f "$join_password_file" && -r "$join_password_file" ]] || fail "JOIN reader parola dosyasi okunamiyor: ${join_password_file}"
+    IFS= read -r join_password < "$join_password_file" || true
+  fi
+  [[ -n "$join_password" ]] || fail "--prepare icin --join-password-file veya SOURCE_JOIN_PASSWORD gerekli"
+  [[ "$join_password" != *$'\n'* && "$join_password" != *$'\r'* ]] || fail "JOIN reader parolasi satir sonu iceremez"
 fi
 
 case "$source_host" in
@@ -201,14 +211,16 @@ trap - EXIT
 info "Collector credential Git-disindaki 0600 dosyaya yazildi: ${secret_path}"
 
 if [[ "$prepare_source" == true ]]; then
-  # Iki parola stdin ile container'a gider; docker argumanlarina veya repository'ye yazilmaz.
+  # Uc parola stdin ile container'a gider; docker argumanlarina veya repository'ye yazilmaz.
   {
     printf '%s\n' "$admin_password"
     printf '%s\n' "$source_password"
+    printf '%s\n' "$join_password"
   } | docker compose exec -T repository-db bash -c '
     set -Eeuo pipefail
     IFS= read -r admin_password
     IFS= read -r collector_password
+    IFS= read -r join_reader_password
     umask 077
     pgpass="$(mktemp /tmp/advisor-source-admin.XXXXXX)"
     trap '\''rm -f "$pgpass"'\'' EXIT
@@ -219,12 +231,15 @@ if [[ "$prepare_source" == true ]]; then
     export PGPASSFILE="$pgpass"
     export PGSSLMODE="${POWA_SOURCE_SSLMODE:-prefer}"
     export ADVISOR_SOURCE_COLLECTOR_PASSWORD="$collector_password"
+    export ADVISOR_SOURCE_JOIN_PASSWORD="$join_reader_password"
     psql -X --set=ON_ERROR_STOP=1 \
       --host "$1" --port "$2" --username "$3" --dbname "$4" \
       --set=monitoring_db="$5" --set=collector_user="$6" \
+      --set=join_reader_user=advisor_join_reader \
       --file /opt/advisor/sql/002_prepare_remote_source.sql
   ' _ "$source_host" "$source_port" "$admin_user" "$admin_db" "$monitoring_db" "$collector_user"
   unset admin_password
+  unset join_password
   info "Kaynak monitoring DB, collector rolu, extension ve grant'lar hazir"
 fi
 
@@ -245,12 +260,21 @@ probe="$({ printf '%s\n' "$source_password"; } | docker compose exec -T reposito
             EXISTS (SELECT 1 FROM pg_extension WHERE extname = '\''pg_stat_statements'\''),
             (SELECT extversion FROM pg_extension WHERE extname = '\''pg_qualstats'\''),
             (SELECT extversion FROM pg_extension WHERE extname = '\''pg_stat_kcache'\''),
+            (SELECT extversion FROM pg_extension WHERE extname = '\''pg_wait_sampling'\''),
             pg_has_role(current_user, '\''pg_read_all_stats'\'', '\''member'\''),
             pg_has_role(current_user, '\''powa_snapshot'\'', '\''member'\''),
             (SELECT count(*) >= 0 FROM pg_stat_statements),
             (SELECT count(*) >= 0 FROM \"PoWA\".powa_qualstats_src(0)),
             (SELECT count(*) >= 0 FROM \"PoWA\".powa_kcache_src(0)),
-            COALESCE((
+            (SELECT count(*) >= 0 FROM \"PoWA\".powa_wait_sampling_src(0)),
+            current_setting('\''pg_wait_sampling.profile_period'\'')::integer = 10
+              AND current_setting('\''pg_wait_sampling.profile_pid'\'') = '\''off'\''
+              AND current_setting('\''pg_wait_sampling.profile_queries'\'') = '\''top'\''
+              AND current_setting('\''pg_wait_sampling.sample_cpu'\'') = '\''off'\'',
+            COALESCE(has_function_privilege(
+              current_user, 'advisor_join.capture_and_reset()', 'EXECUTE'
+            ), false),
+            NOT COALESCE((
               SELECT has_function_privilege(
                        current_user,
                        format('\''%I.pg_qualstats_reset()'\'', n.nspname),
@@ -262,11 +286,11 @@ probe="$({ printf '%s\n' "$source_password"; } | docker compose exec -T reposito
             ), false);"
 ' _ "$source_host" "$source_port" "$monitoring_db" "$collector_user")" || fail "Collector roluyle kaynak preflight basarisiz. --prepare kullanin veya docs/INSTALLATION.md adimlarini uygulayin."
 
-IFS='|' read -r powa_version pgss_ready pgqs_version pgsk_version read_stats snapshot_role pgss_callable pgqs_source_ready pgsk_source_ready pgqs_reset_ready <<< "$probe"
+IFS='|' read -r powa_version pgss_ready pgqs_version pgsk_version pgws_version read_stats snapshot_role pgss_callable pgqs_source_ready pgsk_source_ready pgws_source_ready wait_gucs_ready join_capture_ready direct_reset_revoked <<< "$probe"
 [[ "$powa_version" =~ ^([4-9]|[1-9][0-9]+)\. ]] || fail "Kaynak PoWA 4+ olmali; bulunan: ${powa_version:-yok}"
-[[ "$pgss_ready" == t && "$pgqs_version" =~ ^2\.1\. && "$pgsk_version" =~ ^2\.3\. && "$read_stats" == t && "$snapshot_role" == t && "$pgss_callable" == t && "$pgqs_source_ready" == t && "$pgsk_source_ready" == t && "$pgqs_reset_ready" == t ]] \
-  || fail "Kaynak preflight eksik: pgss=${pgss_ready}, pg_qualstats=${pgqs_version:-yok}, pg_stat_kcache=${pgsk_version:-yok}, read_stats=${read_stats}, powa_snapshot=${snapshot_role}, pgss_callable=${pgss_callable}, pgqs_source=${pgqs_source_ready}, kcache_source=${pgsk_source_ready}, pgqs_reset=${pgqs_reset_ready}"
-info "Kaynak preflight gecti (PoWA ${powa_version}, pg_qualstats ${pgqs_version}, pg_stat_kcache ${pgsk_version})"
+[[ "$pgss_ready" == t && "$pgqs_version" =~ ^2\.1\. && "$pgsk_version" =~ ^2\.3\. && "$pgws_version" == "1.1" && "$read_stats" == t && "$snapshot_role" == t && "$pgss_callable" == t && "$pgqs_source_ready" == t && "$pgsk_source_ready" == t && "$pgws_source_ready" == t && "$wait_gucs_ready" == t && "$join_capture_ready" == t && "$direct_reset_revoked" == t ]] \
+  || fail "Kaynak preflight eksik: pgss=${pgss_ready}, pg_qualstats=${pgqs_version:-yok}, pg_stat_kcache=${pgsk_version:-yok}, pg_wait_sampling=${pgws_version:-yok}, wait_gucs=${wait_gucs_ready}, read_stats=${read_stats}, powa_snapshot=${snapshot_role}, pgss_callable=${pgss_callable}, pgqs_source=${pgqs_source_ready}, kcache_source=${pgsk_source_ready}, waits_source=${pgws_source_ready}, join_capture=${join_capture_ready}, direct_reset_revoked=${direct_reset_revoked}"
+info "Kaynak preflight gecti (PoWA ${powa_version}, pg_qualstats ${pgqs_version}, pg_stat_kcache ${pgsk_version}, pg_wait_sampling release 1.1.11/ext ${pgws_version})"
 
 repo_psql=(docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 --dbname powa_repository --tuples-only --no-align)
 repo_query() {
@@ -302,6 +326,8 @@ if [[ -n "$alias_id" ]]; then
   [[ "$activation_ok" == t ]] || fail "Mevcut PoWA kaydinda pg_qualstats etkinlestirilemedi"
   activation_ok="$(repo_query 'SELECT "PoWA".powa_activate_extension(:'"'"'server_id'"'"'::integer, '"'"'pg_stat_kcache'"'"');' --set=server_id="$alias_id")"
   [[ "$activation_ok" == t ]] || fail "Mevcut PoWA kaydinda pg_stat_kcache etkinlestirilemedi"
+  activation_ok="$(repo_query 'SELECT "PoWA".powa_activate_extension(:'"'"'server_id'"'"'::integer, '"'"'pg_wait_sampling'"'"');' --set=server_id="$alias_id")"
+  [[ "$activation_ok" == t ]] || fail "Mevcut PoWA kaydinda pg_wait_sampling etkinlestirilemedi"
   server_id="$alias_id"
   info "Mevcut PoWA server id ${server_id} idempotent olarak guncellendi"
 else
@@ -311,13 +337,26 @@ else
         alias => :'"'"'source_alias'"'"', username => :'"'"'collector_user'"'"', password => NULL,
         dbname => :'"'"'monitoring_db'"'"', frequency => :'"'"'frequency'"'"'::integer,
         powa_coalesce => :'"'"'coalesce'"'"'::integer, retention => :'"'"'retention'"'"'::interval,
-        allow_ui_connection => false, extensions => ARRAY['"'"'pg_qualstats'"'"', '"'"'pg_stat_kcache'"'"']::text[]);' \
+        allow_ui_connection => false, extensions => ARRAY['"'"'pg_qualstats'"'"', '"'"'pg_stat_kcache'"'"', '"'"'pg_wait_sampling'"'"']::text[]);' \
     --set=source_host="$source_host" --set=source_port="$source_port" --set=source_alias="$source_alias" \
     --set=collector_user="$collector_user" --set=monitoring_db="$monitoring_db" --set=frequency="$frequency" \
     --set=coalesce="$coalesce" --set=retention="$retention"
   server_id="$(repo_query 'SELECT id FROM "PoWA".powa_servers WHERE alias = :'"'"'source_alias'"'"';' --set=source_alias="$source_alias")"
   info "Yeni PoWA server id ${server_id} kaydedildi"
 fi
+
+wait_retention_ok="$(repo_query 'UPDATE "PoWA".powa_extension_config
+                                    SET retention = interval '\''30 days'\''
+                                  WHERE srvid = :'"'"'server_id'"'"'::integer
+                                    AND extname = '\''pg_wait_sampling'\''
+                                    AND retention IS DISTINCT FROM interval '\''30 days'\'';
+                                 SELECT retention = interval '\''30 days'\''
+                                   FROM "PoWA".powa_extension_config
+                                  WHERE srvid = :'"'"'server_id'"'"'::integer
+                                    AND extname = '\''pg_wait_sampling'\'';' \
+  --quiet --set=server_id="$server_id")"
+[[ "$wait_retention_ok" == t ]] || fail "pg_wait_sampling retention 30 gun olarak ayarlanamadi"
+info "pg_wait_sampling extension retention 30 gun"
 
 password_is_null="$(repo_query 'SELECT password IS NULL FROM "PoWA".powa_servers WHERE id = :'"'"'server_id'"'"'::integer;' --set=server_id="$server_id")"
 [[ "$password_is_null" == t ]] || fail "Guvenlik kontrolu: repository kaynak parolasi NULL degil"

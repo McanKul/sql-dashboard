@@ -58,13 +58,13 @@ repo_data_directory="$(docker compose exec -T repository-db psql -U postgres -p 
   || fail "Repository PG18 data directory hatali: ${repo_data_directory}"
 pass "Iki PostgreSQL instance PG18 ve kalici data directory duzeni dogru"
 
-expected_pg_image="postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-hypopg-1.4.3"
+expected_pg_image="postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-waits-1.1.11-hypopg-1.4.3"
 source_pg_image="$(docker inspect --format '{{.Config.Image}}' "$(docker compose ps -q source-db)")"
 repository_pg_image="$(docker inspect --format '{{.Config.Image}}' "$(docker compose ps -q repository-db)")"
 [[ "$source_pg_image" == "$expected_pg_image" ]] \
-  || fail "Kaynak image PG18 + HypoPG 1.4.3 degil: ${source_pg_image}"
+  || fail "Kaynak image PG18 + pg_wait_sampling 1.1.11 + HypoPG 1.4.3 degil: ${source_pg_image}"
 [[ "$repository_pg_image" == "$expected_pg_image" ]] \
-  || fail "Repository image PG18 + HypoPG 1.4.3 degil: ${repository_pg_image}"
+  || fail "Repository image PG18 + pg_wait_sampling 1.1.11 + HypoPG 1.4.3 degil: ${repository_pg_image}"
 source_hypopg_available="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SELECT EXISTS (SELECT 1 FROM pg_available_extension_versions WHERE name = 'hypopg' AND version = '1.4.3')")"
 repository_hypopg_available="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
@@ -73,15 +73,21 @@ repository_hypopg_available="$(docker compose exec -T repository-db psql -U post
   || fail "Kaynak image icinde HypoPG 1.4.3 extension artifact'i yok"
 [[ "$repository_hypopg_available" == "t" ]] \
   || fail "Repository image icinde HypoPG 1.4.3 extension artifact'i yok"
-pass "Kaynak ve repository image'lari PG18 + HypoPG 1.4.3 olarak sabit"
+source_wait_sampling_available="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
+  "SELECT EXISTS (SELECT 1 FROM pg_available_extension_versions WHERE name = 'pg_wait_sampling' AND version = '1.1')")"
+repository_wait_sampling_available="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
+  "SELECT EXISTS (SELECT 1 FROM pg_available_extension_versions WHERE name = 'pg_wait_sampling' AND version = '1.1')")"
+[[ "$source_wait_sampling_available" == "t" && "$repository_wait_sampling_available" == "t" ]] \
+  || fail "Image'larda pg_wait_sampling extension 1.1 artifact'i yok: source=${source_wait_sampling_available}, repo=${repository_wait_sampling_available}"
+pass "Kaynak ve repository image'lari PG18 + pg_wait_sampling 1.1.11 + HypoPG 1.4.3 olarak sabit"
 
 source_ext="$(docker compose exec -T source-db psql -U postgres -d powa -Atqc \
-  "SELECT string_agg(extname || '=' || extversion, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('powa','pg_stat_statements','pg_qualstats','pg_stat_kcache','btree_gist')")"
+  "SELECT string_agg(extname || '=' || extversion, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('powa','pg_stat_statements','pg_qualstats','pg_stat_kcache','pg_wait_sampling','btree_gist')")"
 repo_ext="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
   "SELECT string_agg(extname || '=' || extversion, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('powa','pg_stat_statements','btree_gist')")"
-[[ "$source_ext" == *"powa=5.2.0"* && "$source_ext" == *"pg_stat_statements="* && "$source_ext" == *"pg_qualstats=2.1.4"* && "$source_ext" == *"pg_stat_kcache=2.3.2"* ]] || fail "Kaynak extension seti eksik: ${source_ext}"
+[[ "$source_ext" == *"powa=5.2.0"* && "$source_ext" == *"pg_stat_statements="* && "$source_ext" == *"pg_qualstats=2.1.4"* && "$source_ext" == *"pg_stat_kcache=2.3.2"* && "$source_ext" == *"pg_wait_sampling=1.1"* ]] || fail "Kaynak extension seti eksik: ${source_ext}"
 [[ "$repo_ext" == *"powa=5.2.0"* && "$repo_ext" == *"pg_stat_statements="* ]] || fail "Repository extension seti eksik: ${repo_ext}"
-pass "Kaynak pg_qualstats 2.1.4, pg_stat_kcache 2.3.2 ve iki PoWA extension seti dogru"
+pass "Kaynak pg_qualstats 2.1.4, pg_stat_kcache 2.3.2, pg_wait_sampling 1.1 ve iki PoWA extension seti dogru"
 
 source_hypopg_version="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'")"
@@ -122,8 +128,8 @@ fi
 pass "Evaluator saglikli, HypoPG 1.4.3 yetenekli, read-only ve yalniz ic agda"
 
 preload="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc 'SHOW shared_preload_libraries')"
-[[ "$preload" == *"pg_stat_statements"* && "$preload" == *"pg_qualstats"* && "$preload" == *"pg_stat_kcache"* ]] \
-  || fail "pg_stat_statements/pg_qualstats/pg_stat_kcache preload edilmemis: ${preload}"
+[[ "$preload" == *"pg_stat_statements"* && "$preload" == *"pg_qualstats"* && "$preload" == *"pg_stat_kcache"* && "$preload" == *"pg_wait_sampling"* ]] \
+  || fail "pg_stat_statements/pg_qualstats/pg_stat_kcache/pg_wait_sampling preload edilmemis: ${preload}"
 
 kcache_settings="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
   "SELECT current_setting('pg_stat_kcache.track'),
@@ -132,6 +138,16 @@ kcache_settings="$(docker compose exec -T source-db psql -U postgres -d powa -At
 [[ "$kcache_settings" == "top|off|t" ]] \
   || fail "pg_stat_kcache gozlem ayarlari/datasource beklenmiyor: ${kcache_settings:-bos}"
 pass "pg_stat_kcache top-level execution CPU takibi etkin; planning takibi kapali"
+
+wait_sampling_settings="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
+  "SELECT current_setting('pg_wait_sampling.profile_period'),
+          current_setting('pg_wait_sampling.profile_pid'),
+          current_setting('pg_wait_sampling.profile_queries'),
+          current_setting('pg_wait_sampling.sample_cpu'),
+          (SELECT count(*) >= 0 FROM \"PoWA\".powa_wait_sampling_src(0))")"
+[[ "$wait_sampling_settings" == "10|off|top|off|t" ]] \
+  || fail "pg_wait_sampling profil ayarlari/datasource beklenmiyor: ${wait_sampling_settings:-bos}"
+pass "pg_wait_sampling 10ms top-level wait profili etkin; PID ve CPU orneklemesi kapali"
 
 qualstats_settings="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
   "SELECT current_setting('pg_qualstats.track_constants'),
@@ -143,21 +159,29 @@ qualstats_settings="$(docker compose exec -T source-db psql -U postgres -d powa 
 [[ "$qualstats_settings" == "off|off|off|t|t" ]] \
   || fail "pg_qualstats guvenlik/kapasite/sampling ayarlari beklenmiyor: ${qualstats_settings}"
 
-reset_grant="$(docker compose exec -T source-db psql -U postgres -d powa -Atqc \
-  "SELECT has_function_privilege(
-      'powa_collector', format('%I.pg_qualstats_reset()', n.nspname), 'EXECUTE')
+join_source_acl="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
+  "SELECT
+      NOT has_function_privilege('powa_collector', format('%I.pg_qualstats_reset()', n.nspname), 'EXECUTE'),
+      has_function_privilege('powa_collector', 'advisor_join.capture_and_reset()', 'EXECUTE'),
+      has_function_privilege('advisor_join_reader', 'advisor_join.fetch_batches(integer)', 'EXECUTE'),
+      has_function_privilege('advisor_join_reader', 'advisor_join.ack_batch(bigint)', 'EXECUTE'),
+      NOT has_function_privilege('advisor_join_reader', 'advisor_join.capture_and_reset()', 'EXECUTE'),
+      NOT has_table_privilege('advisor_join_reader', 'advisor_join.outbox_batches', 'SELECT'),
+      NOT has_table_privilege('advisor_join_reader', 'advisor_join.outbox_rows', 'SELECT')
      FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace
     WHERE e.extname='pg_qualstats'")"
-[[ "$reset_grant" == t ]] || fail "Collector pg_qualstats_reset EXECUTE yetkisi eksik"
-pass "pg_qualstats preload, guvenli GUC'lar, kapasite ve reset yetkisi dogru"
+[[ "$join_source_acl" == "t|t|t|t|t|t|t" ]] \
+  || fail "Kaynak JOIN/reset least-privilege ACL'leri beklenmiyor: ${join_source_acl:-bos}"
+pass "Collector direct reset'ten mahrum; atomik capture wrapper ve JOIN reader ACL'leri dogru"
 
 ignored_users="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SHOW powa.ignored_users")"
 ignored_users_compact="${ignored_users// /}"
 [[ ",${ignored_users_compact}," == *",powa_collector,"* \
-   && ",${ignored_users_compact}," == *",advisor_evaluator,"* ]] \
-  || fail "PoWA ignored_users collector/evaluator rollerini kapsamiyor: ${ignored_users}"
-pass "Collector ve evaluator sorgulari PoWA urun telemetrisinden dislaniyor"
+   && ",${ignored_users_compact}," == *",advisor_evaluator,"* \
+   && ",${ignored_users_compact}," == *",advisor_join_reader,"* ]] \
+  || fail "PoWA ignored_users collector/evaluator/JOIN reader rollerini kapsamiyor: ${ignored_users}"
+pass "Collector, evaluator ve JOIN reader sorgulari PoWA urun telemetrisinden dislaniyor"
 
 demo_server_id="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
   "SELECT id FROM \"PoWA\".powa_servers WHERE alias = 'test-source' AND hostname = 'source-db' AND port = 5432")"
@@ -228,6 +252,72 @@ kcache_registration="$(docker compose exec -T repository-db psql -U postgres -p 
   || fail "Repository pg_stat_kcache datasource kaydi eksik: ${kcache_registration:-yok}"
 pass "Repository pg_stat_kcache datasource ve dort PoWA islemi etkin"
 
+wait_sampling_registration="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
+  "SELECT ec.enabled, ec.version,
+          (SELECT count(*) = 4
+             FROM \"PoWA\".powa_functions f
+            WHERE f.srvid = ec.srvid
+              AND f.name = 'pg_wait_sampling'
+              AND f.enabled
+              AND f.operation IN ('snapshot','aggregate','purge','reset'))
+     FROM \"PoWA\".powa_extension_config ec
+    WHERE ec.srvid = ${demo_server_id} AND ec.extname = 'pg_wait_sampling'")"
+[[ "$wait_sampling_registration" == "t|1.1|t" ]] \
+  || fail "Repository pg_wait_sampling datasource kaydi eksik: ${wait_sampling_registration:-yok}"
+pass "Repository pg_wait_sampling datasource ve dort PoWA islemi etkin"
+
+join_repository_acl="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
+  "SELECT
+      EXISTS (
+        SELECT 1
+          FROM \"PoWA\".powa_extension_functions AS extension_function
+         WHERE extension_function.extname = 'pg_qualstats'
+           AND extension_function.operation = 'snapshot'
+           AND extension_function.query_cleanup = 'SELECT advisor_join.capture_and_reset()'
+      ),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.ingest_join_batch(text,bigint,timestamptz,jsonb)', 'EXECUTE'),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.record_join_error(text,text)', 'EXECUTE'),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.purge_join_source_history(text,interval)', 'EXECUTE'),
+      NOT has_function_privilege('advisor_join_ingest', 'advisor_ingest.purge_join_history(interval)', 'EXECUTE'),
+      NOT has_function_privilege('advisor_join_ingest', 'advisor_ingest.refresh_candidates(integer,bigint)', 'EXECUTE'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_snapshot_batches', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_predicate_samples', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor.index_candidates', 'SELECT'),
+      EXISTS (
+        SELECT 1
+          FROM advisor_ingest.join_source_role_bindings AS binding
+         WHERE binding.role_name = 'advisor_join_ingest'
+           AND binding.server_id = server.id
+      )
+     FROM \"PoWA\".powa_servers AS server
+    WHERE server.id = ${demo_server_id}")"
+[[ "$join_repository_acl" == "t|t|t|t|t|t|t|t|t|t" ]] \
+  || fail "Repository JOIN ingest/query_cleanup least-privilege ACL'leri beklenmiyor: ${join_repository_acl:-bos}"
+pass "JOIN capture reset sinirina bagli; ingest rolu tek kaynaga ve source-scoped wrapper'lara kilitli"
+
+if docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --port 5433 --dbname powa_repository \
+  --command "SET SESSION AUTHORIZATION advisor_join_ingest;
+              SELECT advisor_ingest.ingest_join_batch(
+                '__unbound_source__', 9000000000000000000, now(), '[]'::jsonb
+              );" >/dev/null 2>&1; then
+  fail "JOIN ingest rolu bagli olmadigi source alias'ina yazabildi"
+fi
+pass "JOIN ingest alias spoof denemesi repository tarafinda fail-closed reddedildi"
+
+join_networks="$(docker inspect --format '{{json .NetworkSettings.Networks}}' \
+  "$(docker compose ps -q join-snapshotter)")"
+"$python_bin" - "$join_networks" <<'PY'
+import json, sys
+networks = set(json.loads(sys.argv[1]))
+assert any(name.endswith('_join_source') for name in networks), networks
+assert any(name.endswith('_join_repository') for name in networks), networks
+assert not any(name.endswith('_advisor') for name in networks), networks
+assert not any(name.endswith('_evaluator_source') for name in networks), networks
+assert not any(name.endswith('_clone_data') for name in networks), networks
+PY
+pass "JOIN snapshotter yalniz iki internal DB aginda; ana API/evaluator aglarinda degil"
+
 # Yepyeni repository'de ilk snapshot bir delta degil, kaynak sayaclarinin
 # baseline'idir. Kontrollu workload'u bundan sonra calistirarak API metriklerinin
 # temiz kurulumda da ilk farktan uretilmesini garanti ederiz.
@@ -292,11 +382,36 @@ if docker compose ps --services --status running | grep -qx workload; then
 fi
 docker compose stop collector >/dev/null
 collector_stopped=true
+
+# Execute the repaired PoWA 5.2.0 runtime path in a rolled-back transaction,
+# proving retention purge works without deleting repository history.
+docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --port 5433 --dbname powa_repository >/dev/null <<SQL
+BEGIN;
+SELECT "PoWA".powa_qualstats_purge(${demo_server_id});
+ROLLBACK;
+SQL
+pass "PoWA 5.2.0 pg_qualstats retention purge uyumlulugu calisiyor"
+
+run_join_wait_acceptance_workload() {
+  docker compose exec -T source-db psql -X --set=ON_ERROR_STOP=1 \
+    --username postgres --dbname appdb >/dev/null <<'SQL'
+SET pg_qualstats.sample_rate = 1;
+SELECT 'SELECT count(*) FROM public.customers AS c JOIN public.orders AS o ON o.customer_id = c.id WHERE o.status = ''paid'''
+  FROM generate_series(1, 10)
+\gexec
+SELECT pg_sleep(2);
+SQL
+}
+
+# Admin acceptance cleanup also uses the production wrapper.  The collector
+# itself has no direct reset privilege, so JOIN capture and reset cannot race.
 docker compose exec -T source-db psql -U postgres -d powa -qc \
-  'SELECT pg_qualstats_reset()' >/dev/null
+  'SELECT advisor_join.capture_and_reset()' >/dev/null
 
 bash scripts/run-test-workload.sh 20 >/tmp/advisor-workload-result.txt
 grep -q '"ok": true' /tmp/advisor-workload-result.txt || fail "Test fonksiyonu basarisiz"
+run_join_wait_acceptance_workload
 raw_qualstats="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
   "SELECT count(*) FILTER (WHERE lrelid IS NOT NULL AND rrelid IS NOT NULL),
           count(*) FILTER (WHERE (lrelid IS NULL) != (rrelid IS NULL))
@@ -415,9 +530,14 @@ pass "PoWA repository WHERE/filter predicate tarihcesi ve katalog kolon eslemesi
 # API'sinin kullanacagi pozitif statement delta'larini deterministik uretiriz.
 api_baseline_snap="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
   "SELECT extract(epoch FROM snapts) FROM \"PoWA\".powa_snapshot_metas WHERE srvid = ${demo_server_id}")"
+docker compose stop collector >/dev/null
+collector_stopped=true
 bash scripts/run-test-workload.sh 5 >/tmp/advisor-workload-second-result.txt
 grep -q '"ok": true' /tmp/advisor-workload-second-result.txt \
   || fail "Ikinci kontrollu test fonksiyonu basarisiz"
+run_join_wait_acceptance_workload
+docker compose up -d --force-recreate --no-deps collector >/dev/null
+collector_stopped=false
 api_delta_state=""
 for attempt in $(seq 1 20); do
   docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -qc \
@@ -449,6 +569,256 @@ done
 [[ "$api_delta_state" == "t|0|t" ]] \
   || fail "Dashboard icin pozitif statement delta olusmadi: ${api_delta_state:-bos}"
 pass "Dashboard API'si icin ikinci olcum deltasi hazir"
+
+# The two controlled reset boundaries above must arrive through the outbox as
+# JOIN evidence and produce the exact two-column ordering rule.  At the same
+# boundaries pg_sleep provides a deterministic Timeout/PgSleep wait delta.
+composite_identity=""
+for attempt in $(seq 1 30); do
+  composite_identity="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
+    -d powa_repository -AtF '|' -qc \
+    "SELECT candidate_id, query_id, database_id
+       FROM advisor.composite_index_candidates(
+         interval '1 hour', ${demo_server_id}, NULL, NULL
+       )
+      WHERE schema_name = 'public'
+        AND table_name = 'orders'
+        AND key_column_names = ARRAY['status','customer_id']::text[]
+        AND sample_count >= 2
+      ORDER BY sample_count DESC, join_occurrences DESC
+      LIMIT 1")"
+  [[ "$composite_identity" =~ ^[0-9a-f-]{36}\|-?[0-9]+\|[0-9]+$ ]] && break
+  sleep 1
+done
+IFS='|' read -r composite_candidate_id composite_query_id composite_database_id <<< "$composite_identity"
+[[ "$composite_candidate_id" =~ ^[0-9a-f-]{36}$ \
+   && "$composite_query_id" =~ ^-?[0-9]+$ \
+   && "$composite_database_id" =~ ^[0-9]+$ ]] \
+  || fail "Iki JOIN snapshot'indan persisted composite aday olusmadi: ${composite_identity:-bos}"
+
+# PostgreSQL query_id is shared by roles executing the same normalized query.
+# Rebuild one real captured JOIN/filter pair under two synthetic user OIDs in a
+# rolled-back batch: this used to feed duplicate candidate_id rows to one
+# INSERT .. ON CONFLICT and abort the entire ingest transaction.
+multi_user_candidate_regression="$(docker compose exec -T repository-db \
+  psql -X --set=ON_ERROR_STOP=1 --set=regression_server_id="$demo_server_id" \
+  --username postgres --port 5433 --dbname powa_repository \
+  --quiet --tuples-only --no-align <<'SQL'
+SELECT set_config('advisor.regression_server_id', :'regression_server_id', false) AS configured
+\gset
+BEGIN;
+DO $regression$
+DECLARE
+    v_server_id integer := current_setting('advisor.regression_server_id')::integer;
+    v_batch_id bigint := 9000000000000000000 + v_server_id;
+    v_seed record;
+    v_evidence record;
+    v_expected_operator_oids oid[];
+    v_filter_first boolean;
+BEGIN
+    SELECT
+        join_sample.dbid,
+        join_sample.queryid,
+        join_sample.qualid AS join_qualid,
+        join_sample.qualnodeid AS join_qualnodeid,
+        join_sample.lrelid AS join_lrelid,
+        join_sample.lattnum AS join_lattnum,
+        join_sample.opno AS join_opno,
+        join_sample.operator_name AS join_operator_name,
+        join_sample.operator_commutator AS join_operator_commutator,
+        join_sample.btree_strategy AS join_btree_strategy,
+        join_sample.rrelid AS join_rrelid,
+        join_sample.rattnum AS join_rattnum,
+        join_sample.occurences AS join_occurrences,
+        join_sample.execution_count AS join_execution_count,
+        join_sample.nbfiltered AS join_nbfiltered,
+        join_sample.eval_type AS join_eval_type,
+        filter_sample.qualid AS filter_qualid,
+        filter_sample.qualnodeid AS filter_qualnodeid,
+        filter_sample.lrelid AS filter_lrelid,
+        filter_sample.lattnum AS filter_lattnum,
+        filter_sample.opno AS filter_opno,
+        filter_sample.operator_name AS filter_operator_name,
+        filter_sample.operator_commutator AS filter_operator_commutator,
+        filter_sample.btree_strategy AS filter_btree_strategy,
+        filter_sample.occurences AS filter_occurrences,
+        filter_sample.execution_count AS filter_execution_count,
+        filter_sample.nbfiltered AS filter_nbfiltered,
+        filter_sample.eval_type AS filter_eval_type
+      INTO STRICT v_seed
+      FROM advisor_ingest.join_predicate_samples AS join_sample
+      JOIN advisor_ingest.join_predicate_samples AS filter_sample
+        ON filter_sample.server_id = join_sample.server_id
+       AND filter_sample.batch_id = join_sample.batch_id
+       AND filter_sample.dbid = join_sample.dbid
+       AND filter_sample.userid = join_sample.userid
+       AND filter_sample.queryid = join_sample.queryid
+       AND NOT filter_sample.is_join
+       AND filter_sample.rrelid IS NULL
+       AND filter_sample.lrelid IN (join_sample.lrelid, join_sample.rrelid)
+       AND filter_sample.lattnum <> CASE
+               WHEN filter_sample.lrelid = join_sample.lrelid THEN join_sample.lattnum
+               ELSE join_sample.rattnum
+           END
+      JOIN advisor.index_candidates AS candidate
+        ON candidate.server_id = join_sample.server_id
+       AND candidate.database_id = join_sample.dbid
+       AND candidate.query_id = join_sample.queryid
+       AND candidate.relation_id = filter_sample.lrelid
+       AND candidate.key_attnums @> ARRAY[
+               filter_sample.lattnum,
+               CASE
+                   WHEN filter_sample.lrelid = join_sample.lrelid THEN join_sample.lattnum
+                   ELSE join_sample.rattnum
+               END
+           ]::smallint[]
+     WHERE join_sample.server_id = v_server_id
+       AND join_sample.is_join
+       AND join_sample.btree_strategy = 3
+       AND join_sample.lrelid IS DISTINCT FROM join_sample.rrelid
+       AND filter_sample.btree_strategy BETWEEN 1 AND 5
+     ORDER BY join_sample.batch_id DESC
+     LIMIT 1;
+
+    INSERT INTO advisor_ingest.join_snapshot_batches (
+        server_id, batch_id, captured_at, row_count
+    ) VALUES (
+        v_server_id, v_batch_id, clock_timestamp(), 4
+    );
+
+    INSERT INTO advisor_ingest.join_predicate_samples (
+        server_id, batch_id, dbid, userid, queryid, qualid, qualnodeid,
+        lrelid, lattnum, opno, operator_name, operator_commutator,
+        btree_strategy, rrelid, rattnum, occurences, execution_count,
+        nbfiltered, eval_type, is_join
+    )
+    SELECT
+        v_server_id, v_batch_id, v_seed.dbid, synthetic_user.userid::oid,
+        v_seed.queryid, v_seed.join_qualid, v_seed.join_qualnodeid,
+        v_seed.join_lrelid, v_seed.join_lattnum, v_seed.join_opno,
+        v_seed.join_operator_name, v_seed.join_operator_commutator,
+        v_seed.join_btree_strategy, v_seed.join_rrelid, v_seed.join_rattnum,
+        v_seed.join_occurrences, v_seed.join_execution_count,
+        v_seed.join_nbfiltered, v_seed.join_eval_type, true
+      FROM unnest(ARRAY[4000000001::bigint, 4000000002::bigint])
+           AS synthetic_user(userid);
+
+    INSERT INTO advisor_ingest.join_predicate_samples (
+        server_id, batch_id, dbid, userid, queryid, qualid, qualnodeid,
+        lrelid, lattnum, opno, operator_name, operator_commutator,
+        btree_strategy, rrelid, rattnum, occurences, execution_count,
+        nbfiltered, eval_type, is_join
+    )
+    SELECT
+        v_server_id, v_batch_id, v_seed.dbid, synthetic_user.userid::oid,
+        v_seed.queryid, v_seed.filter_qualid, v_seed.filter_qualnodeid,
+        v_seed.filter_lrelid, v_seed.filter_lattnum, v_seed.filter_opno,
+        v_seed.filter_operator_name, v_seed.filter_operator_commutator,
+        v_seed.filter_btree_strategy, NULL, NULL,
+        v_seed.filter_occurrences, v_seed.filter_execution_count,
+        v_seed.filter_nbfiltered, v_seed.filter_eval_type, false
+      FROM unnest(ARRAY[4000000001::bigint, 4000000002::bigint])
+           AS synthetic_user(userid);
+
+    PERFORM advisor_ingest.refresh_candidates(v_server_id, v_batch_id);
+
+    SELECT
+        evidence.join_occurrences,
+        evidence.filter_occurrences,
+        evidence.rows_processed,
+        evidence.rows_filtered,
+        candidate.operator_oids,
+        candidate.ordering_rule
+      INTO STRICT v_evidence
+      FROM advisor.index_candidate_evidence AS evidence
+      JOIN advisor.index_candidates AS candidate USING (candidate_id)
+     WHERE evidence.server_id = v_server_id
+       AND evidence.batch_id = v_batch_id;
+
+    IF v_evidence.join_occurrences <> v_seed.join_occurrences * 2
+       OR v_evidence.filter_occurrences <> v_seed.filter_occurrences * 2
+       OR v_evidence.rows_processed <> v_seed.filter_execution_count * 2
+       OR v_evidence.rows_filtered <> v_seed.filter_nbfiltered * 2 THEN
+        RAISE EXCEPTION 'multi-user candidate evidence was not aggregated exactly once';
+    END IF;
+
+    v_filter_first := v_seed.filter_btree_strategy = 3
+        AND v_seed.filter_nbfiltered::double precision
+            / NULLIF(v_seed.filter_execution_count, 0) >= 0.20;
+    IF COALESCE(v_filter_first, false) THEN
+        v_expected_operator_oids := ARRAY[
+            v_seed.filter_opno, v_seed.join_opno
+        ]::oid[];
+        IF v_evidence.ordering_rule <> 'SELECTIVE_EQUALITY_FILTER_THEN_JOIN' THEN
+            RAISE EXCEPTION 'selective equality ordering rule was not preserved';
+        END IF;
+    ELSE
+        v_expected_operator_oids := ARRAY[
+            v_seed.join_opno, v_seed.filter_opno
+        ]::oid[];
+    END IF;
+    IF v_evidence.operator_oids <> v_expected_operator_oids THEN
+        RAISE EXCEPTION 'operator evidence does not follow composite key order';
+    END IF;
+END
+$regression$;
+ROLLBACK;
+SELECT 'ok';
+SQL
+)"
+[[ "$multi_user_candidate_regression" == "ok" ]] \
+  || fail "Multi-user composite aday regression kontrolu beklenmiyor: ${multi_user_candidate_regression:-bos}"
+pass "Ayni query_id iki DB rolunden geldiginde tek aday/evidence ve sirali operator kaniti uretiliyor"
+
+join_capability_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
+  -d powa_repository -AtF '|' -qc \
+  "SELECT available, data_available, status, capture_mode
+     FROM advisor.join_snapshot_capability(${demo_server_id})")"
+[[ "$join_capability_state" == "t|t|HEALTHY|QUALSTATS_RESET_BOUNDARY" ]] \
+  || fail "JOIN snapshot capability saglikli degil: ${join_capability_state:-bos}"
+pass "Iki atomik JOIN snapshot'i aktarildi ve (status, customer_id) composite adayi kalici olustu"
+
+frequency_scaled_join_health="$(docker compose exec -T repository-db \
+  psql -X --set=ON_ERROR_STOP=1 --set=health_server_id="$demo_server_id" \
+  --username postgres --port 5433 --dbname powa_repository \
+  --quiet --tuples-only --no-align <<'SQL'
+BEGIN;
+UPDATE "PoWA".powa_servers
+   SET frequency = 300
+ WHERE id = :'health_server_id'::integer;
+UPDATE advisor_ingest.join_source_status
+   SET status = 'HEALTHY',
+       last_error = NULL,
+       last_capture_at = now() - interval '10 minutes'
+ WHERE server_id = :'health_server_id'::integer;
+SELECT status
+  FROM advisor.join_snapshot_capability(:'health_server_id'::integer);
+ROLLBACK;
+SQL
+)"
+[[ "$frequency_scaled_join_health" == "HEALTHY" ]] \
+  || fail "JOIN staleness source frequency ile olceklenmiyor: ${frequency_scaled_join_health:-bos}"
+pass "JOIN staleness esigi source frequency*3 + 30 saniye grace ile olcekleniyor"
+
+wait_identity=""
+for attempt in $(seq 1 20); do
+  wait_identity="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
+    -d powa_repository -AtF '|' -qc \
+    "SELECT query_id, database_id, wait_total_samples
+       FROM advisor.query_metrics(interval '1 hour')
+      WHERE server_id = ${demo_server_id}
+        AND lower(coalesce(dominant_wait_event, '')) = 'pgsleep'
+        AND wait_total_samples > 0
+      ORDER BY wait_total_samples DESC
+      LIMIT 1")"
+  [[ "$wait_identity" =~ ^-?[0-9]+\|[0-9]+\|[1-9][0-9]*$ ]] && break
+  sleep 1
+done
+IFS='|' read -r wait_query_id wait_database_id wait_sample_count <<< "$wait_identity"
+[[ "$wait_query_id" =~ ^-?[0-9]+$ && "$wait_database_id" =~ ^[0-9]+$ \
+   && "$wait_sample_count" =~ ^[1-9][0-9]*$ ]] \
+  || fail "Reset-safe Timeout/PgSleep wait deltasi olusmadi: ${wait_identity:-bos}"
+pass "pg_wait_sampling repository adapter'i pozitif Timeout/PgSleep deltasi uretti (${wait_sample_count} sample)"
 
 if [[ "$workload_stopped" == true ]]; then
   docker compose up -d --no-deps workload >/dev/null
@@ -506,6 +876,28 @@ assert all('analyst yetkisi' in item['sql'] for item in data['items'])
 PY
 pass "Sorgu API'si gercek CPU dahil metrik donuyor ve yetkisiz SQL maskeleniyor"
 
+curl -fsS -H 'X-Advisor-Role: analyst' \
+  "${api_url}/api/v1/queries/${wait_query_id}?window=1h&serverId=${demo_server_id}&databaseId=${wait_database_id}" \
+  >/tmp/advisor-wait-query.json
+"$python_bin" - /tmp/advisor-wait-query.json <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    data = json.load(handle)
+waits = data['waits']
+assert waits['capability']['available'] is True, data
+assert waits['capability']['dataAvailable'] is True, data
+assert waits['capability']['version'] == '1.1', data
+assert waits['capability']['release'] == '1.1.11', data
+assert waits['totalSamples'] > 0, data
+assert waits['categories']['timeout'] > 0, data
+assert waits['dominant']['category'] == 'TIMEOUT', data
+assert waits['dominant']['event'].lower() == 'pgsleep', data
+assert waits['dominant']['sharePercent'] > 0, data
+assert waits['events'], data
+assert waits['scoreIncluded'] is False, data
+PY
+pass "Sorgu detay API'si sampled wait dagilimini capability ve dominant event ile donduruyor"
+
 calibration_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
   "WITH metrics AS (SELECT * FROM advisor.query_metrics(interval '1 hour'))
    SELECT
@@ -532,29 +924,26 @@ IFS='|' read -r regression_gate top_level_only critical_count min_score max_scor
   || fail "Puan kalibrasyon guard'lari basarisiz: ${calibration_state:-bos}"
 pass "Kalibrasyon: top-level toplam, %20/20-cagri regresyon gate'i ve skor araligi dogru (critical=${critical_count}, min=${min_score}, max=${max_score})"
 
-predicate_identity="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
-  "SELECT query_id, database_id
-     FROM advisor.predicate_metrics(interval '1 hour', ${demo_server_id}, NULL, NULL)
-    WHERE schema_name <> 'unknown'
-    ORDER BY CASE signal WHEN 'INDEX_CANDIDATE' THEN 1 WHEN 'REVIEW' THEN 2 ELSE 3 END,
-             occurrences DESC
-    LIMIT 1")"
-IFS='|' read -r predicate_query_id predicate_database_id <<< "$predicate_identity"
-[[ "$predicate_query_id" =~ ^-?[0-9]+$ && "$predicate_database_id" =~ ^[0-9]+$ ]] \
-  || fail "Predicate endpoint kabul sorgusu bulunamadi: ${predicate_identity:-bos}"
+predicate_query_id="$composite_query_id"
+predicate_database_id="$composite_database_id"
 curl -fsS \
   "${api_url}/api/v1/queries/${predicate_query_id}/predicates?window=1h&serverId=${demo_server_id}&databaseId=${predicate_database_id}" \
   >/tmp/advisor-predicates.json
-"$python_bin" - /tmp/advisor-predicates.json <<'PY'
+"$python_bin" - /tmp/advisor-predicates.json "$composite_candidate_id" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding='utf-8') as handle:
     data = json.load(handle)
 capability = data['capability']
 assert capability['available'] is True, data
 assert capability['dataAvailable'] is True, data
-assert capability['coverage'] == 'WHERE_FILTER_ONLY', data
-assert capability['joinsAvailable'] is False, data
-assert capability['ddlGenerated'] is False, data
+assert capability['coverage'] == 'WHERE_AND_JOIN_SNAPSHOT', data
+assert capability['joinsAvailable'] is True, data
+assert capability['ddlGenerated'] is True, data
+join_capability = data['joinCapability']
+assert join_capability['available'] is True, data
+assert join_capability['dataAvailable'] is True, data
+assert join_capability['status'] == 'HEALTHY', data
+assert join_capability['captureMode'] == 'QUALSTATS_RESET_BOUNDARY', data
 assert data['items'], data
 for item in data['items']:
     assert item['occurrences'] > 0, item
@@ -562,8 +951,26 @@ for item in data['items']:
     assert item['filterRatio'] is None or 0 <= item['filterRatio'] <= 1, item
     assert item['sampleCount'] > 0, item
     assert 'CREATE INDEX' not in item['recommendation'].upper(), item
+assert data['joins'], data
+assert any(
+    {join['leftColumnName'], join['rightColumnName']} == {'customer_id', 'id'}
+    and join['scoreIncluded'] is False
+    for join in data['joins']
+), data
+assert data['candidates'], data
+candidate = next(
+    item for item in data['candidates']
+    if item['columns'] == ['status', 'customer_id']
+)
+assert candidate['candidateId'] == sys.argv[2], candidate
+assert candidate['sampleCount'] >= 2, candidate
+assert candidate['joinOccurrences'] >= 5, candidate
+assert candidate['filterOccurrences'] >= 5, candidate
+assert candidate['orderingRule'] == 'SELECTIVE_EQUALITY_FILTER_THEN_JOIN', candidate
+assert candidate['createIndexSql'].startswith('CREATE INDEX CONCURRENTLY '), candidate
+assert candidate['scoreIncluded'] is False, candidate
 PY
-pass "pg_qualstats WHERE/filter kaniti API ve guvenli index adayi gozlemleri calisiyor"
+pass "Predicate API WHERE + JOIN kanitini ve persisted composite adayi birlikte donduruyor"
 
 source_evaluation_identity="$(docker compose exec -T source-db psql -U postgres -d appdb -AtF '|' -qc \
   "SELECT (SELECT oid FROM pg_database WHERE datname = current_database()),
@@ -586,6 +993,36 @@ source_index_fingerprint() {
 }
 
 indexes_before_evaluation="$(source_index_fingerprint)"
+
+composite_payload="$(printf \
+  '{"serverId":%s,"databaseId":%s,"candidateId":"%s"}' \
+  "$demo_server_id" "$composite_database_id" "$composite_candidate_id")"
+curl -fsS -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'X-Advisor-Role: analyst' \
+  "${api_url}/api/v1/queries/${composite_query_id}/composite-index-evaluations?window=1h" \
+  --data "$composite_payload" >/tmp/advisor-composite-evaluation.json
+"$python_bin" - /tmp/advisor-composite-evaluation.json <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    data = json.load(handle)
+assert data['status'] == 'VALIDATED', data
+assert data['reasonCode'] == 'COST_REDUCTION_CONFIRMED', data
+assert data['ddlExecuted'] is False, data
+candidate = data['candidate']
+assert candidate['method'] == 'btree', candidate
+assert candidate['columns'] == ['status', 'customer_id'], candidate
+assert candidate['createIndexSql'].startswith('CREATE INDEX CONCURRENTLY '), candidate
+assert candidate['copyable'] is True, candidate
+validation = data['validation']
+assert validation['hypopgVersion'] == '1.4.3', validation
+assert validation['baselineTotalCost'] > validation['hypotheticalTotalCost'] >= 0, validation
+assert validation['costReductionPercent'] >= 10, validation
+assert validation['hypotheticalIndexUsed'] is True, validation
+assert data['confidence']['level'] in {'MEDIUM', 'HIGH'}, data
+PY
+pass "Persisted iki kolonlu aday HypoPG ile dogrulandi; gercek DDL calismadi"
+
 evaluation_candidates_file=/tmp/advisor-index-evaluation-candidates.tsv
 docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
   "SELECT m.query_id, m.database_id, m.qual_id, m.relation_id
@@ -760,7 +1197,11 @@ api_environment="$(docker compose exec -T api env)"
 [[ "$api_environment" != *"EVALUATOR_DATABASE_URL="* \
    && "$api_environment" != *"ADVISOR_EVALUATOR_PASSWORD="* ]] \
   || fail "API containerina evaluator kaynak DSN/parolasi sizmis"
-pass "API yalniz repository ve ic evaluator endpoint bilgisini tasiyor; kaynak DSN/parolasi yok"
+[[ "$api_environment" != *"CLONE_DATABASE_URL="* \
+   && "$api_environment" != *"CLONE_ADMIN_PASSWORD="* \
+   && "$api_environment" != *"CLONE_RUNNER_PASSWORD="* ]] \
+  || fail "API containerina clone database DSN/parolasi sizmis"
+pass "API yalniz repository ve ic evaluator endpointlerini tasiyor; kaynak/clone DB parolasi yok"
 
 if docker compose ps --services --status running | grep -qx web; then
   curl -fsS "${web_url}/healthz" >/dev/null
@@ -768,4 +1209,4 @@ if docker compose ps --services --status running | grep -qx web; then
 fi
 
 echo
-echo "Iterasyon 1, 2.1-B pg_qualstats, 2.2 HypoPG, kalibrasyon ve 2.3 pg_stat_kcache kabul kontrolleri tamamlandi."
+echo "Iterasyon 1 ve 2.1-B–2.6 telemetry/JOIN/composite kabul kontrolleri tamamlandi; 2.7 disposable clone profili ayrica istege baglidir."

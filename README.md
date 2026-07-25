@@ -2,7 +2,7 @@
 
 PDF v1.1'de tarif edilen ilk iterasyonun çalışan referans uygulamasıdır. Tek bir Docker/OrbStack hostu üzerinde **iki ayrı PostgreSQL sunucu süreci** çalışır: demo kaynak instance `5432`, PoWA repository instance `5433`. PoWA Collector istatistikleri kaynaktan repository'ye taşır; FastAPI yalnız repository'yi okur ve React arayüzü sonuçları gösterir. Aynı repository/collector, `scripts/register-source.sh` ile birden fazla gerçek PostgreSQL kaynağı izleyebilir.
 
-> Bu sürüm önce hangi sorguya bakılması gerektiğini gösterir, gerçek CPU tüketimini ayrı gözlem sinyali olarak sunar ve dar kapsamlı WHERE adaylarını HypoPG ile doğrulayabilir. Yalnız doğrulanmış aday için kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı üretir; otomatik `CREATE/DROP INDEX`, SQL rewrite veya canlı veritabanına müdahale yapmaz.
+> Bu sürüm önce hangi sorguya bakılması gerektiğini gösterir; gerçek CPU ile sampled wait profilini ayırır, JOIN ilişkilerini düşük yetkili snapshotter ile taşır ve iki kolonlu adayları HypoPG ile doğrular. Gerçek `CREATE INDEX` yalnız isteğe bağlı disposable clone profilinde çalışır; izlenen kaynakta otomatik DDL, SQL rewrite veya müdahale yapılmaz.
 
 ## Hızlı başlangıç
 
@@ -19,7 +19,7 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-`.env` içindeki admin, collector, API, evaluator ve iç servis token örneklerini değiştirin. Ardından:
+`.env` içindeki admin, collector, API, evaluator, runtime operator ve iç servis token örneklerini değiştirin. `RUNTIME_ADMIN_TOKEN` değerini frontend build/env dosyasına koymayın. Ardından:
 
 ```bash
 docker info
@@ -31,12 +31,14 @@ docker compose ps
 
 Bu komut demo PostgreSQL'ü ölçülebilir hedef olarak hazırlar ancak sürekli yük üreten `workload` servisini başlatmaz. `REGISTER_DEMO_SOURCE=false` yalnız **boş bir repository volume'ünün ilk kurulumu öncesinde** seçilirse demo kaydı oluşturulmaz; gerçek kaynak-only kurulumlarda bu seçenek kullanılabilir.
 
-İlk build sırasında PostgreSQL 18 tabanı üzerinde PoWA Archivist 5.2.0, `pg_qualstats` 2.1.4, `pg_stat_kcache` 2.3.2 ve HypoPG 1.4.3 doğrulanmış kaynak arşivlerinden derlenir; bu nedenle sonraki başlatmalardan daha uzun sürer. PostgreSQL 17 named volume'leri yalnız image etiketi değiştirilerek açılamaz; PG18'in `/var/lib/postgresql/18/docker` veri dizini düzenine dump/restore veya `pg_upgrade` ile taşınmalıdır. Aşağıdaki scriptler aynı PostgreSQL major sürümündeki mevcut demo volume'lerini yeni extension/rol/grant düzenine geçirir; temiz volume init sırasında zaten hazırlanır.
+İlk build sırasında PostgreSQL 18 tabanı üzerinde PoWA Archivist 5.2.0, `pg_qualstats` 2.1.4, `pg_stat_kcache` 2.3.2, `pg_wait_sampling` release 1.1.11 (extension version 1.1) ve HypoPG 1.4.3 doğrulanmış kaynak arşivlerinden derlenir; bu nedenle sonraki başlatmalardan daha uzun sürer. PostgreSQL 17 named volume'leri yalnız image etiketi değiştirilerek açılamaz; PG18'in `/var/lib/postgresql/18/docker` veri dizini düzenine dump/restore veya `pg_upgrade` ile taşınmalıdır. Aşağıdaki scriptler aynı PostgreSQL major sürümündeki mevcut demo volume'lerini yeni extension/rol/grant düzenine geçirir; temiz volume init sırasında zaten hazırlanır.
 
 ```bash
 bash scripts/enable-pg-qualstats.sh
 bash scripts/enable-hypopg.sh
 bash scripts/enable-pg-stat-kcache.sh
+bash scripts/enable-pg-wait-sampling.sh
+bash scripts/enable-join-snapshotter.sh
 ```
 
 Servisler sağlıklı olduktan sonra:
@@ -45,25 +47,32 @@ Servisler sağlıklı olduktan sonra:
 bash scripts/verify.sh
 ```
 
-Başarılı sonuç İterasyon 2.1-B predicate hattını, İterasyon 2.2 HypoPG doğrulamasını, puan kalibrasyon guard'larını ve İterasyon 2.3 CPU telemetrisini kabul eder.
+Başarılı sonuç predicate, HypoPG, CPU, sampled wait, JOIN snapshot ve composite aday hatlarını kabul eder. İzole gerçek çalışma testi ayrı ve isteğe bağlıdır:
+
+```bash
+docker compose --profile real-validation up -d --wait clone-db clone-evaluator
+bash scripts/verify-real-validation.sh
+```
+
+İkinci script demo eşitlik sorgusu için audit metadatalı sentetik replay fixture'ı kaydeder; gerçek indexin yalnız disposable candidate clone'da kullanıldığını, kaynağın değişmediğini ve iki job database'in de temizlendiğini doğrular.
 
 ## Erişim adresleri
 
 | Bileşen | Yerel adres | Varsayılan erişim |
 |---|---|---|
-| Web arayüzü | <http://localhost:5173> | Host ağına açık (`0.0.0.0`) |
+| Web arayüzü | <http://localhost:5173> | Yalnız loopback (`127.0.0.1`) |
 | Web üzerinden API | <http://localhost:5173/api/v1/health> | Nginx proxy üzerinden |
 | FastAPI | <http://localhost:8000/api/v1/health> | Yalnız loopback (`127.0.0.1`) |
 | OpenAPI | <http://localhost:8000/docs> | Yalnız loopback |
 | Kaynak PostgreSQL | `127.0.0.1:15432/appdb` | Yalnız loopback; container içinde `5432` |
 | PoWA repository | `127.0.0.1:15433/powa_repository` | Yalnız loopback; container içinde `5433` |
 
-Başka bir bilgisayardan yalnız `http://SUNUCU_IP:5173` adresini açın. API çağrıları arayüzün Nginx `/api` proxy'sinden geçer; `15432`, `15433` ve `8000` portlarını dış ağa açmayın.
+Uzak erişim varsayılan olarak kapalıdır. Bilinçli bir sunucu kurulumunda kimlik doğrulayan/TLS sonlandıran reverse proxy kullanın; yalnız bu sınır hazırsa `WEB_BIND=0.0.0.0` ile web portunu açın. API çağrıları arayüzün Nginx `/api` proxy'sinden geçer; `15432`, `15433` ve `8000` portlarını dış ağa açmayın.
 
 Arayüzde şu analiz ekranları bulunur:
 
 - Genel Bakış: yük özeti, en yüksek etkili sorgular ve trend
-- Sorgular: arama, filtreleme, sıralama, dönem karşılaştırması, `pg_stat_kcache` gerçek CPU/OS I/O, pg_qualstats tabanlı WHERE gözlemleri ve isteğe bağlı HypoPG plan doğrulaması
+- Sorgular: arama, filtreleme, dönem karşılaştırması, gerçek CPU/OS I/O, sampled wait dağılımı, WHERE/JOIN kanıtı, composite kolon sırası, HypoPG ve isteğe bağlı clone runtime doğrulaması
 - Sistem Sağlığı: son repository snapshot'ındaki seq scan, dead tuple, autovacuum ve uzun transaction sinyalleri; dönem seçici bu snapshot ekranında gösterilmez
 - Operasyonlar: collector/retention görünürlüğü, repository kapasitesi, veritabanı ve cluster I/O, WAL/checkpoint ile güvenli index kullanım sinyalleri
 
@@ -95,19 +104,29 @@ Altyapı ve ilk ürün adımı tamamlandı: PostgreSQL 18 image'ı sabitlenmiş 
 
 Çıktı yalnız gözlemdir: Impact Score'a katılmaz, otomatik `CREATE INDEX` üretmez veya çalıştırmaz ve kullanıcıyı HypoPG/EXPLAIN doğrulamasına yönlendirir. Düşük örnekli kayıtlar `INSUFFICIENT_DATA` olarak işaretlenir.
 
-Önemli veri sınırı şudur: kaynak `pg_qualstats()` hem `WHERE` hem kolon-kolon `JOIN` predicate'lerini yakalar. PoWA 5.2'nin standart remote datasource'u ise repository geçmişine yalnız tek tarafında kolon bulunan `WHERE`/filter predicate'lerini taşır. JOIN görünürlüğünün ürünleştirilmesi sonraki adımda ayrı, düşük yetkili bir `source-snapshotter` gerektirir. Uygulama ve işletim ayrıntıları [İterasyon 2.1-B runbook'unda](docs/ITERATION_2_1_B_PG_QUALSTATS.md) yer alır.
+Önemli veri sınırı şudur: kaynak `pg_qualstats()` hem `WHERE` hem kolon-kolon `JOIN` predicate'lerini yakalar. PoWA 5.2'nin standart remote datasource'u yalnız `WHERE`/filter predicate'lerini taşır; JOIN kapsamı artık reset ile aynı transaction'daki outbox ve düşük yetkili `join-snapshotter` üzerinden tamamlanır. Ayrıntılar [İterasyon 2.1-B](docs/ITERATION_2_1_B_PG_QUALSTATS.md) ve [2.5–2.7](docs/ITERATIONS_2_5_TO_2_7.md) runbook'larındadır.
 
 ## İterasyon 2.2 — HypoPG doğrulaması
 
-HypoPG 1.4.3 kaynak PostgreSQL 18 image'ına sabitlendi ve ayrı, salt-okunur `evaluator` servisine bağlandı. Sorgu detayındaki uygun WHERE adayı için kullanıcı **HypoPG ile doğrula** dediğinde sistem aynı kaynak oturumunda önce normal, sonra sanal tek kolonlu B-tree index ile plain `EXPLAIN` planı alır. Sanal index gerçekten seçilir ve yapılandırılmış planner-cost eşiği aşılırsa maliyet farkı, tahmini index boyutu, güven seviyesi ve kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı gösterilir.
+HypoPG 1.4.3 kaynak PostgreSQL 18 image'ına sabitlendi ve ayrı, salt-okunur `evaluator` servisine bağlandı. Uygun tek kolonlu WHERE veya persisted iki kolonlu composite aday için aynı kaynak oturumunda önce normal, sonra sanal B-tree index ile plain `EXPLAIN` planı alınır. Sanal index seçilir ve planner-cost eşiği aşılırsa maliyet farkı, tahmini boyut, güven seviyesi ve kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı gösterilir.
 
-İlk kapsam yalnız tek statement `SELECT`/`WITH`, tek kolonlu B-tree uyumlu predicate ve yapılandırılmış `test-source/appdb` hedefidir. `EXPLAIN ANALYZE`, gerçek DDL, DML replay, SQL rewrite ve otomatik uygulama yoktur; bütün cevaplarda `ddlExecuted=false` kalır. Collector'a dış kaynak eklemek o kaynağı otomatik evaluator kapsamına almaz. Güvenlik modeli, sonuç durumları, mevcut-volume adımı ve dış kaynak runbook'u [İterasyon 2.2 belgesindedir](docs/ITERATION_2_2_HYPOPG.md).
+Kapsam tek statement `SELECT`/`WITH`, en fazla iki kolonlu B-tree adayı ve yapılandırılmış `test-source/appdb` hedefidir. HypoPG tarafında `EXPLAIN ANALYZE` veya gerçek DDL yoktur ve `ddlExecuted=false` kalır. Gerçek çalışma yalnız ayrı clone profilindedir. Collector'a dış kaynak eklemek o kaynağı otomatik evaluator kapsamına almaz. Temel güvenlik modeli [İterasyon 2.2](docs/ITERATION_2_2_HYPOPG.md), composite/clone uzantısı [2.5–2.7 belgesindedir](docs/ITERATIONS_2_5_TO_2_7.md).
 
 ## İterasyon 2.3 — `pg_stat_kcache` gerçek CPU telemetrisi
 
 `pg_stat_kcache 2.3.2` PostgreSQL 18 image'ına sabitlendi ve PoWA 5.2 remote hattına bağlandı. Sorgu listesi ve detay ekranı execution user/system/total CPU süresini, CPU'nun DB süresindeki oranını ve OS filesystem read/write byte değerlerini gösterir. Extension kapalı, history yetersiz ve veri kullanılabilir durumları ayrı capability sonucu taşır; eksik veri sahte `0 CPU` olarak sunulmaz.
 
 CPU bu iterasyonda gözlem modundadır: `scoreIncluded=false` kalır ve mevcut Impact Score ağırlıkları değişmez. Paralel worker CPU toplamı duvar saatini aşabileceği için oran `%100` üstünde olabilir. Kurulum, mevcut-volume migration'ı, sayaç semantiği, overhead komutu ve kabul ayrıntıları [İterasyon 2.3 runbook'undadır](docs/ITERATION_2_3_PG_STAT_KCACHE.md).
+
+## İterasyon 2.4–2.7 — wait, JOIN, composite ve izole gerçek test
+
+`pg_wait_sampling` release 1.1.11 sorgu bazındaki bekleme örneklerini I/O, lock, LWLock, client, IPC, timeout, activity, extension ve other sınıflarına ayırır. Değerler örnek sayısıdır; duvar saati veya CPU yüzdesi değildir ve `scoreIncluded=false` kalır. Sürüm, overhead ve mevcut-volume runbook'u [pg_wait_sampling belgesindedir](docs/PG_WAIT_SAMPLING.md).
+
+PoWA'nın taşımadığı kolon-kolon JOIN kayıtları, `pg_qualstats` reset'iyle aynı source transaction'ında durable outbox'a alınır. Ayrı `join-snapshotter` yalnız source `fetch/ack` ve repository `ingest/status/purge` fonksiyonlarını çağırabilir. Repository commit edilmeden source batch ack edilmez; tekrar teslim candidate/evidence anahtarlarında idempotenttir.
+
+JOIN eşitliği ile aynı tablodaki WHERE equality/range kanıtı en az iki snapshot ve asgari occurrence eşiklerini geçtiğinde iki kolonlu B-tree adayı oluşur. Equality/range kuralı kolon sırasını açıklar; mevcut index prefix'i ve planner faydası canlı kaynakta salt-okunur HypoPG evaluator tarafından doğrulanır. Bu kanıt da ana inceleme skoruna katılmaz.
+
+Gerçek çalışma testi varsayılan olarak kapalıdır. `real-validation` profili tmpfs üzerinde clone template'ten ayrı baseline/candidate veritabanları üretir, gerçek indexi yalnız candidate clone'da kurar ve dönüşümlü `EXPLAIN ANALYZE` medianlarını karşılaştırır. Parametreli replay yalnız exact query/candidate kimliğine bağlı, süresi ve audit metadatası olan server-side sentetik/anonim fixture ile açılır; browser serbest SQL veya bind değeri gönderemez. Her cevap `sourceDdlExecuted=false` ve clone cleanup durumunu taşır. Kurulum ve güvenlik sınırları [2.5–2.7 runbook'undadır](docs/ITERATIONS_2_5_TO_2_7.md).
 
 ## İterasyon 1 kapanış notu — 24 Temmuz 2026
 
@@ -132,22 +151,22 @@ Denetim sırasında agresif demo yükü 6 worker ile yaklaşık 1.164 statement 
 
 | Aday alt iterasyon | Tek araç | Kazandırdığı veri | Mevcut mimariye uyum | Temel dikkat noktası |
 |---|---|---|---|---|
-| `2.1-B` | `pg_qualstats` | Kaynakta `WHERE`/`JOIN`, standart repository hattında `WHERE`/filter predicate istatistikleri | Altyapı tamamlandı; JOIN tarihçesi için özel snapshotter gerekir | Sampling overhead'i ve entry büyümesi ölçülmeli; agresif demoda constants takibi sınırlanmalı |
+| `2.1-B` | `pg_qualstats` | Kaynakta `WHERE`/`JOIN`, standart repository hattında `WHERE`/filter predicate istatistikleri | Tamamlandı; JOIN tarihçesi 2.5 outbox hattında | Sampling overhead'i ve entry büyümesi ölçülmeli; agresif demoda constants takibi sınırlanmalı |
 | `2.2` | `HypoPG` | Gerçek index oluşturmadan sanal index kullanımı, plan maliyeti ve tahmini boyut karşılaştırması | Tamamlandı; ayrı salt-okunur evaluator aynı kaynak oturumunu kullanır | İlk kapsam SELECT + tek kolonlu B-tree + yapılandırılmış `appdb`; dış kaynaklar ayrıca hazırlanmalı |
 | `2.3` | `pg_stat_kcache` | Sorgu bazında CPU user/system süresi ve işletim sistemi fiziksel I/O'su | Tamamlandı; PoWA remote history + API/UI capability | Skor dışında gözlem modunda; gerçek yükte dağılım izlenmeli |
-| `2.4` | `pg_wait_sampling` | CPU dışı bekleme nedenleri, lock/I/O/client wait dağılımı | Sıradaki; PoWA remote mode destekler | Sampling frekansı ve ek yük ölçülmeli |
-| `2.5` | JOIN snapshotter | PoWA'nın taşımadığı kolon-kolon JOIN ilişkileri | Ayrı düşük yetkili servis gerekir | Secret, read-only transaction, timeout ve audit sınırı |
-| `2.6` | Composite öneri | JOIN + WHERE kanıtından kolon sırası | 2.5 sonrasında | Eşitlik/range sırası ve mevcut index örtüşmesi doğrulanmalı |
-| `2.7` | İzole gerçek test | Disposable clone üzerinde gerçek index + `EXPLAIN ANALYZE` | Opsiyonel, kaynak dışı | Clone yaşam döngüsü, veri güvenliği ve maliyet |
+| `2.4` | `pg_wait_sampling` | CPU dışı bekleme nedenleri, lock/I/O/client wait dağılımı | Tamamlandı; PoWA remote history + API/UI capability | Örnek sayısı süre değildir; overhead scripti ayrı container kullanır |
+| `2.5` | JOIN snapshotter | PoWA'nın taşımadığı kolon-kolon JOIN ilişkileri | Tamamlandı; atomik source outbox + düşük yetkili aktarım | At-least-once teslim, idempotent ingest ve ayrı parolalar |
+| `2.6` | Composite öneri | JOIN + WHERE kanıtından kolon sırası | Tamamlandı; persisted 2 kolonlu aday + HypoPG | Eşitlik/range sırası ve mevcut index prefix'i evaluator'da doğrulanır |
+| `2.7` | İzole gerçek test | Disposable clone üzerinde gerçek index + `EXPLAIN ANALYZE` | Tamamlandı; varsayılan kapalı `real-validation` profili | Onaylı scalar replay fixture, clone marker/rol guard'ı ve zorunlu cleanup |
 | Alternatif plan yakalama | `auto_explain` | Yavaş sorguların gerçek planlarını loga yazar | Düşük; PoWA repository hattına doğal olarak akmaz | Log ingestion, hassas veri, örnekleme ve planlama/çalıştırma overhead'i gerektirir |
 
-**Seçilen rota:** `pg_qualstats`, HypoPG ve `pg_stat_kcache` alt iterasyonları tamamlandı. Sıradaki araç `2.4 pg_wait_sampling`; ardından PoWA'nın taşımadığı JOIN'ler için `2.5` düşük yetkili snapshotter, yeterli JOIN/WHERE kanıtından sonra `2.6` composite kolon sırası ve opsiyonel `2.7` disposable clone doğrulaması gelir. HypoPG gerçek index oluşturmaz; gösterilen SQL'i çalıştırma kararı DBA'ya aittir.
+**Seçilen rota tamamlandı:** `pg_qualstats`, HypoPG, `pg_stat_kcache`, `pg_wait_sampling`, düşük yetkili JOIN snapshotter, composite kolon sırası ve opsiyonel disposable clone doğrulaması birlikte çalışır. HypoPG kaynakta gerçek index oluşturmaz; gerçek DDL yalnız açıkça başlatılan clone profilinde yürür.
 
-PoWA'nın taşıdığı tarihsel veriler repository üzerinden sunulmaya ve ana API repository-only kalmaya devam eder. İterasyon 2.2'de HypoPG için ayrı, düşük yetkili `evaluator` servisi yalnız açıkça yapılandırılmış tek kaynak/database hedefine bağlanır. Kaynak erişimi veya HypoPG hazırlığı olmayan kurulumlarda doğrulama `UNAVAILABLE` döner; çoklu dış kaynak evaluator routing'i henüz yoktur. PoWA'nın taşımadığı JOIN snapshotları da ileride ayrı, audit edilen `source-snapshotter` gerektirir.
+PoWA'nın taşıdığı tarihsel veriler repository üzerinden sunulmaya ve ana API repository-only kalmaya devam eder. HypoPG evaluator yalnız açıkça yapılandırılmış kaynak/database hedefine bağlanır; JOIN snapshotter farklı source/repository rolleriyle yalnız kontrollü fonksiyon çağırır. Ana API ne source ne clone DB credential'ı alır. Hazırlığı olmayan capability `UNAVAILABLE` döner.
 
 ## Gerçek bir PostgreSQL kaynağı ekleme
 
-Bu entegrasyon yalnız PostgreSQL içindir. Kaynak cluster'a uygun PoWA Archivist, `pg_stat_statements`, `pg_qualstats 2.1.x` ve `pg_stat_kcache 2.3.x` paketleri önceden kurulmuş; `pg_stat_statements,pg_qualstats,pg_stat_kcache` `shared_preload_libraries` içinde etkin olmalıdır. Script extension binary'si veya PostgreSQL ayarı kurmaz; preload değişikliği ve gerekli restart kaynak DBA'ya aittir.
+Bu entegrasyon yalnız PostgreSQL içindir. Kaynak cluster'a uygun PoWA Archivist, `pg_stat_statements`, `pg_qualstats 2.1.x`, `pg_stat_kcache 2.3.x` ve `pg_wait_sampling 1.1.11` paketleri önceden kurulmuş; dördü de `shared_preload_libraries` içinde etkin olmalıdır. Script extension binary'si veya PostgreSQL ayarı kurmaz; preload değişikliği ve gerekli restart kaynak DBA'ya aittir. JOIN reader secret/routing'i kaynak başına ayrıca yapılandırılır; referans Compose snapshotter'ı yalnız `test-source` içindir.
 
 1. Örneği Git dışındaki güvenli bir konuma kopyalayın:
 
@@ -173,11 +192,13 @@ Komut tekrar çalıştırılabilir: aynı alias yeni satır açmaz; bağlantı/f
 
 | Compose servisi | Görev | Kalıcı veri |
 |---|---|---|
-| `source-db` | PostgreSQL 18, `appdb`, `pg_stat_statements`, `pg_qualstats`, `pg_stat_kcache`, HypoPG ve remote PoWA fonksiyonları | `source_data` |
+| `source-db` | PostgreSQL 18, `appdb`, stats/kcache/wait extension'ları, HypoPG ve JOIN outbox | `source_data` |
 | `repository-db` | PostgreSQL 18, PoWA geçmişi ve `advisor` şeması | `repository_data` |
 | `collector` | PoWA Collector 1.3.2; kaynaktan snapshot alır | Yok |
+| `join-snapshotter` | JOIN outbox batch'lerini düşük yetkili rollerle repository'ye taşır | Yok |
 | `api` | Repository-only FastAPI okuma/annotation katmanı | Repository'de |
 | `evaluator` | Yapılandırılmış kaynakta salt-okunur HypoPG/plain-EXPLAIN doğrulaması | Yok |
+| `clone-db`, `clone-evaluator` | Yalnız `real-validation` profilinde tmpfs disposable clone + gerçek test | Tmpfs; kalıcı değil |
 | `workload` | Yalnız `demo` profili açıldığında sürekli sentetik sorgu yükü | Yok |
 | `web` | React + TypeScript arayüzü ve Nginx API proxy | Yok |
 
@@ -189,6 +210,9 @@ external PG #N ──────┘                                      │
                                                    api:8000 ──> web:5173
 
 configured source/appdb ──salt-okunur──> evaluator:8010 ──iç API──> api:8000
+
+source JOIN outbox ──fetch/ack──> join-snapshotter ──ingest──> repository-db
+api ──iç token──> clone-evaluator:8020 ──gerçek DDL──> disposable clone-db
 ```
 
 Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasına bakın.
@@ -200,20 +224,31 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 - `advisor_api` yalnız repository DSN'i alır. Yapılandırma doğrulaması `source-db`, `5432` veya `appdb` içeren API DSN'ini reddeder.
 - Kaynak DSN'i yalnız ayrı `evaluator` servisindedir. Bu servis `advisor_evaluator` rolü, read-only transaction, kısa timeout, connection limit, internal network ve token korumalı iç endpoint ile sınırlandırılır; ana API'ye kaynak parolası verilmez.
 - HypoPG fonksiyonlarının PUBLIC yetkileri kaldırılmıştır. Evaluator yalnız sanal index oluşturur ve plain `EXPLAIN` çalıştırır; kopyalanabilir SQL'in kullanıcıya dönmesi gerçek DDL çalıştığı anlamına gelmez.
-- Header gönderilmeyen API isteği `viewer` sayılır ve tam SQL maskelenir. `X-Advisor-Role: analyst` ve `admin` SQL'i görür; CSV export yalnız `admin` içindir. Referans web istemcisi analiz ekranlarını gösterebilmek için şu anda `analyst` header'ı gönderir.
-- Bu header tabanlı rol seçimi ilk iterasyon demonstrasyonudur, kimlik doğrulama değildir. İnternet erişimi verilen bir kurulumda OIDC/SSO veya kimlik doğrulayan reverse proxy eklenmeden üretim güvenliği sağlanmış sayılmaz.
+- Header gönderilmeyen API isteği `viewer` sayılır ve tam SQL maskelenir. Referans web istemcisi analiz ekranları için demonstrasyon amaçlı `analyst` header'ı gönderir; bu gerçek kullanıcı kimliği değildir.
+- `admin` iddiası tek başına kabul edilmez. `RUNTIME_ADMIN_TOKEN` boşken admin işlemleri fail-closed kapalıdır; CSV export ve disposable-clone runtime testi için ayrıca bu server-side secret ile `X-Advisor-Admin-Token` gerekir. Secret browser bundle'ına verilmez; yalnız güvenilir yerel/operator istemcisi kullanır.
+- Runtime bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar; UI yalnız fixture'ın hazır olup olmadığını görür.
+- Statik operator token'ı tam kullanıcı kimlik doğrulamasının yerini tutmaz. İnternet erişimi verilen bir kurulumda OIDC/SSO veya kimlik doğrulayan reverse proxy eklenmeden üretim güvenliği sağlanmış sayılmaz.
 - `.env` yalnız yerel geliştirme içindir; canlı ortamda secret manager ve parola rotasyonu kullanın.
-- Docker port publish kuralları bazı firewall araçlarından önce uygulanabilir. Linux sunucuda `DOCKER-USER` zinciri veya kurumun network policy katmanıyla yalnız web portuna izin verildiğini ayrıca doğrulayın.
+- Docker port publish kuralları bazı firewall araçlarından önce uygulanabilir. Uzak web erişimini özellikle açtıysanız Linux sunucuda `DOCKER-USER` zinciri veya kurumun network policy katmanıyla yalnız web portuna izin verildiğini ayrıca doğrulayın.
 
 ## Testler
 
-Tüm çalışma zamanı kabul kontrolleri:
+Temel stack çalışma zamanı kabul kontrolleri:
 
 ```bash
 bash scripts/verify.sh
 ```
 
-Bu script Compose geçerliliğini, iki PostgreSQL 18 instance'ını ve data directory düzenini, extension sürümlerini, 90 gün retention'ı, raw JOIN/WHERE predicate yakalamayı, repository filter geçmişi/katalog eşlemesini, güvenli predicate endpoint'ini, HypoPG evaluator izolasyonunu ve gerçek DDL üretmeden plan doğrulamasını, iki snapshot'ı, collector sağlığını, gerçek API metriklerini, SQL maskelemesini, 2 saniyelik API hedefini, annotation audit kaydını ve ana API'nin kaynak DSN taşımadığını kontrol eder.
+Bu script Compose geçerliliğini, iki PostgreSQL 18 instance'ını ve data directory düzenini, extension sürümlerini, 90/30 günlük retention'ları, CPU/wait history'sini, raw JOIN/WHERE yakalamayı, atomik snapshot ve multi-user composite kanıtını, güvenli predicate endpoint'ini, HypoPG izolasyonunu, collector sağlığını, SQL maskelemesini, 2 saniyelik API hedefini, audit kaydını ve ana API'nin kaynak/clone DSN taşımadığını kontrol eder.
+
+İsteğe bağlı gerçek clone kabulü:
+
+```bash
+docker compose --profile real-validation up -d --wait clone-db clone-evaluator
+bash scripts/verify-real-validation.sh
+```
+
+Bu ikinci script operator fixture kaydını, admin-token sınırını, güvenli bind adaptasyonuyla gerçek index kullanımını ve zorunlu clone cleanup'ını doğrular.
 
 Backend unit testleri:
 
@@ -261,6 +296,8 @@ docker compose down
 - [İterasyon 2.1-B `pg_qualstats` durum ve işletim notu](docs/ITERATION_2_1_B_PG_QUALSTATS.md)
 - [İterasyon 2.2 HypoPG plan doğrulaması ve dış kaynak runbook'u](docs/ITERATION_2_2_HYPOPG.md)
 - [İterasyon 2.3 `pg_stat_kcache` CPU telemetrisi](docs/ITERATION_2_3_PG_STAT_KCACHE.md)
+- [İterasyon 2.4 `pg_wait_sampling` telemetrisi](docs/PG_WAIT_SAMPLING.md)
+- [İterasyon 2.5–2.7 JOIN, composite ve disposable clone](docs/ITERATIONS_2_5_TO_2_7.md)
 
 ## Sabitlenen temel sürümler
 
@@ -268,8 +305,9 @@ docker compose down
 - PoWA Archivist `5.2.0` / `REL_5_2_0` — kaynak arşiv SHA-256 ile doğrulanır
 - `pg_qualstats 2.1.4` — kaynak arşiv SHA-256 ile doğrulanır; sabit sürüme hedefli shared-memory düzeltmesi uygulanır
 - `pg_stat_kcache 2.3.2` — PostgreSQL 18 uyumlu kaynak arşiv SHA-256 ile doğrulanır
+- `pg_wait_sampling 1.1.11` / SQL extension `1.1` — kaynak arşiv SHA-256 ile doğrulanır
 - HypoPG `1.4.3` — tam upstream commit ve kaynak arşiv SHA-256 ile doğrulanır
 - PoWA Collector `1.3.2` — wheel SHA-256 ile sabitlenir
 - Python `3.12`, Node `22`, Nginx `1.27`
 
-Güncel tasarım dayanakları: [PoWA remote setup](https://powa.readthedocs.io/en/latest/remote_setup.html), [PoWA destekli stats extension'ları](https://powa.readthedocs.io/en/latest/components/stats_extensions/), [pg_qualstats](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_qualstats.html), [pg_stat_kcache](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_stat_kcache.html), [HypoPG](https://github.com/HypoPG/hypopg), [PoWA güvenlik](https://powa.readthedocs.io/en/latest/security.html), [Docker Engine kurulumu](https://docs.docker.com/engine/install/).
+Güncel tasarım dayanakları: [PoWA remote setup](https://powa.readthedocs.io/en/latest/remote_setup.html), [PoWA destekli stats extension'ları](https://powa.readthedocs.io/en/latest/components/stats_extensions/), [pg_qualstats](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_qualstats.html), [pg_stat_kcache](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_stat_kcache.html), [pg_wait_sampling](https://github.com/postgrespro/pg_wait_sampling), [HypoPG](https://github.com/HypoPG/hypopg), [PoWA güvenlik](https://powa.readthedocs.io/en/latest/security.html), [Docker Engine kurulumu](https://docs.docker.com/engine/install/).

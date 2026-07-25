@@ -53,6 +53,9 @@ activation_ok="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
 # rerunnable advisor adapter so CPU fields become available without data loss.
 docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
   --username postgres --port 5433 --dbname powa_repository \
+  --file /docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql >/dev/null
+docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --port 5433 --dbname powa_repository \
   --file /docker-entrypoint-initdb.d/20-advisor-schema.sql >/dev/null
 pass "Repository datasource ve advisor CPU adapter'i guncel"
 

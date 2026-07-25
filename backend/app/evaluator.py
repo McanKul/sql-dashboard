@@ -133,17 +133,34 @@ def _uses_hypothetical_index(plan: dict[str, Any], index_oid: int, index_name: s
     return False
 
 
-def _proposed_index_sql(
-    connection: psycopg.Connection[Any], schema_name: str, table_name: str, column_name: str
+def _proposed_index_name(
+    schema_name: str,
+    table_name: str,
+    column_names: str | list[str],
 ) -> str:
-    readable = re.sub(r"[^a-z0-9_]+", "_", f"{table_name}_{column_name}".lower()).strip("_")
-    digest = hashlib.sha256(f"{schema_name}.{table_name}:{column_name}".encode()).hexdigest()[:8]
-    index_name = f"idx_advisor_{readable[:38]}_{digest}"
+    columns = [column_names] if isinstance(column_names, str) else column_names
+    readable = re.sub(
+        r"[^a-z0-9_]+", "_", f"{table_name}_{'_'.join(columns)}".lower()
+    ).strip("_")
+    digest = hashlib.sha256(
+        f"{schema_name}.{table_name}:{','.join(columns)}".encode()
+    ).hexdigest()[:8]
+    return f"idx_advisor_{readable[:38]}_{digest}"
+
+
+def _proposed_index_sql(
+    connection: psycopg.Connection[Any],
+    schema_name: str,
+    table_name: str,
+    column_names: str | list[str],
+) -> str:
+    columns = [column_names] if isinstance(column_names, str) else column_names
+    index_name = _proposed_index_name(schema_name, table_name, columns)
     statement = sql.SQL("CREATE INDEX CONCURRENTLY {} ON {}.{} USING btree ({});").format(
         sql.Identifier(index_name),
         sql.Identifier(schema_name),
         sql.Identifier(table_name),
-        sql.Identifier(column_name),
+        sql.SQL(", ").join(sql.Identifier(column) for column in columns),
     )
     return statement.as_string(connection)
 
@@ -168,11 +185,11 @@ def _evaluate(payload: InternalIndexEvaluationRequest) -> dict[str, Any]:
             "INSUFFICIENT_PREDICATE_EVIDENCE",
             "Plan onerisi icin daha fazla predicate ornegi birikmeli.",
         )
-    if payload.schemaName == "unknown" or len(payload.columns) != 1:
+    if payload.schemaName == "unknown" or not 1 <= len(payload.columns) <= 2:
         return _advice(
             "UNSAFE",
             "UNRESOLVED_OR_COMPOSITE_PREDICATE",
-            "Canli kaynakta tek kolonlu predicate kimligi guvenle cozumlenemedi.",
+            "Canli kaynakta index adayi katalog kimligi guvenle cozumlenemedi.",
         )
 
     try:
@@ -218,25 +235,27 @@ def _evaluate(payload: InternalIndexEvaluationRequest) -> dict[str, Any]:
             if not database["hypopg_version"]:
                 raise EvaluationStop("UNAVAILABLE", "HYPOPG_NOT_INSTALLED", "Kaynak veritabaninda HypoPG etkin degil.")
 
-            column_name = payload.columns[0]
             cursor.execute(
                 """
                 SELECT c.oid::bigint AS relation_id,
                        c.relkind,
                        c.relrowsecurity,
-                       a.attnum,
+                       array_agg(a.attnum ORDER BY requested.ordinality)::smallint[] AS attnums,
                        has_table_privilege(current_user, c.oid, 'SELECT') AS can_select,
                        pg_total_relation_size(c.oid)::bigint AS table_size_bytes
                   FROM pg_class c
                   JOIN pg_namespace n ON n.oid = c.relnamespace
-                  JOIN pg_attribute a ON a.attrelid = c.oid
+                  CROSS JOIN unnest(%s::text[]) WITH ORDINALITY AS requested(column_name, ordinality)
+                  JOIN pg_attribute a
+                    ON a.attrelid = c.oid AND a.attname = requested.column_name
                  WHERE n.nspname = %s
                    AND c.relname = %s
-                   AND a.attname = %s
                    AND a.attnum > 0
                    AND NOT a.attisdropped
+                 GROUP BY c.oid, c.relkind, c.relrowsecurity
+                HAVING count(*) = %s
                 """,
-                (payload.schemaName, payload.tableName, column_name),
+                (payload.columns, payload.schemaName, payload.tableName, len(payload.columns)),
             )
             relation = cursor.fetchone()
             if not relation or int(relation["relation_id"]) != payload.relationId:
@@ -288,18 +307,23 @@ def _evaluate(payload: InternalIndexEvaluationRequest) -> dict[str, Any]:
                    AND i.indisready
                    AND i.indpred IS NULL
                    AND i.indexprs IS NULL
-                   AND i.indnkeyatts >= 1
-                   AND i.indkey[0] = %s
+                   AND i.indnkeyatts >= %s
+                   AND (i.indkey::smallint[])[0:%s] = %s::smallint[]
                  LIMIT 1
                 """,
-                (relation["relation_id"], relation["attnum"]),
+                (
+                    relation["relation_id"],
+                    len(payload.columns),
+                    len(payload.columns) - 1,
+                    relation["attnums"],
+                ),
             )
             existing = cursor.fetchone()
             if existing:
                 raise EvaluationStop(
                     "NO_IMPROVEMENT",
                     "EQUIVALENT_INDEX_EXISTS",
-                    f"{existing['index_name']} ayni kolonla baslayan gecerli bir B-tree indexidir; yeni SQL onerilmedi.",
+                    f"{existing['index_name']} ayni kolon sirasi ile baslayan gecerli bir B-tree indexidir; yeni SQL onerilmedi.",
                 )
 
             cursor.execute("SELECT advisor_hypopg.hypopg_reset()")
@@ -307,7 +331,7 @@ def _evaluate(payload: InternalIndexEvaluationRequest) -> dict[str, Any]:
             hypothetical_ddl = sql.SQL("CREATE INDEX ON {}.{} USING btree ({})").format(
                 sql.Identifier(payload.schemaName),
                 sql.Identifier(payload.tableName),
-                sql.Identifier(column_name),
+                sql.SQL(", ").join(sql.Identifier(column) for column in payload.columns),
             ).as_string(connection)
             cursor.execute(
                 "SELECT indexrelid::bigint, indexname FROM advisor_hypopg.hypopg_create_index(%s)",
@@ -367,9 +391,9 @@ def _evaluate(payload: InternalIndexEvaluationRequest) -> dict[str, Any]:
                 "HypoPG sanal indexi planda kullanildi ve tahmini maliyeti anlamli bicimde dusurdu.",
                 candidate={
                     "method": "btree",
-                    "columns": [column_name],
+                    "columns": payload.columns,
                     "createIndexSql": _proposed_index_sql(
-                        connection, payload.schemaName, payload.tableName, column_name
+                        connection, payload.schemaName, payload.tableName, payload.columns
                     ),
                     "copyable": True,
                 },

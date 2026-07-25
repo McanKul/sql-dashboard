@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: deployment/postgres/Dockerfile
-    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-hypopg-1.4.3
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-waits-1.1.11-hypopg-1.4.3
     shm_size: ${SOURCE_DB_SHM_SIZE:-256mb}
     environment:
       POSTGRES_DB: appdb
@@ -13,10 +13,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
       POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:-advisor_dev_collector}
       ADVISOR_EVALUATOR_PASSWORD: ${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}
+      ADVISOR_JOIN_SOURCE_PASSWORD: ${ADVISOR_JOIN_SOURCE_PASSWORD:-advisor_dev_join_source}
     command:
       - postgres
       - -c
-      - shared_preload_libraries=pg_stat_statements,pg_qualstats,pg_stat_kcache
+      - shared_preload_libraries=pg_stat_statements,pg_qualstats,pg_stat_kcache,pg_wait_sampling
       - -c
       - compute_query_id=on
       - -c
@@ -40,14 +41,23 @@ services:
       - -c
       - pg_stat_kcache.track_planning=off
       - -c
+      - pg_wait_sampling.profile_period=${PG_WAIT_SAMPLING_PROFILE_PERIOD_MS:-10}
+      - -c
+      - pg_wait_sampling.profile_pid=off
+      - -c
+      - pg_wait_sampling.profile_queries=top
+      - -c
+      - pg_wait_sampling.sample_cpu=off
+      - -c
       - track_io_timing=on
       - -c
-      - powa.ignored_users=powa_collector,advisor_evaluator
+      - powa.ignored_users=powa_collector,advisor_evaluator,advisor_join_reader
     ports:
       - "${SOURCE_DB_BIND:-127.0.0.1}:${SOURCE_DB_PORT:-15432}:5432"
     volumes:
       - source_data:/var/lib/postgresql
       - ./deployment/source/init-source.sh:/docker-entrypoint-initdb.d/10-init-source.sh:ro,Z
+      - ./sql/003_join_snapshot_source.sql:/opt/advisor/sql/003_join_snapshot_source.sql:ro,Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d appdb -p 5432 && psql -U postgres -d powa -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
       interval: 5s
@@ -55,10 +65,10 @@ services:
       retries: 30
       start_period: 20s
     restart: unless-stopped
-    networks: [advisor, evaluator_source]
+    networks: [collector_source, evaluator_source, join_source, workload_source]
 
   repository-db:
-    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-hypopg-1.4.3
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-waits-1.1.11-hypopg-1.4.3
     environment:
       PGPORT: 5433
       POSTGRES_DB: powa_repository
@@ -66,6 +76,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-advisor_dev_admin}
       POWA_COLLECTOR_PASSWORD: ${POWA_COLLECTOR_PASSWORD:-advisor_dev_collector}
       ADVISOR_API_PASSWORD: ${ADVISOR_API_PASSWORD:-advisor_dev_api}
+      ADVISOR_JOIN_REPOSITORY_PASSWORD: ${ADVISOR_JOIN_REPOSITORY_PASSWORD:-advisor_dev_join_repository}
+      JOIN_SOURCE_ALIAS: ${JOIN_SOURCE_ALIAS:-test-source}
       REGISTER_DEMO_SOURCE: ${REGISTER_DEMO_SOURCE:-true}
       # register-source preflight/prepare psql komutlari icin; PGSSLMODE adi
       # kullanilmaz, aksi halde repository healthcheck baglantisi da etkilenir.
@@ -76,8 +88,12 @@ services:
     volumes:
       - repository_data:/var/lib/postgresql
       - ./deployment/repository/init-repository.sh:/docker-entrypoint-initdb.d/10-init-repository.sh:ro,Z
+      - ./sql/004_powa_5_2_0_qualstats_purge_compat.sql:/docker-entrypoint-initdb.d/15-powa-qualstats-purge-compat.sql:ro,Z
       - ./sql/001_advisor_schema.sql:/docker-entrypoint-initdb.d/20-advisor-schema.sql:ro,Z
+      - ./sql/006_runtime_replay_fixtures.sql:/docker-entrypoint-initdb.d/25-runtime-replay-fixtures.sql:ro,Z
+      - ./sql/005_bind_join_source_role.sql:/docker-entrypoint-initdb.d/30-bind-join-source-role.sql:ro,Z
       - ./sql/002_prepare_remote_source.sql:/opt/advisor/sql/002_prepare_remote_source.sql:ro,Z
+      - ./sql/003_join_snapshot_source.sql:/opt/advisor/sql/003_join_snapshot_source.sql:ro,Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d powa_repository -p 5433 && psql -U postgres -d powa_repository -p 5433 -Atqc \"SELECT extversion FROM pg_extension WHERE extname='powa'\" | grep -q '^5.2.0$'"]
       interval: 5s
@@ -87,7 +103,7 @@ services:
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    networks: [advisor]
+    networks: [advisor, join_repository]
 
   collector:
     build:
@@ -122,12 +138,49 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
-    networks: [advisor]
+    networks: [advisor, collector_source]
+
+  join-snapshotter:
+    build:
+      context: .
+      dockerfile: deployment/join-snapshotter/Dockerfile
+    image: postgresql-advisor/join-snapshotter:iteration-2.5
+    environment:
+      JOIN_SOURCE_ALIAS: ${JOIN_SOURCE_ALIAS:-test-source}
+      JOIN_SOURCE_DATABASE_URL: postgresql://advisor_join_reader:${ADVISOR_JOIN_SOURCE_PASSWORD:-advisor_dev_join_source}@source-db:5432/powa?sslmode=disable
+      JOIN_REPOSITORY_DATABASE_URL: postgresql://advisor_join_ingest:${ADVISOR_JOIN_REPOSITORY_PASSWORD:-advisor_dev_join_repository}@repository-db:5433/powa_repository?sslmode=disable
+      JOIN_POLL_INTERVAL_SECONDS: ${JOIN_POLL_INTERVAL_SECONDS:-2}
+      JOIN_BATCH_LIMIT: ${JOIN_BATCH_LIMIT:-20}
+      JOIN_RETENTION_DAYS: ${JOIN_RETENTION_DAYS:-30}
+      JOIN_STATEMENT_TIMEOUT_MS: ${JOIN_STATEMENT_TIMEOUT_MS:-30000}
+      JOIN_HEALTH_MAX_AGE_SECONDS: ${JOIN_HEALTH_MAX_AGE_SECONDS:-60}
+    depends_on:
+      source-db:
+        condition: service_healthy
+      repository-db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    healthcheck:
+      test: ["CMD", "python", "/app/snapshotter.py", "--healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: ${JOIN_HEALTH_START_PERIOD:-30s}
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 128m
+    stop_grace_period: 35s
+    restart: unless-stopped
+    networks: [join_repository, join_source]
 
   api:
     build:
       context: ./backend
-    image: postgresql-advisor/api:iteration-2.3
+    image: postgresql-advisor/api:iteration-2.7
     environment:
       DATABASE_URL: postgresql://advisor_api:${ADVISOR_API_PASSWORD:-advisor_dev_api}@repository-db:5433/powa_repository
       DEFAULT_WINDOW: ${DEFAULT_WINDOW:-24h}
@@ -138,6 +191,12 @@ services:
       EVALUATOR_URL: http://evaluator:8010
       EVALUATOR_TOKEN: ${EVALUATOR_TOKEN:-advisor-dev-evaluator-token}
       EVALUATOR_TIMEOUT_SECONDS: ${EVALUATOR_TIMEOUT_SECONDS:-4}
+      CLONE_EVALUATOR_URL: http://clone-evaluator:8020
+      CLONE_EVALUATOR_TOKEN: ${CLONE_EVALUATOR_TOKEN:-advisor-dev-clone-evaluator-token}
+      CLONE_EVALUATOR_TIMEOUT_SECONDS: ${CLONE_EVALUATOR_TIMEOUT_SECONDS:-90}
+      # Bosken admin endpointleri fail-closed kalir. Yerel operator kullanimi
+      # icin .env.example'daki en az 16 karakterli secret'i ozellikle ayarlayin.
+      RUNTIME_ADMIN_TOKEN: ${RUNTIME_ADMIN_TOKEN:-}
     ports:
       - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     depends_on:
@@ -154,12 +213,12 @@ services:
       retries: 12
       start_period: 15s
     restart: unless-stopped
-    networks: [advisor, evaluator_control]
+    networks: [advisor, evaluator_control, clone_control]
 
   evaluator:
     build:
       context: ./backend
-    image: postgresql-advisor/api:iteration-2.3
+    image: postgresql-advisor/api:iteration-2.7
     command: ["uvicorn", "app.evaluator:app", "--host", "0.0.0.0", "--port", "8010"]
     environment:
       EVALUATOR_DATABASE_URL: postgresql://advisor_evaluator:${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}@source-db:5432/appdb
@@ -189,6 +248,105 @@ services:
     restart: unless-stopped
     networks: [evaluator_control, evaluator_source]
 
+  clone-db:
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-waits-1.1.11-hypopg-1.4.3
+    profiles: [real-validation]
+    shm_size: ${CLONE_DB_SHM_SIZE:-256mb}
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: clone_admin
+      POSTGRES_PASSWORD: ${CLONE_ADMIN_PASSWORD:-advisor_dev_clone_admin}
+      POWA_COLLECTOR_PASSWORD: ${CLONE_POWA_COLLECTOR_PASSWORD:-advisor_dev_clone_collector}
+      ADVISOR_EVALUATOR_PASSWORD: ${CLONE_HYPOPG_PASSWORD:-advisor_dev_clone_hypopg}
+      ADVISOR_JOIN_SOURCE_PASSWORD: ${CLONE_JOIN_SOURCE_PASSWORD:-advisor_dev_clone_join}
+      CLONE_RUNNER_PASSWORD: ${CLONE_RUNNER_PASSWORD:-advisor_dev_clone_runner}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements,pg_qualstats,pg_stat_kcache,pg_wait_sampling
+      - -c
+      - advisor.validation_clone=on
+      - -c
+      - compute_query_id=on
+      - -c
+      - pg_qualstats.sample_rate=0.1
+      - -c
+      - pg_stat_kcache.track=top
+      - -c
+      - pg_wait_sampling.profile_queries=top
+      - -c
+      - pg_wait_sampling.sample_cpu=off
+      # Values are restricted to SYNTHETIC/ANONYMIZED fixtures. Suppress any
+      # failed-statement or bind text in this isolated clone's Docker logs too.
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_parameter_max_length_on_error=0
+    tmpfs:
+      - /var/lib/postgresql:rw,nosuid,nodev,size=${CLONE_DATA_TMPFS_SIZE:-1g}
+    volumes:
+      - ./deployment/source/init-source.sh:/docker-entrypoint-initdb.d/10-init-source.sh:ro,Z
+      - ./sql/003_join_snapshot_source.sql:/opt/advisor/sql/003_join_snapshot_source.sql:ro,Z
+      - ./deployment/clone/init-clone.sh:/docker-entrypoint-initdb.d/20-init-clone.sh:ro,Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clone_admin -d postgres -p 5432 && psql -U clone_admin -d postgres -Atqc \"SELECT current_setting('advisor.validation_clone', true) = 'on' AND EXISTS (SELECT 1 FROM pg_database WHERE datname='appdb' AND datistemplate)\" | grep -q '^t$'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    cap_drop: [ALL]
+    # Official postgres entrypoint starts as root only long enough to prepare
+    # the fresh tmpfs data/socket directories, then drops to postgres.  Keep
+    # exactly the ownership and uid/gid transition capabilities it needs.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
+    restart: "no"
+    networks: [clone_data]
+
+  clone-evaluator:
+    build:
+      context: .
+      dockerfile: deployment/clone-evaluator/Dockerfile
+    image: postgresql-advisor/clone-evaluator:iteration-2.7
+    profiles: [real-validation]
+    environment:
+      CLONE_DATABASE_URL: postgresql://clone_admin:${CLONE_ADMIN_PASSWORD:-advisor_dev_clone_admin}@clone-db:5432/postgres?sslmode=disable
+      CLONE_TEMPLATE_DATABASE: appdb
+      CLONE_ADMIN_ROLE: clone_admin
+      CLONE_RUNNER_ROLE: clone_runner
+      CLONE_RUNNER_PASSWORD: ${CLONE_RUNNER_PASSWORD:-advisor_dev_clone_runner}
+      CLONE_EVALUATOR_TOKEN: ${CLONE_EVALUATOR_TOKEN:-advisor-dev-clone-evaluator-token}
+      CLONE_STATEMENT_TIMEOUT_MS: ${CLONE_STATEMENT_TIMEOUT_MS:-10000}
+      CLONE_LOCK_TIMEOUT_MS: ${CLONE_LOCK_TIMEOUT_MS:-1000}
+      CLONE_TRANSACTION_TIMEOUT_MS: ${CLONE_TRANSACTION_TIMEOUT_MS:-15000}
+      CLONE_WARMUP_RUNS: ${CLONE_WARMUP_RUNS:-1}
+      CLONE_MEASURED_RUNS: ${CLONE_MEASURED_RUNS:-5}
+      CLONE_MIN_IMPROVEMENT_PERCENT: ${CLONE_MIN_IMPROVEMENT_PERCENT:-10}
+    depends_on:
+      clone-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    restart: "no"
+    networks: [clone_control, clone_data]
+
   workload:
     build:
       context: ./deployment/workload
@@ -205,14 +363,14 @@ services:
         condition: service_healthy
     profiles: [demo]
     restart: unless-stopped
-    networks: [advisor]
+    networks: [workload_source]
 
   web:
     build:
       context: ./frontend
-    image: postgresql-advisor/web:iteration-2.3
+    image: postgresql-advisor/web:iteration-2.7
     ports:
-      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-5173}:80"
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-5173}:80"
     depends_on:
       api:
         condition: service_healthy
@@ -231,6 +389,23 @@ networks:
     driver: bridge
     internal: true
   evaluator_source:
+    driver: bridge
+    internal: true
+  collector_source:
+    driver: bridge
+  join_source:
+    driver: bridge
+    internal: true
+  join_repository:
+    driver: bridge
+    internal: true
+  workload_source:
+    driver: bridge
+    internal: true
+  clone_control:
+    driver: bridge
+    internal: true
+  clone_data:
     driver: bridge
     internal: true
 

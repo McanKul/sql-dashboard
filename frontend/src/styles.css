@@ -405,6 +405,10 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .cpu-metric-grid > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; padding: 11px; border: 1px solid #e7eaf0; border-radius: 9px; background: #fafbfc; }
 .cpu-metric-grid span, .cpu-metric-grid small { color: #8b95a6; font-size: 9px; }
 .cpu-metric-grid strong { overflow: hidden; color: #39465d; font-size: 13px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.wait-event-list { display: grid; gap: 8px; margin-top: 12px; }
+.wait-event-list > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid #e7eaf0; border-radius: 9px; background: #fafbfc; }
+.wait-event-list span { overflow: hidden; color: #667085; text-overflow: ellipsis; white-space: nowrap; }
+.wait-event-list strong { color: #39465d; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .comparison-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 15px; }
 .comparison-item { padding: 12px; border: 1px solid #e8ebf0; border-radius: 9px; background: #fbfcfd; }
 .comparison-item > span { color: #828b9c; font-size: 8.5px; font-weight: 630; }

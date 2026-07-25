@@ -44,13 +44,25 @@ SELECT s.id, s.hostname, s.port, s.dbname, s.frequency,
            AND f.enabled
            AND f.operation IN ('snapshot', 'aggregate', 'purge', 'reset')),
        (SELECT count(*) FROM "PoWA".powa_kcache_metrics_current h WHERE h.srvid = s.id)
-         + (SELECT count(*) FROM "PoWA".powa_kcache_metrics h WHERE h.srvid = s.id)
+         + (SELECT count(*) FROM "PoWA".powa_kcache_metrics h WHERE h.srvid = s.id),
+       coalesce(waits.version, ''),
+       coalesce(waits.enabled, false),
+       (SELECT count(*) = 4
+          FROM "PoWA".powa_functions f
+         WHERE f.srvid = s.id
+           AND f.name = 'pg_wait_sampling'
+           AND f.enabled
+           AND f.operation IN ('snapshot', 'aggregate', 'purge', 'reset')),
+       (SELECT count(*) FROM "PoWA".powa_wait_sampling_history_current h WHERE h.srvid = s.id)
+         + (SELECT count(*) FROM "PoWA".powa_wait_sampling_history h WHERE h.srvid = s.id)
   FROM "PoWA".powa_servers AS s
   JOIN "PoWA".powa_snapshot_metas AS m ON m.srvid = s.id
   LEFT JOIN "PoWA".powa_extension_config AS ec
     ON ec.srvid = s.id AND ec.extname = 'pg_qualstats'
   LEFT JOIN "PoWA".powa_extension_config AS kcache
     ON kcache.srvid = s.id AND kcache.extname = 'pg_stat_kcache'
+  LEFT JOIN "PoWA".powa_extension_config AS waits
+    ON waits.srvid = s.id AND waits.extname = 'pg_wait_sampling'
  WHERE s.alias = :'source_alias';
 SQL
 row="$(printf '%s\n' "$repo_sql" | docker compose exec -T repository-db \
@@ -59,9 +71,11 @@ row="$(printf '%s\n' "$repo_sql" | docker compose exec -T repository-db \
   --set=source_alias="$alias_name")"
 
 [[ -n "$row" ]] || fail "Repository'de alias bulunamadi: ${alias_name}"
-IFS='|' read -r server_id hostname port database frequency password_null has_snapshot error_count pgqs_version pgqs_enabled pgqs_functions pgqs_history_rows pgsk_version pgsk_enabled pgsk_functions pgsk_history_rows <<< "$row"
+IFS='|' read -r server_id hostname port database frequency password_null has_snapshot error_count pgqs_version pgqs_enabled pgqs_functions pgqs_history_rows pgsk_version pgsk_enabled pgsk_functions pgsk_history_rows pgws_version pgws_enabled pgws_functions pgws_history_rows <<< "$row"
 [[ "$server_id" =~ ^[0-9]+$ ]] || fail "Server id gecersiz: ${server_id}"
-[[ "$frequency" =~ ^[0-9]+$ ]] && ((frequency >= 5)) || fail "Kaynak aktif degil: frequency=${frequency}"
+if ! [[ "$frequency" =~ ^[0-9]+$ ]] || ((frequency < 5)); then
+  fail "Kaynak aktif degil: frequency=${frequency}"
+fi
 [[ "$password_null" == t ]] || fail "Kaynak parolasi repository'de saklaniyor"
 [[ "$has_snapshot" == t ]] || fail "Kaynak henuz snapshot uretmedi"
 [[ "$error_count" == 0 ]] || fail "Collector kaynak icin ${error_count} hata raporluyor"
@@ -71,7 +85,10 @@ IFS='|' read -r server_id hostname port database frequency password_null has_sna
 [[ "$pgsk_version" =~ ^2\.3\. && "$pgsk_enabled" == t && "$pgsk_functions" == t ]] \
   || fail "pg_stat_kcache datasource eksik: version=${pgsk_version:-yok}, enabled=${pgsk_enabled}, functions=${pgsk_functions}"
 [[ "$pgsk_history_rows" =~ ^[0-9]+$ ]] || fail "pg_stat_kcache history sayaci gecersiz: ${pgsk_history_rows}"
-pass "PoWA/pg_qualstats/pg_stat_kcache kaydi aktif; parola NULL ve snapshot saglikli (server id ${server_id}, qual history ${pgqs_history_rows}, CPU history ${pgsk_history_rows})"
+[[ "$pgws_version" == "1.1" && "$pgws_enabled" == t && "$pgws_functions" == t ]] \
+  || fail "pg_wait_sampling datasource eksik: extension_version=${pgws_version:-yok}, enabled=${pgws_enabled}, functions=${pgws_functions}"
+[[ "$pgws_history_rows" =~ ^[0-9]+$ ]] || fail "pg_wait_sampling history sayaci gecersiz: ${pgws_history_rows}"
+pass "PoWA/qualstats/kcache/wait sampling kaydi aktif; parola NULL ve snapshot saglikli (server id ${server_id}, qual history ${pgqs_history_rows}, CPU history ${pgsk_history_rows}, wait history ${pgws_history_rows})"
 
 secret_path="runtime/collector/sources/${alias_name}.pgpass"
 [[ -f "$secret_path" ]] || fail "Collector secret dosyasi bulunamadi: ${secret_path}"

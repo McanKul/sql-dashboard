@@ -36,10 +36,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="PostgreSQL Sorgu Performansi ve Oneri Motoru",
-    version="1.0.0-iteration-2.2",
+    version="1.0.0-iteration-2.7",
     description=(
-        "PoWA repository uzerinden sorgu analizi ve ayri salt-okunur evaluator ile "
-        "istege bagli HypoPG plan dogrulamasi."
+        "PoWA repository uzerinden CPU/bekleme analizi, JOIN snapshotlari, composite "
+        "index onerileri, HypoPG ve istege bagli izole clone dogrulamasi."
     ),
     lifespan=lifespan,
 )

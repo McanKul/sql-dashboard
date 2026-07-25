@@ -1,6 +1,120 @@
 \set ON_ERROR_STOP on
 
 CREATE SCHEMA IF NOT EXISTS advisor AUTHORIZATION postgres;
+CREATE SCHEMA IF NOT EXISTS advisor_ingest AUTHORIZATION postgres;
+REVOKE ALL ON SCHEMA advisor_ingest FROM PUBLIC;
+
+-- Private ingest objects stay private by default in later migrations too.
+-- Individual low-privilege entry points are granted explicitly at the end of
+-- this file; tables, sequences and future functions are never PUBLIC.
+ALTER DEFAULT PRIVILEGES IN SCHEMA advisor_ingest
+    REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA advisor_ingest
+    REVOKE ALL ON SEQUENCES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA advisor_ingest
+    REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
+CREATE TABLE IF NOT EXISTS advisor_ingest.join_snapshot_batches (
+    server_id integer NOT NULL,
+    batch_id bigint NOT NULL,
+    captured_at timestamptz NOT NULL,
+    ingested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    row_count integer NOT NULL,
+    PRIMARY KEY (server_id, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS advisor_ingest.join_predicate_samples (
+    sample_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    server_id integer NOT NULL,
+    batch_id bigint NOT NULL,
+    dbid oid NOT NULL,
+    userid oid NOT NULL,
+    queryid bigint NOT NULL,
+    qualid bigint NOT NULL,
+    qualnodeid bigint NOT NULL,
+    lrelid oid,
+    lattnum smallint,
+    opno oid NOT NULL,
+    operator_name text,
+    operator_commutator oid,
+    btree_strategy smallint,
+    rrelid oid,
+    rattnum smallint,
+    occurences bigint NOT NULL,
+    execution_count bigint NOT NULL,
+    nbfiltered bigint NOT NULL,
+    eval_type "char" NOT NULL,
+    is_join boolean NOT NULL,
+    UNIQUE NULLS NOT DISTINCT (
+        server_id, batch_id, dbid, userid, queryid, qualnodeid,
+        opno, lrelid, lattnum, rrelid, rattnum
+    ),
+    FOREIGN KEY (server_id, batch_id)
+        REFERENCES advisor_ingest.join_snapshot_batches(server_id, batch_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS join_predicate_samples_lookup_idx
+    ON advisor_ingest.join_predicate_samples
+    (server_id, dbid, queryid, is_join, batch_id);
+
+CREATE TABLE IF NOT EXISTS advisor_ingest.join_source_status (
+    server_id integer PRIMARY KEY,
+    status text NOT NULL DEFAULT 'STARTING'
+        CHECK (status IN ('STARTING', 'HEALTHY', 'DEGRADED', 'ERROR')),
+    last_capture_at timestamptz,
+    last_ingest_at timestamptz,
+    last_batch_id bigint,
+    last_row_count integer,
+    last_error text,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Every repository login used by a JOIN snapshotter is pinned to one PoWA
+-- source.  SECURITY DEFINER entry points resolve this table with session_user,
+-- so a caller cannot select another source by changing a request parameter or
+-- by using SET ROLE.  Multiple roles may intentionally point at the same
+-- source during credential rotation, but one role can never span sources.
+CREATE TABLE IF NOT EXISTS advisor_ingest.join_source_role_bindings (
+    role_name name PRIMARY KEY,
+    server_id integer NOT NULL,
+    bound_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS join_source_role_bindings_server_idx
+    ON advisor_ingest.join_source_role_bindings (server_id);
+
+REVOKE ALL ON ALL TABLES IN SCHEMA advisor_ingest FROM PUBLIC;
+
+CREATE TABLE IF NOT EXISTS advisor.index_candidates (
+    candidate_id uuid PRIMARY KEY,
+    server_id integer NOT NULL,
+    database_id oid NOT NULL,
+    query_id bigint NOT NULL,
+    relation_id oid NOT NULL,
+    schema_name text NOT NULL,
+    table_name text NOT NULL,
+    method text NOT NULL DEFAULT 'btree' CHECK (method = 'btree'),
+    key_attnums smallint[] NOT NULL CHECK (cardinality(key_attnums) = 2),
+    key_column_names text[] NOT NULL CHECK (cardinality(key_column_names) = 2),
+    operator_oids oid[] NOT NULL,
+    ordering_rule text NOT NULL,
+    first_supported_at timestamptz NOT NULL,
+    last_supported_at timestamptz NOT NULL,
+    UNIQUE (server_id, database_id, query_id, relation_id, key_attnums)
+);
+
+CREATE TABLE IF NOT EXISTS advisor.index_candidate_evidence (
+    candidate_id uuid NOT NULL REFERENCES advisor.index_candidates(candidate_id) ON DELETE CASCADE,
+    server_id integer NOT NULL,
+    batch_id bigint NOT NULL,
+    captured_at timestamptz NOT NULL,
+    join_occurrences bigint NOT NULL,
+    filter_occurrences bigint NOT NULL,
+    rows_processed bigint NOT NULL,
+    rows_filtered bigint NOT NULL,
+    PRIMARY KEY (candidate_id, server_id, batch_id)
+);
 
 CREATE TABLE IF NOT EXISTS advisor.query_annotations (
     server_id integer NOT NULL,
@@ -359,6 +473,78 @@ WHERE previous_user_time IS NOT NULL
   AND sample_at >= p_start;
 $$;
 
+-- pg_wait_sampling profile counters are cumulative.  PoWA stores one series
+-- per query/event and intentionally drops NULL event rows (CPU/runnable
+-- samples).  Keep raw event names, calculate reset-safe sample deltas and do
+-- not convert samples to wall-clock or CPU time.
+CREATE OR REPLACE FUNCTION advisor.wait_deltas(p_start timestamptz)
+RETURNS TABLE (
+    server_id integer,
+    database_id oid,
+    query_id bigint,
+    event_type text,
+    event text,
+    sample_at timestamptz,
+    samples bigint
+)
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, advisor
+AS $$
+WITH raw_samples AS (
+    SELECT
+        h.srvid AS server_id,
+        h.dbid AS database_id,
+        h.queryid AS query_id,
+        h.event_type,
+        h.event,
+        (sample_record).ts AS sample_at,
+        (sample_record).count::numeric AS sample_count
+    FROM "PoWA".powa_wait_sampling_history AS h
+    CROSS JOIN LATERAL unnest(h.records) AS sample_record
+    WHERE h.coalesce_range && tstzrange(p_start - interval '1 hour', now(), '[]')
+      AND (sample_record).ts >= p_start - interval '1 hour'
+      AND (sample_record).ts <= now()
+    UNION ALL
+    SELECT
+        c.srvid,
+        c.dbid,
+        c.queryid,
+        c.event_type,
+        c.event,
+        (c.record).ts,
+        (c.record).count::numeric
+    FROM "PoWA".powa_wait_sampling_history_current AS c
+    WHERE (c.record).ts >= p_start - interval '1 hour'
+      AND (c.record).ts <= now()
+), ordered AS (
+    SELECT
+        raw_samples.*,
+        lag(sample_count) OVER (
+            PARTITION BY server_id, database_id, query_id, event_type, event
+            ORDER BY sample_at
+        ) AS previous_count
+    FROM raw_samples
+)
+SELECT
+    server_id,
+    database_id,
+    query_id,
+    event_type,
+    event,
+    sample_at,
+    CASE
+        WHEN sample_count >= previous_count THEN sample_count - previous_count
+        ELSE sample_count
+    END::bigint AS samples
+FROM ordered
+WHERE previous_count IS NOT NULL
+  AND sample_at >= p_start
+  AND query_id <> 0
+  AND event_type IS NOT NULL
+  AND event IS NOT NULL;
+$$;
+
 -- The return shape grew in iteration 1.  Drop the three convenience views first
 -- so this migration remains rerunnable on an already initialized repository.
 DROP VIEW IF EXISTS advisor.v_query_summary;
@@ -393,6 +579,23 @@ RETURNS TABLE (
     cpu_percent_of_exec_time double precision,
     filesystem_reads_bytes bigint,
     filesystem_writes_bytes bigint,
+    wait_sampling_available boolean,
+    wait_sampling_version text,
+    wait_sampling_data_available boolean,
+    wait_total_samples bigint,
+    wait_io_samples bigint,
+    wait_lock_samples bigint,
+    wait_lwlock_samples bigint,
+    wait_client_samples bigint,
+    wait_ipc_samples bigint,
+    wait_timeout_samples bigint,
+    wait_activity_samples bigint,
+    wait_extension_samples bigint,
+    wait_other_samples bigint,
+    dominant_wait_category text,
+    dominant_wait_event text,
+    dominant_wait_share_percent double precision,
+    wait_events jsonb,
     previous_calls bigint,
     previous_mean_exec_time_ms double precision,
     regression_percent double precision,
@@ -484,6 +687,89 @@ WITH period AS (
     FROM "PoWA".powa_extension_config AS config
     WHERE config.extname = 'pg_stat_kcache'
     GROUP BY config.srvid
+), wait_period AS (
+    SELECT
+        w.server_id,
+        w.database_id,
+        w.query_id,
+        w.event_type,
+        w.event,
+        CASE upper(w.event_type)
+            WHEN 'IO' THEN 'IO'
+            WHEN 'LOCK' THEN 'LOCK'
+            WHEN 'BUFFERPIN' THEN 'LOCK'
+            WHEN 'LWLOCK' THEN 'LWLOCK'
+            WHEN 'LWLOCKNAMED' THEN 'LWLOCK'
+            WHEN 'LWLOCKTRANCHE' THEN 'LWLOCK'
+            WHEN 'CLIENT' THEN 'CLIENT'
+            WHEN 'IPC' THEN 'IPC'
+            WHEN 'TIMEOUT' THEN 'TIMEOUT'
+            WHEN 'ACTIVITY' THEN 'ACTIVITY'
+            WHEN 'EXTENSION' THEN 'EXTENSION'
+            ELSE 'OTHER'
+        END AS category,
+        sum(w.samples)::bigint AS samples
+    FROM advisor.wait_deltas(now() - p_window) AS w
+    WHERE w.sample_at >= now() - p_window
+      AND w.samples > 0
+    GROUP BY w.server_id, w.database_id, w.query_id, w.event_type, w.event
+), wait_with_category_totals AS (
+    SELECT
+        wait_period.*,
+        sum(samples) OVER (
+            PARTITION BY server_id, database_id, query_id, category
+        )::bigint AS category_samples
+    FROM wait_period
+), wait_ranked AS (
+    SELECT
+        wait_with_category_totals.*,
+        row_number() OVER (
+            PARTITION BY server_id, database_id, query_id
+            ORDER BY samples DESC, event_type, event
+        ) AS event_rank,
+        row_number() OVER (
+            PARTITION BY server_id, database_id, query_id
+            ORDER BY category_samples DESC, samples DESC, event_type, event
+        ) AS dominant_rank
+    FROM wait_with_category_totals
+), wait_summary AS (
+    SELECT
+        w.server_id,
+        w.database_id,
+        w.query_id,
+        sum(w.samples)::bigint AS total_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'IO')::bigint AS io_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'LOCK')::bigint AS lock_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'LWLOCK')::bigint AS lwlock_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'CLIENT')::bigint AS client_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'IPC')::bigint AS ipc_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'TIMEOUT')::bigint AS timeout_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'ACTIVITY')::bigint AS activity_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'EXTENSION')::bigint AS extension_samples,
+        sum(w.samples) FILTER (WHERE w.category = 'OTHER')::bigint AS other_samples,
+        max(w.category) FILTER (WHERE w.dominant_rank = 1) AS dominant_category,
+        max(w.event) FILTER (WHERE w.dominant_rank = 1) AS dominant_event,
+        max(w.category_samples) FILTER (WHERE w.dominant_rank = 1)::bigint AS dominant_samples,
+        jsonb_agg(
+            jsonb_build_object(
+                'category', w.category,
+                'eventType', w.event_type,
+                'event', w.event,
+                'samples', w.samples
+            ) ORDER BY w.samples DESC, w.event_type, w.event
+        ) AS events
+    FROM wait_ranked AS w
+    GROUP BY w.server_id, w.database_id, w.query_id
+), wait_capability AS (
+    SELECT
+        config.srvid AS server_id,
+        bool_or(config.enabled) AS available,
+        max(config.version)::text AS version,
+        bool_or(meta.snapts > '-infinity'::timestamptz) AS data_available
+    FROM "PoWA".powa_extension_config AS config
+    LEFT JOIN "PoWA".powa_snapshot_metas AS meta ON meta.srvid = config.srvid
+    WHERE config.extname = 'pg_wait_sampling'
+    GROUP BY config.srvid
 ), enriched AS (
     SELECT
         p.*,
@@ -496,6 +782,23 @@ WITH period AS (
         k.cpu_system_time_ms,
         k.filesystem_reads_bytes,
         k.filesystem_writes_bytes,
+        COALESCE(wait_cap.available, false) AS wait_sampling_available,
+        wait_cap.version AS wait_sampling_version,
+        COALESCE(wait_cap.data_available, false) AS wait_sampling_data_available,
+        COALESCE(ws.total_samples, 0)::bigint AS wait_total_samples,
+        COALESCE(ws.io_samples, 0)::bigint AS wait_io_samples,
+        COALESCE(ws.lock_samples, 0)::bigint AS wait_lock_samples,
+        COALESCE(ws.lwlock_samples, 0)::bigint AS wait_lwlock_samples,
+        COALESCE(ws.client_samples, 0)::bigint AS wait_client_samples,
+        COALESCE(ws.ipc_samples, 0)::bigint AS wait_ipc_samples,
+        COALESCE(ws.timeout_samples, 0)::bigint AS wait_timeout_samples,
+        COALESCE(ws.activity_samples, 0)::bigint AS wait_activity_samples,
+        COALESCE(ws.extension_samples, 0)::bigint AS wait_extension_samples,
+        COALESCE(ws.other_samples, 0)::bigint AS wait_other_samples,
+        ws.dominant_category AS dominant_wait_category,
+        ws.dominant_event AS dominant_wait_event,
+        100.0 * ws.dominant_samples / NULLIF(ws.total_samples, 0) AS dominant_wait_share_percent,
+        COALESCE(ws.events, '[]'::jsonb) AS wait_events,
         p.rows / NULLIF(p.calls, 0)::double precision AS rows_per_call,
         p.total_exec_time_ms / NULLIF(p.calls, 0) AS mean_exec_time_ms,
         p.previous_total_exec_time_ms / NULLIF(p.previous_calls, 0) AS previous_mean_exec_time_ms,
@@ -526,6 +829,11 @@ WITH period AS (
      AND k.database_id = p.database_id
      AND k.query_id = p.query_id
     LEFT JOIN kcache_capability AS cap ON cap.server_id = p.server_id
+    LEFT JOIN wait_summary AS ws
+      ON ws.server_id = p.server_id
+     AND ws.database_id = p.database_id
+     AND ws.query_id = p.query_id
+    LEFT JOIN wait_capability AS wait_cap ON wait_cap.server_id = p.server_id
     WHERE COALESCE(p.calls, 0) > 0
       AND s.query !~* '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|SET|SHOW)([[:space:]]|$)'
 ), ranked AS (
@@ -622,6 +930,23 @@ SELECT
         / NULLIF(sc.total_exec_time_ms, 0),
     sc.filesystem_reads_bytes,
     sc.filesystem_writes_bytes,
+    sc.wait_sampling_available,
+    sc.wait_sampling_version,
+    sc.wait_sampling_data_available,
+    sc.wait_total_samples,
+    sc.wait_io_samples,
+    sc.wait_lock_samples,
+    sc.wait_lwlock_samples,
+    sc.wait_client_samples,
+    sc.wait_ipc_samples,
+    sc.wait_timeout_samples,
+    sc.wait_activity_samples,
+    sc.wait_extension_samples,
+    sc.wait_other_samples,
+    sc.dominant_wait_category,
+    sc.dominant_wait_event,
+    sc.dominant_wait_share_percent,
+    sc.wait_events,
     COALESCE(sc.previous_calls, 0),
     sc.previous_mean_exec_time_ms,
     sc.regression_percent,
@@ -1777,6 +2102,458 @@ WHERE latest.transaction_started_at IS NOT NULL
   AND COALESCE(latest.state, '') <> 'idle'
   AND COALESCE(latest.application_name, '') !~ '^PoWA collector';
 
+CREATE OR REPLACE FUNCTION advisor_ingest.refresh_candidates(
+    p_server_id integer,
+    p_batch_id bigint
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor, advisor_ingest
+AS $$
+DECLARE
+    v_count integer;
+BEGIN
+    -- Product query identity is server/database/query_id, matching the public
+    -- metrics API.  Aggregate identical predicate evidence across PostgreSQL
+    -- users before candidate_id generation; retaining userid here would emit
+    -- duplicate conflict keys in a single upsert for shared queries.
+    WITH join_sides AS (
+        SELECT
+            sample.server_id,
+            sample.batch_id,
+            sample.dbid,
+            sample.queryid,
+            side.relation_id,
+            side.attribute_number,
+            sample.opno,
+            sample.occurences
+        FROM advisor_ingest.join_predicate_samples AS sample
+        CROSS JOIN LATERAL (
+            VALUES
+                (sample.lrelid, sample.lattnum),
+                (sample.rrelid, sample.rattnum)
+        ) AS side(relation_id, attribute_number)
+        WHERE sample.server_id = p_server_id
+          AND sample.batch_id = p_batch_id
+          AND sample.is_join
+          AND sample.btree_strategy = 3
+          AND side.relation_id IS NOT NULL
+          AND side.attribute_number IS NOT NULL
+    ), join_metrics AS (
+        SELECT
+            server_id, batch_id, dbid, queryid, relation_id,
+            attribute_number, min(opno)::oid AS opno,
+            sum(occurences)::bigint AS join_occurrences
+        FROM join_sides
+        GROUP BY server_id, batch_id, dbid, queryid, relation_id, attribute_number
+    ), filter_metrics AS (
+        SELECT
+            sample.server_id,
+            sample.batch_id,
+            sample.dbid,
+            sample.queryid,
+            sample.lrelid AS relation_id,
+            sample.lattnum AS attribute_number,
+            min(sample.opno)::oid AS opno,
+            min(sample.btree_strategy)::smallint AS btree_strategy,
+            sum(sample.occurences)::bigint AS filter_occurrences,
+            sum(sample.execution_count)::bigint AS rows_processed,
+            sum(sample.nbfiltered)::bigint AS rows_filtered
+        FROM advisor_ingest.join_predicate_samples AS sample
+        WHERE sample.server_id = p_server_id
+          AND sample.batch_id = p_batch_id
+          AND NOT sample.is_join
+          AND sample.lrelid IS NOT NULL
+          AND sample.lattnum IS NOT NULL
+          AND sample.rrelid IS NULL
+          AND sample.btree_strategy BETWEEN 1 AND 5
+        GROUP BY
+            sample.server_id, sample.batch_id, sample.dbid,
+            sample.queryid, sample.lrelid, sample.lattnum
+    ), pairs AS (
+        SELECT
+            join_metric.server_id,
+            join_metric.batch_id,
+            join_metric.dbid,
+            join_metric.queryid,
+            join_metric.relation_id,
+            CASE
+                WHEN filter_metric.btree_strategy = 3
+                 AND filter_metric.rows_filtered::double precision
+                     / NULLIF(filter_metric.rows_processed, 0) >= 0.20
+                    THEN ARRAY[filter_metric.attribute_number, join_metric.attribute_number]::smallint[]
+                ELSE ARRAY[join_metric.attribute_number, filter_metric.attribute_number]::smallint[]
+            END AS key_attnums,
+            CASE
+                WHEN filter_metric.btree_strategy = 3
+                 AND filter_metric.rows_filtered::double precision
+                     / NULLIF(filter_metric.rows_processed, 0) >= 0.20
+                    THEN ARRAY[filter_metric.opno, join_metric.opno]::oid[]
+                ELSE ARRAY[join_metric.opno, filter_metric.opno]::oid[]
+            END AS operator_oids,
+            CASE
+                WHEN filter_metric.btree_strategy <> 3 THEN 'EQUALITY_JOIN_THEN_RANGE_FILTER'
+                WHEN filter_metric.rows_filtered::double precision
+                     / NULLIF(filter_metric.rows_processed, 0) >= 0.20
+                    THEN 'SELECTIVE_EQUALITY_FILTER_THEN_JOIN'
+                ELSE 'EQUALITY_JOIN_THEN_FILTER'
+            END AS ordering_rule,
+            join_metric.join_occurrences,
+            filter_metric.filter_occurrences,
+            filter_metric.rows_processed,
+            filter_metric.rows_filtered
+        FROM join_metrics AS join_metric
+        JOIN filter_metrics AS filter_metric
+         ON filter_metric.server_id = join_metric.server_id
+         AND filter_metric.batch_id = join_metric.batch_id
+         AND filter_metric.dbid = join_metric.dbid
+         AND filter_metric.queryid = join_metric.queryid
+         AND filter_metric.relation_id = join_metric.relation_id
+         AND filter_metric.attribute_number <> join_metric.attribute_number
+    ), resolved AS (
+        SELECT
+            pair.*,
+            COALESCE(namespace.nspname::text, 'unknown') AS schema_name,
+            COALESCE(class.relname::text, 'relation-' || pair.relation_id::text) AS table_name,
+            ARRAY[first_attribute.attname::text, second_attribute.attname::text] AS key_column_names,
+            batch.captured_at,
+            md5(
+                pair.server_id::text || ':' || pair.dbid::text || ':' || pair.queryid::text || ':' ||
+                pair.relation_id::text || ':' || array_to_string(pair.key_attnums, ',')
+            )::uuid AS candidate_id
+        FROM pairs AS pair
+        JOIN advisor_ingest.join_snapshot_batches AS batch
+          ON batch.server_id = pair.server_id AND batch.batch_id = pair.batch_id
+        LEFT JOIN "PoWA".powa_catalog_class AS class
+          ON class.srvid = pair.server_id AND class.dbid = pair.dbid AND class.oid = pair.relation_id
+        LEFT JOIN "PoWA".powa_catalog_namespace AS namespace
+          ON namespace.srvid = class.srvid AND namespace.dbid = class.dbid
+         AND namespace.oid = class.relnamespace
+        LEFT JOIN "PoWA".powa_catalog_attribute AS first_attribute
+          ON first_attribute.srvid = pair.server_id AND first_attribute.dbid = pair.dbid
+         AND first_attribute.attrelid = pair.relation_id
+         AND first_attribute.attnum = pair.key_attnums[1]
+        LEFT JOIN "PoWA".powa_catalog_attribute AS second_attribute
+          ON second_attribute.srvid = pair.server_id AND second_attribute.dbid = pair.dbid
+         AND second_attribute.attrelid = pair.relation_id
+         AND second_attribute.attnum = pair.key_attnums[2]
+        WHERE first_attribute.attname IS NOT NULL
+          AND second_attribute.attname IS NOT NULL
+          AND COALESCE(namespace.nspname::text, '') !~ '^(pg_|information_schema$)'
+    ), upserted AS (
+        INSERT INTO advisor.index_candidates (
+            candidate_id, server_id, database_id, query_id, relation_id,
+            schema_name, table_name, key_attnums, key_column_names,
+            operator_oids, ordering_rule, first_supported_at, last_supported_at
+        )
+        SELECT
+            candidate_id, server_id, dbid, queryid, relation_id,
+            schema_name, table_name, key_attnums, key_column_names,
+            operator_oids, ordering_rule, captured_at, captured_at
+        FROM resolved
+        ON CONFLICT (candidate_id) DO UPDATE
+           SET schema_name = EXCLUDED.schema_name,
+               table_name = EXCLUDED.table_name,
+               key_column_names = EXCLUDED.key_column_names,
+               operator_oids = EXCLUDED.operator_oids,
+               ordering_rule = EXCLUDED.ordering_rule,
+               last_supported_at = GREATEST(
+                   advisor.index_candidates.last_supported_at,
+                   EXCLUDED.last_supported_at
+               )
+        RETURNING candidate_id
+    )
+    INSERT INTO advisor.index_candidate_evidence (
+        candidate_id, server_id, batch_id, captured_at,
+        join_occurrences, filter_occurrences, rows_processed, rows_filtered
+    )
+    SELECT
+        resolved.candidate_id, resolved.server_id, resolved.batch_id,
+        resolved.captured_at, resolved.join_occurrences,
+        resolved.filter_occurrences, resolved.rows_processed,
+        resolved.rows_filtered
+    FROM resolved
+    JOIN upserted USING (candidate_id)
+    ON CONFLICT (candidate_id, server_id, batch_id) DO NOTHING;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor_ingest.bind_join_source_role(
+    p_role name,
+    p_server_alias text
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor_ingest
+AS $$
+DECLARE
+    v_server_id integer;
+BEGIN
+    IF p_role IS NULL OR btrim(p_role::text) = '' THEN
+        RAISE EXCEPTION 'join ingest role is required';
+    END IF;
+    IF p_server_alias IS NULL OR btrim(p_server_alias) = '' THEN
+        RAISE EXCEPTION 'join source alias is required';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_role) THEN
+        RAISE EXCEPTION 'join ingest role % does not exist', p_role;
+    END IF;
+
+    SELECT server.id INTO STRICT v_server_id
+      FROM "PoWA".powa_servers AS server
+     WHERE server.alias = p_server_alias;
+
+    INSERT INTO advisor_ingest.join_source_role_bindings (
+        role_name, server_id, bound_at
+    ) VALUES (
+        p_role, v_server_id, clock_timestamp()
+    )
+    ON CONFLICT (role_name) DO UPDATE
+       SET server_id = EXCLUDED.server_id,
+           bound_at = EXCLUDED.bound_at;
+
+    -- Reapply the complete least-privilege envelope on every bind/rotation.
+    -- The role gets no table, sequence, helper, admin, or global purge access.
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), p_role);
+    EXECUTE format('REVOKE ALL ON SCHEMA advisor, advisor_ingest FROM %I', p_role);
+    EXECUTE format(
+        'REVOKE ALL ON ALL TABLES IN SCHEMA advisor, advisor_ingest FROM %I', p_role
+    );
+    EXECUTE format(
+        'REVOKE ALL ON ALL SEQUENCES IN SCHEMA advisor, advisor_ingest FROM %I', p_role
+    );
+    EXECUTE format(
+        'REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA advisor, advisor_ingest FROM %I', p_role
+    );
+    EXECUTE format('GRANT USAGE ON SCHEMA advisor_ingest TO %I', p_role);
+    EXECUTE format(
+        'GRANT EXECUTE ON FUNCTION advisor_ingest.ingest_join_batch(text,bigint,timestamptz,jsonb) TO %I',
+        p_role
+    );
+    EXECUTE format(
+        'GRANT EXECUTE ON FUNCTION advisor_ingest.record_join_error(text,text) TO %I',
+        p_role
+    );
+    EXECUTE format(
+        'GRANT EXECUTE ON FUNCTION advisor_ingest.purge_join_source_history(text,interval) TO %I',
+        p_role
+    );
+
+    RETURN v_server_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor_ingest.bound_join_server(p_server_alias text)
+RETURNS integer
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor_ingest
+AS $$
+DECLARE
+    v_server_id integer;
+BEGIN
+    SELECT binding.server_id INTO v_server_id
+      FROM advisor_ingest.join_source_role_bindings AS binding
+      JOIN "PoWA".powa_servers AS server ON server.id = binding.server_id
+     WHERE binding.role_name = session_user::name
+       AND server.alias = p_server_alias;
+
+    IF v_server_id IS NULL THEN
+        RAISE EXCEPTION 'join ingest login % is not bound to source alias %',
+            session_user, p_server_alias
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN v_server_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor_ingest.ingest_join_batch(
+    p_server_alias text,
+    p_batch_id bigint,
+    p_captured_at timestamptz,
+    p_rows jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor, advisor_ingest
+AS $$
+DECLARE
+    v_server_id integer;
+    v_inserted integer;
+    v_row_count integer;
+BEGIN
+    IF p_batch_id IS NULL
+       OR p_batch_id < 1
+       OR p_captured_at IS NULL
+       OR p_rows IS NULL
+       OR jsonb_typeof(p_rows) <> 'array' THEN
+        RAISE EXCEPTION 'invalid join snapshot batch';
+    END IF;
+    v_row_count := jsonb_array_length(p_rows);
+    IF v_row_count > 50000 THEN
+        RAISE EXCEPTION 'join snapshot batch exceeds 50000 rows';
+    END IF;
+
+    v_server_id := advisor_ingest.bound_join_server(p_server_alias);
+
+    INSERT INTO advisor_ingest.join_snapshot_batches (
+        server_id, batch_id, captured_at, row_count
+    ) VALUES (
+        v_server_id, p_batch_id, p_captured_at, v_row_count
+    ) ON CONFLICT (server_id, batch_id) DO NOTHING;
+    GET DIAGNOSTICS v_inserted = ROW_COUNT;
+
+    IF v_inserted > 0 THEN
+        INSERT INTO advisor_ingest.join_predicate_samples (
+            server_id, batch_id, dbid, userid, queryid, qualid, qualnodeid,
+            lrelid, lattnum, opno, operator_name, operator_commutator,
+            btree_strategy, rrelid, rattnum, occurences, execution_count,
+            nbfiltered, eval_type, is_join
+        )
+        SELECT
+            v_server_id, p_batch_id, row.dbid, row.userid, row.queryid,
+            row.qualid, row.qualnodeid, row.lrelid, row.lattnum, row.opno,
+            row."operatorName", row."operatorCommutator", row."btreeStrategy",
+            row.rrelid, row.rattnum, row.occurences, row."executionCount",
+            row.nbfiltered, substring(COALESCE(row."evalType", 'f'), 1, 1)::"char",
+            row."isJoin"
+        FROM jsonb_to_recordset(p_rows) AS row(
+            dbid oid, userid oid, queryid bigint, qualid bigint, qualnodeid bigint,
+            lrelid oid, lattnum smallint, opno oid, "operatorName" text,
+            "operatorCommutator" oid, "btreeStrategy" smallint,
+            rrelid oid, rattnum smallint, occurences bigint,
+            "executionCount" bigint, nbfiltered bigint, "evalType" text,
+            "isJoin" boolean
+        )
+        WHERE row.queryid <> 0
+          AND row.opno IS NOT NULL
+          AND row.occurences >= 0
+          AND row."executionCount" >= 0
+          AND row.nbfiltered >= 0
+        ON CONFLICT DO NOTHING;
+
+        PERFORM advisor_ingest.refresh_candidates(v_server_id, p_batch_id);
+    END IF;
+
+    INSERT INTO advisor_ingest.join_source_status (
+        server_id, status, last_capture_at, last_ingest_at,
+        last_batch_id, last_row_count, last_error, updated_at
+    ) VALUES (
+        v_server_id, 'HEALTHY', p_captured_at, clock_timestamp(),
+        p_batch_id, v_row_count, NULL, clock_timestamp()
+    ) ON CONFLICT (server_id) DO UPDATE
+       SET status = 'HEALTHY',
+           last_capture_at = GREATEST(
+               advisor_ingest.join_source_status.last_capture_at,
+               EXCLUDED.last_capture_at
+           ),
+           last_ingest_at = EXCLUDED.last_ingest_at,
+           last_batch_id = GREATEST(
+               advisor_ingest.join_source_status.last_batch_id,
+               EXCLUDED.last_batch_id
+           ),
+           last_row_count = EXCLUDED.last_row_count,
+           last_error = NULL,
+           updated_at = EXCLUDED.updated_at;
+    RETURN v_inserted > 0;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor_ingest.record_join_error(
+    p_server_alias text,
+    p_error text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor_ingest
+AS $$
+DECLARE
+    v_server_id integer;
+BEGIN
+    v_server_id := advisor_ingest.bound_join_server(p_server_alias);
+    INSERT INTO advisor_ingest.join_source_status(server_id, status, last_error, updated_at)
+    VALUES (
+        v_server_id,
+        'ERROR',
+        left(COALESCE(NULLIF(p_error, ''), 'unspecified join snapshotter error'), 500),
+        clock_timestamp()
+    )
+    ON CONFLICT (server_id) DO UPDATE
+       SET status = 'ERROR',
+           last_error = EXCLUDED.last_error,
+           updated_at = EXCLUDED.updated_at;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor_ingest.purge_join_source_history(
+    p_server_alias text,
+    p_retention interval DEFAULT interval '30 days'
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor, advisor_ingest
+AS $$
+DECLARE
+    v_server_id integer;
+    v_deleted bigint;
+BEGIN
+    IF p_retention IS NULL
+       OR p_retention < interval '1 day'
+       OR p_retention > interval '365 days' THEN
+        RAISE EXCEPTION 'join retention must be between 1 and 365 days';
+    END IF;
+    v_server_id := advisor_ingest.bound_join_server(p_server_alias);
+
+    DELETE FROM advisor.index_candidate_evidence
+     WHERE server_id = v_server_id
+       AND captured_at < now() - p_retention;
+    DELETE FROM advisor_ingest.join_snapshot_batches
+     WHERE server_id = v_server_id
+       AND captured_at < now() - p_retention;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    DELETE FROM advisor.index_candidates
+     WHERE server_id = v_server_id
+       AND last_supported_at < now() - p_retention;
+    RETURN v_deleted;
+END;
+$$;
+
+-- Central repository maintenance can still enforce a global retention policy,
+-- but this function is deliberately never granted to a source snapshotter.
+CREATE OR REPLACE FUNCTION advisor_ingest.purge_join_history(p_retention interval DEFAULT interval '30 days')
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor, advisor_ingest
+AS $$
+DECLARE
+    v_deleted bigint;
+BEGIN
+    IF p_retention IS NULL
+       OR p_retention < interval '1 day'
+       OR p_retention > interval '365 days' THEN
+        RAISE EXCEPTION 'join retention must be between 1 and 365 days';
+    END IF;
+    DELETE FROM advisor.index_candidate_evidence
+     WHERE captured_at < now() - p_retention;
+    DELETE FROM advisor_ingest.join_snapshot_batches
+     WHERE captured_at < now() - p_retention;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    DELETE FROM advisor.index_candidates
+     WHERE last_supported_at < now() - p_retention;
+    RETURN v_deleted;
+END;
+$$;
+
 -- pg_qualstats evidence is deliberately kept outside the impact score.  This
 -- adapter exposes only predicates that PoWA has already persisted in the
 -- repository and never emits executable DDL.  Stock PoWA 5.2 transfers
@@ -2005,6 +2782,298 @@ WHERE config.srvid = p_server_id
   AND config.extname = 'pg_qualstats';
 $$;
 
+CREATE OR REPLACE FUNCTION advisor.join_predicate_metrics(
+    p_window interval DEFAULT interval '24 hours',
+    p_server_id integer DEFAULT NULL,
+    p_database_id oid DEFAULT NULL,
+    p_query_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    server_id integer,
+    server_alias text,
+    database_id oid,
+    database_name text,
+    query_id bigint,
+    qual_id bigint,
+    qual_node_id bigint,
+    left_relation_id oid,
+    left_schema_name text,
+    left_table_name text,
+    left_attribute_number smallint,
+    left_column_name text,
+    right_relation_id oid,
+    right_schema_name text,
+    right_table_name text,
+    right_attribute_number smallint,
+    right_column_name text,
+    operator_oid oid,
+    operator_name text,
+    btree_strategy smallint,
+    occurrences bigint,
+    rows_processed bigint,
+    sample_count bigint,
+    observed_from timestamptz,
+    observed_to timestamptz,
+    signal text,
+    score_included boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor
+AS $$
+WITH metrics AS (
+    SELECT
+        sample.server_id,
+        sample.dbid,
+        sample.queryid,
+        sample.qualid,
+        sample.qualnodeid,
+        sample.lrelid,
+        sample.lattnum,
+        sample.rrelid,
+        sample.rattnum,
+        sample.opno,
+        max(sample.operator_name) AS operator_name,
+        min(sample.btree_strategy)::smallint AS btree_strategy,
+        sum(sample.occurences)::bigint AS occurrences,
+        sum(sample.execution_count)::bigint AS rows_processed,
+        count(DISTINCT sample.batch_id)::bigint AS sample_count,
+        min(batch.captured_at) AS observed_from,
+        max(batch.captured_at) AS observed_to
+    FROM advisor_ingest.join_predicate_samples AS sample
+    JOIN advisor_ingest.join_snapshot_batches AS batch
+      ON batch.server_id = sample.server_id AND batch.batch_id = sample.batch_id
+    WHERE sample.is_join
+      AND batch.captured_at >= now() - p_window
+      AND (p_server_id IS NULL OR sample.server_id = p_server_id)
+      AND (p_database_id IS NULL OR sample.dbid = p_database_id)
+      AND (p_query_id IS NULL OR sample.queryid = p_query_id)
+    GROUP BY
+        sample.server_id, sample.dbid, sample.queryid, sample.qualid,
+        sample.qualnodeid, sample.lrelid, sample.lattnum,
+        sample.rrelid, sample.rattnum, sample.opno
+)
+SELECT
+    metric.server_id,
+    COALESCE(server.alias::text, server.hostname::text, 'server-' || metric.server_id::text),
+    metric.dbid,
+    COALESCE(database.datname::text, 'db-' || metric.dbid::text),
+    metric.queryid,
+    metric.qualid,
+    metric.qualnodeid,
+    metric.lrelid,
+    COALESCE(left_namespace.nspname::text, 'unknown'),
+    COALESCE(left_class.relname::text, 'relation-' || metric.lrelid::text),
+    metric.lattnum,
+    COALESCE(left_attribute.attname::text, 'column-' || metric.lattnum::text),
+    metric.rrelid,
+    COALESCE(right_namespace.nspname::text, 'unknown'),
+    COALESCE(right_class.relname::text, 'relation-' || metric.rrelid::text),
+    metric.rattnum,
+    COALESCE(right_attribute.attname::text, 'column-' || metric.rattnum::text),
+    metric.opno,
+    metric.operator_name,
+    metric.btree_strategy,
+    metric.occurrences,
+    metric.rows_processed,
+    metric.sample_count,
+    metric.observed_from,
+    metric.observed_to,
+    CASE
+        WHEN metric.sample_count < 2 OR metric.occurrences < 5 THEN 'INSUFFICIENT_DATA'
+        WHEN metric.occurrences >= 20 THEN 'FREQUENT_JOIN'
+        ELSE 'OBSERVED_JOIN'
+    END,
+    false
+FROM metrics AS metric
+LEFT JOIN "PoWA".powa_servers AS server ON server.id = metric.server_id
+LEFT JOIN "PoWA".powa_databases AS database
+  ON database.srvid = metric.server_id AND database.oid = metric.dbid
+LEFT JOIN "PoWA".powa_catalog_class AS left_class
+  ON left_class.srvid = metric.server_id AND left_class.dbid = metric.dbid
+ AND left_class.oid = metric.lrelid
+LEFT JOIN "PoWA".powa_catalog_namespace AS left_namespace
+  ON left_namespace.srvid = left_class.srvid AND left_namespace.dbid = left_class.dbid
+ AND left_namespace.oid = left_class.relnamespace
+LEFT JOIN "PoWA".powa_catalog_attribute AS left_attribute
+  ON left_attribute.srvid = metric.server_id AND left_attribute.dbid = metric.dbid
+ AND left_attribute.attrelid = metric.lrelid AND left_attribute.attnum = metric.lattnum
+LEFT JOIN "PoWA".powa_catalog_class AS right_class
+  ON right_class.srvid = metric.server_id AND right_class.dbid = metric.dbid
+ AND right_class.oid = metric.rrelid
+LEFT JOIN "PoWA".powa_catalog_namespace AS right_namespace
+  ON right_namespace.srvid = right_class.srvid AND right_namespace.dbid = right_class.dbid
+ AND right_namespace.oid = right_class.relnamespace
+LEFT JOIN "PoWA".powa_catalog_attribute AS right_attribute
+  ON right_attribute.srvid = metric.server_id AND right_attribute.dbid = metric.dbid
+ AND right_attribute.attrelid = metric.rrelid AND right_attribute.attnum = metric.rattnum
+WHERE COALESCE(left_namespace.nspname::text, '') !~ '^(pg_|information_schema$)'
+  AND COALESCE(right_namespace.nspname::text, '') !~ '^(pg_|information_schema$)'
+ORDER BY metric.occurrences DESC, metric.qualnodeid;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor.join_snapshot_capability(p_server_id integer)
+RETURNS TABLE (
+    available boolean,
+    data_available boolean,
+    status text,
+    last_snapshot_at timestamptz,
+    lag_seconds double precision,
+    capture_mode text,
+    reason text
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor
+AS $$
+SELECT
+    source.server_id IS NOT NULL,
+    source.last_capture_at IS NOT NULL,
+    CASE
+        WHEN source.server_id IS NULL THEN 'UNAVAILABLE'
+        WHEN source.last_error IS NOT NULL THEN 'ERROR'
+        WHEN source.last_capture_at < now() - make_interval(
+            secs => greatest(COALESCE(server.frequency, 60), 5) * 3 + 30
+        ) THEN 'DEGRADED'
+        ELSE source.status
+    END,
+    source.last_capture_at,
+    extract(epoch FROM clock_timestamp() - source.last_capture_at)::double precision,
+    'QUALSTATS_RESET_BOUNDARY',
+    CASE
+        WHEN source.server_id IS NULL THEN 'JOIN snapshotter bu kaynak icin yapilandirilmamis.'
+        WHEN source.last_error IS NOT NULL THEN 'JOIN snapshotter son aktarimda hata raporladi.'
+        WHEN source.last_capture_at < now() - make_interval(
+            secs => greatest(COALESCE(server.frequency, 60), 5) * 3 + 30
+        ) THEN 'JOIN snapshotter verisi kaynak snapshot frekansina gore gecikmis.'
+        ELSE 'JOIN predicate outbox aktarimi saglikli.'
+    END
+FROM (SELECT p_server_id AS requested_server) AS requested
+LEFT JOIN advisor_ingest.join_source_status AS source
+  ON source.server_id = requested.requested_server
+LEFT JOIN "PoWA".powa_servers AS server
+  ON server.id = requested.requested_server;
+$$;
+
+CREATE OR REPLACE FUNCTION advisor.composite_index_candidates(
+    p_window interval DEFAULT interval '24 hours',
+    p_server_id integer DEFAULT NULL,
+    p_database_id oid DEFAULT NULL,
+    p_query_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    candidate_id uuid,
+    server_id integer,
+    database_id oid,
+    query_id bigint,
+    relation_id oid,
+    schema_name text,
+    table_name text,
+    method text,
+    key_column_names text[],
+    key_attnums smallint[],
+    operator_oids oid[],
+    ordering_rule text,
+    join_occurrences bigint,
+    filter_occurrences bigint,
+    rows_processed bigint,
+    rows_filtered bigint,
+    filter_ratio double precision,
+    sample_count bigint,
+    observed_from timestamptz,
+    observed_to timestamptz,
+    confidence text,
+    create_index_sql text,
+    existing_index_checked boolean,
+    score_included boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, advisor
+AS $$
+WITH evidence AS (
+    SELECT
+        candidate.candidate_id,
+        sum(sample.join_occurrences)::bigint AS join_occurrences,
+        sum(sample.filter_occurrences)::bigint AS filter_occurrences,
+        sum(sample.rows_processed)::bigint AS rows_processed,
+        sum(sample.rows_filtered)::bigint AS rows_filtered,
+        count(*)::bigint AS sample_count,
+        min(sample.captured_at) AS observed_from,
+        max(sample.captured_at) AS observed_to
+    FROM advisor.index_candidates AS candidate
+    JOIN advisor.index_candidate_evidence AS sample USING (candidate_id)
+    WHERE sample.captured_at >= now() - p_window
+      AND (p_server_id IS NULL OR candidate.server_id = p_server_id)
+      AND (p_database_id IS NULL OR candidate.database_id = p_database_id)
+      AND (p_query_id IS NULL OR candidate.query_id = p_query_id)
+    GROUP BY candidate.candidate_id
+)
+SELECT
+    candidate.candidate_id,
+    candidate.server_id,
+    candidate.database_id,
+    candidate.query_id,
+    candidate.relation_id,
+    candidate.schema_name,
+    candidate.table_name,
+    candidate.method,
+    candidate.key_column_names,
+    candidate.key_attnums,
+    candidate.operator_oids,
+    candidate.ordering_rule,
+    evidence.join_occurrences,
+    evidence.filter_occurrences,
+    evidence.rows_processed,
+    evidence.rows_filtered,
+    LEAST(1.0, GREATEST(
+        0.0,
+        evidence.rows_filtered::double precision / NULLIF(evidence.rows_processed, 0)
+    )),
+    evidence.sample_count,
+    evidence.observed_from,
+    evidence.observed_to,
+    CASE
+        WHEN evidence.sample_count >= 3
+         AND evidence.join_occurrences >= 20
+         AND evidence.filter_occurrences >= 20
+         AND evidence.rows_filtered::double precision / NULLIF(evidence.rows_processed, 0) >= 0.20
+            THEN 'HIGH'
+        WHEN evidence.sample_count >= 2
+         AND evidence.join_occurrences >= 5
+         AND evidence.filter_occurrences >= 5
+            THEN 'MEDIUM'
+        ELSE 'LOW'
+    END,
+    format(
+        'CREATE INDEX CONCURRENTLY %I ON %I.%I USING btree (%I, %I);',
+        'idx_advisor_' || left(regexp_replace(candidate.table_name, '[^a-zA-Z0-9_]+', '_', 'g'), 24)
+            || '_' || substr(replace(candidate.candidate_id::text, '-', ''), 1, 8),
+        candidate.schema_name,
+        candidate.table_name,
+        candidate.key_column_names[1],
+        candidate.key_column_names[2]
+    ),
+    false,
+    false
+FROM advisor.index_candidates AS candidate
+JOIN evidence USING (candidate_id)
+WHERE evidence.sample_count >= 2
+  AND evidence.join_occurrences >= 5
+  AND evidence.filter_occurrences >= 5
+ORDER BY
+    CASE
+        WHEN evidence.sample_count >= 3
+         AND evidence.join_occurrences >= 20
+         AND evidence.filter_occurrences >= 20 THEN 1
+        ELSE 2
+    END,
+    evidence.join_occurrences + evidence.filter_occurrences DESC;
+$$;
+
 GRANT USAGE ON SCHEMA advisor TO advisor_api;
 GRANT SELECT ON ALL TABLES IN SCHEMA advisor TO advisor_api;
 GRANT INSERT, UPDATE ON advisor.query_annotations TO advisor_api;
@@ -2012,6 +3081,7 @@ GRANT INSERT ON advisor.audit_log TO advisor_api;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA advisor TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.query_deltas(timestamptz) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.kcache_deltas(timestamptz) TO advisor_api;
+GRANT EXECUTE ON FUNCTION advisor.wait_deltas(timestamptz) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.query_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.index_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.database_io_metrics(interval) TO advisor_api;
@@ -2021,9 +3091,63 @@ REVOKE ALL ON FUNCTION advisor.predicate_metrics(interval, integer, oid, bigint)
 GRANT EXECUTE ON FUNCTION advisor.predicate_metrics(interval, integer, oid, bigint) TO advisor_api;
 REVOKE ALL ON FUNCTION advisor.predicate_capability(integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION advisor.predicate_capability(integer) TO advisor_api;
+REVOKE ALL ON FUNCTION advisor.join_predicate_metrics(interval, integer, oid, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION advisor.join_predicate_metrics(interval, integer, oid, bigint) TO advisor_api;
+REVOKE ALL ON FUNCTION advisor.join_snapshot_capability(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION advisor.join_snapshot_capability(integer) TO advisor_api;
+REVOKE ALL ON FUNCTION advisor.composite_index_candidates(interval, integer, oid, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION advisor.composite_index_candidates(interval, integer, oid, bigint) TO advisor_api;
+
+REVOKE ALL ON SCHEMA advisor_ingest FROM PUBLIC, advisor_api;
+REVOKE ALL ON ALL TABLES IN SCHEMA advisor_ingest FROM PUBLIC, advisor_api;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA advisor_ingest FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.refresh_candidates(integer, bigint)
+    FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.bind_join_source_role(name, text)
+    FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.bound_join_server(text)
+    FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.ingest_join_batch(text, bigint, timestamptz, jsonb)
+    FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.record_join_error(text, text)
+    FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.purge_join_source_history(text, interval)
+    FROM PUBLIC, advisor_api;
+REVOKE ALL ON FUNCTION advisor_ingest.purge_join_history(interval)
+    FROM PUBLIC, advisor_api;
+
+-- The adapter is intentionally rerunnable before an existing installation has
+-- created its new snapshotter login.  Fresh installs create the role first;
+-- the existing-volume migration creates it and reapplies this file.  Keeping
+-- the role-specific ACLs conditional avoids coupling unrelated wait/CPU schema
+-- upgrades to a credential that may not exist yet.
+DO $acl$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'advisor_join_ingest') THEN
+        REVOKE ALL ON SCHEMA advisor_ingest FROM advisor_join_ingest;
+        REVOKE ALL ON ALL TABLES IN SCHEMA advisor_ingest FROM advisor_join_ingest;
+        REVOKE ALL ON ALL SEQUENCES IN SCHEMA advisor_ingest FROM advisor_join_ingest;
+        REVOKE ALL ON FUNCTION advisor_ingest.refresh_candidates(integer, bigint)
+            FROM advisor_join_ingest;
+        REVOKE ALL ON FUNCTION advisor_ingest.bind_join_source_role(name, text)
+            FROM advisor_join_ingest;
+        REVOKE ALL ON FUNCTION advisor_ingest.bound_join_server(text)
+            FROM advisor_join_ingest;
+        REVOKE ALL ON FUNCTION advisor_ingest.purge_join_history(interval)
+            FROM advisor_join_ingest;
+        GRANT USAGE ON SCHEMA advisor_ingest TO advisor_join_ingest;
+        GRANT EXECUTE ON FUNCTION advisor_ingest.ingest_join_batch(text, bigint, timestamptz, jsonb)
+            TO advisor_join_ingest;
+        GRANT EXECUTE ON FUNCTION advisor_ingest.record_join_error(text, text)
+            TO advisor_join_ingest;
+        GRANT EXECUTE ON FUNCTION advisor_ingest.purge_join_source_history(text, interval)
+            TO advisor_join_ingest;
+    END IF;
+END
+$acl$;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA advisor GRANT SELECT ON TABLES TO advisor_api;
 ALTER DEFAULT PRIVILEGES IN SCHEMA advisor GRANT EXECUTE ON FUNCTIONS TO advisor_api;
 
 COMMENT ON SCHEMA advisor IS
-'Urun verileri ve PoWA surumunden bagimsiz adapter katmani. PoWA nesneleri degistirilmez.';
+'Urun verileri ve PoWA surumunden bagimsiz adapter katmani. PoWA tablolarina dokunulmaz; pinned 5.2.0 qualstats purge uyumluluk migrasyonu ayri uygulanir.';

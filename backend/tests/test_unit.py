@@ -241,6 +241,15 @@ def test_index_contract_never_calls_no_scan_signal_unused() -> None:
                 "noScanSizeBytes": 2_000_000,
             },
             "items": [payload],
+            "joinCapability": {
+                "available": False,
+                "dataAvailable": False,
+                "status": "UNAVAILABLE",
+                "captureMode": "QUALSTATS_RESET_BOUNDARY",
+                "reason": "JOIN snapshotter yapilandirilmamis.",
+            },
+            "joins": [],
+            "candidates": [],
         }
     )
     assert response.items[0].signal == "NO_SCANS_OBSERVED"
@@ -346,6 +355,15 @@ def test_predicate_contract_keeps_sampled_semantics_and_never_emits_ddl() -> Non
                 "reason": "Yalniz WHERE/filter gecmisi.",
             },
             "items": [payload],
+            "joinCapability": {
+                "available": False,
+                "dataAvailable": False,
+                "status": "UNAVAILABLE",
+                "captureMode": "QUALSTATS_RESET_BOUNDARY",
+                "reason": "JOIN snapshotter yapilandirilmamis.",
+            },
+            "joins": [],
+            "candidates": [],
         }
     )
 
@@ -388,7 +406,23 @@ async def test_predicate_route_exposes_where_only_capability(monkeypatch: pytest
             }
         ], {"available": True, "version": "2.1.4"}
 
+    async def join_evidence(**kwargs: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+        assert kwargs == {"window": "1h", "server_id": 1, "database_id": 16384, "query_id": -42}
+        return [], {
+            "available": False,
+            "data_available": False,
+            "status": "UNAVAILABLE",
+            "capture_mode": "QUALSTATS_RESET_BOUNDARY",
+            "reason": "JOIN snapshotter yapilandirilmamis.",
+        }
+
+    async def composite_candidates(**kwargs: object) -> list[dict[str, object]]:
+        assert kwargs == {"window": "1h", "server_id": 1, "database_id": 16384, "query_id": -42}
+        return []
+
     monkeypatch.setattr(repository, "predicate_evidence", predicate_evidence)
+    monkeypatch.setattr(repository, "join_evidence", join_evidence)
+    monkeypatch.setattr(repository, "composite_candidates", composite_candidates)
 
     result = await query_predicates(query_id=-42, window="1h", server_id=1, database_id=16384)
 

@@ -1,0 +1,15 @@
+--- a/powa--5.1.1--5.1.2.sql
++++ b/powa--5.1.1--5.1.2.sql
+@@ -280 +280 @@
+-    PERFORM @extschema@.powa_prevent_concurrent_snapshot(_srvid,'pg_qualstats');
++    PERFORM @extschema@.powa_prevent_concurrent_snapshot(_srvid);
+--- a/powa--5.1.2.sql
++++ b/powa--5.1.2.sql
+@@ -7023 +7023 @@
+-    PERFORM @extschema@.powa_prevent_concurrent_snapshot(_srvid,'pg_qualstats');
++    PERFORM @extschema@.powa_prevent_concurrent_snapshot(_srvid);
+--- a/powa--5.2.0.sql
++++ b/powa--5.2.0.sql
+@@ -7242 +7242 @@
+-    PERFORM @extschema@.powa_prevent_concurrent_snapshot(_srvid,'pg_qualstats');
++    PERFORM @extschema@.powa_prevent_concurrent_snapshot(_srvid);

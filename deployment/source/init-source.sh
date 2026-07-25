@@ -3,13 +3,18 @@ set -Eeuo pipefail
 
 : "${POWA_COLLECTOR_PASSWORD:?POWA_COLLECTOR_PASSWORD tanimli olmali}"
 : "${ADVISOR_EVALUATOR_PASSWORD:?ADVISOR_EVALUATOR_PASSWORD tanimli olmali}"
+: "${ADVISOR_JOIN_SOURCE_PASSWORD:?ADVISOR_JOIN_SOURCE_PASSWORD tanimli olmali}"
 
 psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   --set=collector_password="$POWA_COLLECTOR_PASSWORD" \
   --set=evaluator_password="$ADVISOR_EVALUATOR_PASSWORD" \
+  --set=join_snapshotter_password="$ADVISOR_JOIN_SOURCE_PASSWORD" \
   --set=source_database="$POSTGRES_DB" <<'SQL'
 CREATE ROLE powa_collector LOGIN PASSWORD :'collector_password';
 CREATE ROLE advisor_evaluator LOGIN PASSWORD :'evaluator_password'
+  NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT 2;
+CREATE ROLE advisor_join_reader LOGIN PASSWORD :'join_snapshotter_password'
   NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   CONNECTION LIMIT 2;
 ALTER ROLE advisor_evaluator SET default_transaction_read_only = on;
@@ -168,6 +173,7 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pg_qualstats;
 CREATE EXTENSION IF NOT EXISTS pg_stat_kcache;
+CREATE EXTENSION IF NOT EXISTS pg_wait_sampling;
 CREATE SCHEMA IF NOT EXISTS "PoWA";
 CREATE EXTENSION IF NOT EXISTS powa WITH SCHEMA "PoWA";
 -- Normal fresh installs already populate powa_roles.  A dump/restore can leave
@@ -182,8 +188,9 @@ WHERE NOT EXISTS (
 -- Acik cagri, tekrar calistirilan bootstrap/upgrade akisini da guvenli tutar.
 SELECT "PoWA".powa_activate_extension(0, 'pg_qualstats');
 SELECT "PoWA".powa_activate_extension(0, 'pg_stat_kcache');
+SELECT "PoWA".powa_activate_extension(0, 'pg_wait_sampling');
 
-GRANT CONNECT ON DATABASE powa TO powa_collector;
+GRANT CONNECT ON DATABASE powa TO powa_collector, advisor_join_reader;
 GRANT USAGE ON SCHEMA "PoWA" TO powa_collector;
 GRANT pg_read_all_stats TO powa_collector;
 GRANT powa_snapshot TO powa_collector;
@@ -201,3 +208,6 @@ JOIN pg_namespace n ON n.oid = e.extnamespace
 WHERE e.extname = 'pg_qualstats'
 \gexec
 SQL
+
+psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname powa \
+  --file /opt/advisor/sql/003_join_snapshot_source.sql

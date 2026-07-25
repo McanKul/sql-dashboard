@@ -4,6 +4,7 @@ import type {
   ApiList,
   ApiResult,
   DatabaseOption,
+  CompositeIndexCandidate,
   IndexTelemetryItem,
   IoTelemetryItem,
   OperationsData,
@@ -80,6 +81,29 @@ interface RawQuery {
     filesystemWritesBytes?: number | null
     scoreIncluded?: false
   }
+  waits?: {
+    capability?: {
+      available?: boolean
+      version?: string | null
+      release?: string
+      dataAvailable?: boolean
+      source?: string
+      coverage?: 'TOP_LEVEL_SAMPLED_WAITS'
+      reason?: string
+    }
+    totalSamples?: number | null
+    categories?: {
+      io?: number; lock?: number; lwlock?: number; client?: number; ipc?: number
+      timeout?: number; activity?: number; extension?: number; other?: number
+    } | null
+    dominant?: {
+      category?: string; event?: string; sharePercent?: number; confidence?: 'LOW' | 'MEDIUM'
+    } | null
+    events?: Array<{
+      category?: string; eventType?: string; event?: string; samples?: number; sharePercent?: number
+    }>
+    scoreIncluded?: false
+  }
   previousCalls: number
   previousMeanExecTimeMs: number
   regressionPercent: number
@@ -117,9 +141,9 @@ interface RawPredicateResponse {
     available: boolean
     version?: string | null
     dataAvailable: boolean
-    coverage: 'WHERE_FILTER_ONLY'
-    joinsAvailable: false
-    ddlGenerated: false
+    coverage: 'WHERE_FILTER_ONLY' | 'WHERE_AND_JOIN_SNAPSHOT'
+    joinsAvailable: boolean
+    ddlGenerated: boolean
     reason: string
     observedFrom?: string | null
     observedTo?: string | null
@@ -142,6 +166,38 @@ interface RawPredicateResponse {
     signal: 'INDEX_CANDIDATE' | 'REVIEW' | 'INDEX_CONDITION_OBSERVED' | 'OBSERVED' | 'INSUFFICIENT_DATA'
     recommendation: string
   }>
+  joinCapability?: {
+    available: boolean
+    dataAvailable: boolean
+    status: 'STARTING' | 'HEALTHY' | 'DEGRADED' | 'ERROR' | 'UNAVAILABLE'
+    lastSnapshotAt?: string | null
+    lagSeconds?: number | null
+    captureMode: 'QUALSTATS_RESET_BOUNDARY'
+    reason: string
+  }
+  joins?: Array<{
+    qualId: string
+    qualNodeId: string
+    leftRelationId: number
+    leftSchemaName: string
+    leftTableName: string
+    leftColumnName: string
+    rightRelationId: number
+    rightSchemaName: string
+    rightTableName: string
+    rightColumnName: string
+    operatorOid: number
+    operatorName?: string | null
+    btreeStrategy?: number | null
+    occurrences: number
+    rowsProcessed: number
+    sampleCount: number
+    observedFrom: string
+    observedTo: string
+    signal: 'FREQUENT_JOIN' | 'OBSERVED_JOIN' | 'INSUFFICIENT_DATA'
+    scoreIncluded: false
+  }>
+  candidates?: CompositeIndexCandidate[]
 }
 
 interface RawOverview {
@@ -293,6 +349,8 @@ function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): Que
   const impactScore = clamp(Number(query.impactScore))
   const cpuAvailable = Boolean(query.cpu?.capability?.available)
   const cpuDataAvailable = cpuAvailable && Boolean(query.cpu?.capability?.dataAvailable)
+  const waitAvailable = Boolean(query.waits?.capability?.available)
+  const waitDataAvailable = waitAvailable && Boolean(query.waits?.capability?.dataAvailable)
   return {
     id: queryKey(query),
     queryId: String(query.queryId),
@@ -326,6 +384,43 @@ function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): Que
       percentOfExecTime: cpuDataAvailable ? optionalNumber(query.cpu?.percentOfExecTime) ?? null : null,
       filesystemReadsBytes: cpuDataAvailable ? optionalNumber(query.cpu?.filesystemReadsBytes) ?? null : null,
       filesystemWritesBytes: cpuDataAvailable ? optionalNumber(query.cpu?.filesystemWritesBytes) ?? null : null,
+      scoreIncluded: false,
+    },
+    waits: {
+      capability: {
+        available: waitAvailable,
+        version: query.waits?.capability?.version,
+        release: query.waits?.capability?.release || '1.1.11',
+        dataAvailable: waitDataAvailable,
+        source: query.waits?.capability?.source || 'PoWA pg_wait_sampling',
+        coverage: 'TOP_LEVEL_SAMPLED_WAITS',
+        reason: query.waits?.capability?.reason || 'pg_wait_sampling telemetrisi kullanilamiyor.',
+      },
+      totalSamples: waitDataAvailable ? optionalNumber(query.waits?.totalSamples) ?? 0 : null,
+      categories: waitDataAvailable ? {
+        io: Number(query.waits?.categories?.io || 0),
+        lock: Number(query.waits?.categories?.lock || 0),
+        lwlock: Number(query.waits?.categories?.lwlock || 0),
+        client: Number(query.waits?.categories?.client || 0),
+        ipc: Number(query.waits?.categories?.ipc || 0),
+        timeout: Number(query.waits?.categories?.timeout || 0),
+        activity: Number(query.waits?.categories?.activity || 0),
+        extension: Number(query.waits?.categories?.extension || 0),
+        other: Number(query.waits?.categories?.other || 0),
+      } : null,
+      dominant: waitDataAvailable && query.waits?.dominant?.event ? {
+        category: query.waits.dominant.category || 'OTHER',
+        event: query.waits.dominant.event,
+        sharePercent: Number(query.waits.dominant.sharePercent || 0),
+        confidence: query.waits.dominant.confidence || 'LOW',
+      } : null,
+      events: waitDataAvailable ? (query.waits?.events || []).map((event) => ({
+        category: event.category || 'OTHER',
+        eventType: event.eventType || 'Unknown',
+        event: event.event || 'Unknown',
+        samples: Number(event.samples || 0),
+        sharePercent: Number(event.sharePercent || 0),
+      })) : [],
       scoreIncluded: false,
     },
     impactScore: Math.round(impactScore),
@@ -416,6 +511,45 @@ function mapDetail(query: RawQueryDetail, predicatePayload: RawPredicateResponse
         rowsFiltered: Number(item.rowsFiltered || 0),
         filterRatio: optionalNumber(item.filterRatio),
         sampleCount: Number(item.sampleCount || 0),
+      })),
+      joinCapability: predicatePayload.joinCapability || {
+        available: false,
+        dataAvailable: false,
+        status: 'UNAVAILABLE',
+        captureMode: 'QUALSTATS_RESET_BOUNDARY',
+        reason: 'JOIN snapshotter bu kaynak icin yapilandirilmamis.',
+      },
+      joins: (predicatePayload.joins || []).map((item) => ({
+        ...item,
+        qualId: String(item.qualId),
+        qualNodeId: String(item.qualNodeId),
+        leftRelationId: Number(item.leftRelationId),
+        rightRelationId: Number(item.rightRelationId),
+        operatorOid: Number(item.operatorOid),
+        btreeStrategy: optionalNumber(item.btreeStrategy),
+        occurrences: Number(item.occurrences || 0),
+        rowsProcessed: Number(item.rowsProcessed || 0),
+        sampleCount: Number(item.sampleCount || 0),
+        scoreIncluded: false,
+      })),
+      candidates: (predicatePayload.candidates || []).map((item) => ({
+        ...item,
+        candidateId: String(item.candidateId),
+        serverId: Number(item.serverId),
+        databaseId: Number(item.databaseId),
+        queryId: String(item.queryId),
+        relationId: Number(item.relationId),
+        columns: item.columns,
+        operatorOids: (item.operatorOids || []).map(Number),
+        joinOccurrences: Number(item.joinOccurrences || 0),
+        filterOccurrences: Number(item.filterOccurrences || 0),
+        rowsProcessed: Number(item.rowsProcessed || 0),
+        rowsFiltered: Number(item.rowsFiltered || 0),
+        filterRatio: optionalNumber(item.filterRatio),
+        sampleCount: Number(item.sampleCount || 0),
+        existingIndexChecked: Boolean(item.existingIndexChecked),
+        runtimeFixtureAvailable: Boolean(item.runtimeFixtureAvailable),
+        scoreIncluded: false,
       })),
     },
   }
@@ -654,6 +788,27 @@ export const advisorApi = {
           databaseId: key.databaseId,
           qualId: predicate.qualId,
           relationId: predicate.relationId,
+        }),
+      },
+    )
+    return asResult(payload, 'api')
+  },
+
+  async evaluateCompositeIndex(id: string, window: TimeWindow, candidate: CompositeIndexCandidate, signal?: AbortSignal): Promise<ApiResult<QueryIndexAdvice>> {
+    if (demoModeEnabled) return asResult({ status: 'UNAVAILABLE', reasonCode: 'DEMO_MODE', message: 'Composite HypoPG dogrulamasi demo verisinde calistirilmaz.', ddlExecuted: false }, 'demo')
+    const key = parseQueryKey(id)
+    if (key.serverId === undefined || key.databaseId === undefined) {
+      throw new ApiClientError({ path: `/queries/${key.queryId}/composite-index-evaluations`, message: 'Composite HypoPG icin sunucu ve veritabani kimligi gerekli.' })
+    }
+    const payload = await request<QueryIndexAdvice>(
+      `/queries/${encodeURIComponent(key.queryId)}/composite-index-evaluations?window=${window}`,
+      {
+        method: 'POST',
+        signal,
+        body: JSON.stringify({
+          serverId: key.serverId,
+          databaseId: key.databaseId,
+          candidateId: candidate.candidateId,
         }),
       },
     )
