@@ -1,6 +1,6 @@
 # Kurulum ve işletim rehberi
 
-Bu rehber PostgreSQL 18, İterasyon 2.1-B predicate paneli ve İterasyon 2.2 HypoPG doğrulamasını içeren mevcut stack'i macOS/OrbStack veya Docker Engine çalıştırabilen Linux üzerinde kurar. Ana yol container tabanlıdır; işletim sistemi yalnız Docker kurulum adımını değiştirir. Uygulama stack'i ve kabul komutları bütün platformlarda aynıdır.
+Bu rehber PostgreSQL 18, İterasyon 2.1-B predicate paneli, İterasyon 2.2 HypoPG doğrulaması ve İterasyon 2.3 `pg_stat_kcache` CPU telemetrisini içeren mevcut stack'i macOS/OrbStack veya Docker Engine çalıştırabilen Linux üzerinde kurar. Ana yol container tabanlıdır; işletim sistemi yalnız Docker kurulum adımını değiştirir. Uygulama stack'i ve kabul komutları bütün platformlarda aynıdır.
 
 ## 1. Kurulum modelini doğru okuyun
 
@@ -335,10 +335,10 @@ API_URL=http://localhost:18000 WEB_URL=http://localhost:15173 bash scripts/verif
 Beklenen son satır:
 
 ```text
-Iterasyon 1, Iterasyon 2.1-B pg_qualstats ve Iterasyon 2.2 HypoPG kabul kontrolleri tamamlandi.
+Iterasyon 1, 2.1-B pg_qualstats, 2.2 HypoPG, kalibrasyon ve 2.3 pg_stat_kcache kabul kontrolleri tamamlandi.
 ```
 
-Test ayrıca iki database'in PostgreSQL 18 kullandığını, veri dizininin `/var/lib/postgresql/18/docker` olduğunu, gerçek bir predicate kaydı üzerinden `WHERE_FILTER_ONLY` capability sözleşmesini ve HypoPG evaluator'ın gerçek index oluşturmadan aynı oturumda plan doğrulaması yaptığını kontrol eder.
+Test ayrıca iki database'in PostgreSQL 18 kullandığını, veri dizininin `/var/lib/postgresql/18/docker` olduğunu, gerçek bir predicate kaydı üzerinden `WHERE_FILTER_ONLY` capability sözleşmesini, CPU history/capability alanlarını ve HypoPG evaluator'ın gerçek index oluşturmadan aynı oturumda plan doğrulaması yaptığını kontrol eder.
 
 ### Adım 9 — Analiz arayüzünü açın
 
@@ -394,7 +394,7 @@ Script şunları yapar:
 
 Script şunları otomatik yapmaz:
 
-- Kaynak işletim sistemine PoWA binary/paketi kurmak
+- Kaynak işletim sistemine PoWA veya `pg_stat_kcache` binary/paketi kurmak
 - `postgresql.conf` değiştirmek veya PostgreSQL'ü yeniden başlatmak
 - `pg_hba.conf`, firewall, DNS, VPN ya da TLS sertifikası değiştirmek
 - HypoPG binary/extension'ı, `advisor_evaluator` rolünü veya dış kaynak evaluator DSN/ağ yolunu hazırlamak
@@ -403,21 +403,23 @@ Bu değişiklikler canlı veritabanında bakım ve güvenlik kararı gerektirir.
 
 ### 1 — Kaynak PostgreSQL ön koşulları
 
-Kaynak cluster'ın PostgreSQL major sürümüne uygun `powa`/PoWA Archivist, `pg_stat_statements`, `pg_qualstats 2.1.x` ve `btree_gist` extension dosyalarını işletim sistemi paket yöneticisiyle kurun. `--prepare` bu binary/control dosyalarını işletim sistemine kurmaz. Yalnız telemetry toplamak için HypoPG gerekmez; bu kaynakta İterasyon 2.2 plan doğrulaması isteniyorsa HypoPG 1.4.3 ayrıca hedef uygulama database'ine kurulmalıdır.
+Kaynak cluster'ın PostgreSQL major sürümüne uygun `powa`/PoWA Archivist, `pg_stat_statements`, `pg_qualstats 2.1.x`, `pg_stat_kcache 2.3.x` ve `btree_gist` extension dosyalarını işletim sistemi paket yöneticisiyle kurun. `--prepare` bu binary/control dosyalarını işletim sistemine kurmaz. Yalnız telemetry toplamak için HypoPG gerekmez; bu kaynakta İterasyon 2.2 plan doğrulaması isteniyorsa HypoPG 1.4.3 ayrıca hedef uygulama database'ine kurulmalıdır.
 
 `postgresql.conf` için minimum:
 
 ```conf
-shared_preload_libraries = 'pg_stat_statements,pg_qualstats'
+shared_preload_libraries = 'pg_stat_statements,pg_qualstats,pg_stat_kcache'
 compute_query_id = on
 track_io_timing = on
 pg_qualstats.track_constants = off
 pg_qualstats.track_pg_catalog = off
 pg_qualstats.resolve_oids = off
 pg_qualstats.sample_rate = 0.1
+pg_stat_kcache.track = top
+pg_stat_kcache.track_planning = off
 ```
 
-Mevcut `shared_preload_libraries` listesinde başka modüller varsa onları silmeyin; virgülle iki extension'ı ekleyin. Preload değişikliği cluster restart gerektirir. `track_io_timing` ve sampling ölçüm maliyeti taşıyabildiği için canlı değerler DBA kararı ve overhead ölçümüyle seçilmelidir.
+Mevcut `shared_preload_libraries` listesinde başka modüller varsa onları silmeyin; gerekli üç extension'ı ekleyin. Preload değişikliği cluster restart gerektirir. `track_io_timing`, sampling ve kcache ölçümü maliyet taşıyabildiği için canlı değerler DBA kararı ve overhead ölçümüyle seçilmelidir.
 
 Kontrol:
 
@@ -426,6 +428,7 @@ SHOW shared_preload_libraries;
 SHOW compute_query_id;
 SHOW track_io_timing;
 SHOW pg_qualstats.sample_rate;
+SHOW pg_stat_kcache.track;
 ```
 
 Collector container'ından kaynak host/portuna ağ erişimi, kaynak `pg_hba.conf` içinde collector hostu için TLS/SCRAM kuralı ve firewall izni olmalıdır. Aynı Docker hostundaki host PostgreSQL için `localhost` yazmayın; container açısından bu kendi container'ıdır. `host.docker.internal` veya yönlendirilebilir DNS/IP kullanın.
@@ -628,7 +631,7 @@ Script custom-format `pg_dump` üretir. Yedeği aynı hostta bırakmak tek baş�
 
 Kaynak server kaydı `retention = interval '90 days'` ile oluşturulur. `.env` içindeki `RETENTION_DAYS=90` API/operasyon ekranındaki ayardır; mevcut PoWA kaydını sonradan tek başına değiştirmez. Retention değişikliği repository'de PoWA'nın yönetim fonksiyonlarıyla ve kapasite planıyla birlikte yapılmalıdır.
 
-### İterasyon 2.1-B / 2.2 mevcut-volume geçişi
+### İterasyon 2.1-B / 2.2 / 2.3 mevcut-volume geçişi
 
 Named volume daha eski image ile oluşturulduysa init scriptleri kendiliğinden tekrar çalışmaz. Demo stack'i veri/geçmiş silmeden yükseltmek için:
 
@@ -637,11 +640,12 @@ docker compose build source-db
 docker compose up -d --force-recreate source-db repository-db
 bash scripts/enable-pg-qualstats.sh
 bash scripts/enable-hypopg.sh
+bash scripts/enable-pg-stat-kcache.sh
 docker compose up -d --force-recreate evaluator api web
 bash scripts/verify.sh
 ```
 
-İlk script preload/call/grant koşulunu doğrular, küçük kontrollü workload üretir ve hem snapshot hem qualstats history ilerleyene kadar bekler. İkinci script image'daki HypoPG 1.4.3'ü, `advisor_hypopg` şemasını ve salt-okunur evaluator rolünü mevcut `appdb` içinde hazırlar. İkisi de `test-source` demo kaydına özeldir. Gerçek dış kaynakları izlemek için DBA preload/restart işleminden sonra aynı alias ile `scripts/register-source.sh` çalıştırılır; dış kaynak HypoPG evaluator hazırlığı bunun dışında ve ayrı runbook'a tabidir.
+İlk script predicate datasource/grant koşullarını ve history akışını doğrular. İkinci script HypoPG 1.4.3'ü, `advisor_hypopg` şemasını ve salt-okunur evaluator rolünü hazırlar. Üçüncü script `pg_stat_kcache 2.3.2` datasource'unu, mevcut repository SQL adapter'ını ve CPU history'sini veri silmeden etkinleştirir. Scriptler `test-source` demo kaydına özeldir. Gerçek dış kaynakları izlemek için DBA binary/preload/restart işleminden sonra aynı alias ile `scripts/register-source.sh` çalıştırılır; dış kaynak HypoPG evaluator hazırlığı bunun dışında ve ayrı runbook'a tabidir.
 
 ## 8. Temizleme ve yeniden kurulum
 

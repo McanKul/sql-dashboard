@@ -266,6 +266,99 @@ WHERE previous_calls IS NOT NULL
   AND sample_at >= p_start;
 $$;
 
+-- pg_stat_kcache counters are cumulative like pg_stat_statements counters.
+-- Read both PoWA storage tiers and turn them into reset-safe per-snapshot
+-- deltas.  CPU values are seconds in the extension/PoWA record and are kept
+-- in seconds here; the public query adapter converts them to milliseconds.
+CREATE OR REPLACE FUNCTION advisor.kcache_deltas(p_start timestamptz)
+RETURNS TABLE (
+    server_id integer,
+    database_id oid,
+    query_id bigint,
+    user_id oid,
+    toplevel boolean,
+    sample_at timestamptz,
+    exec_user_time_seconds double precision,
+    exec_system_time_seconds double precision,
+    filesystem_reads_bytes bigint,
+    filesystem_writes_bytes bigint
+)
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, advisor
+AS $$
+WITH samples AS (
+    SELECT
+        h.srvid AS server_id,
+        h.dbid AS database_id,
+        h.queryid AS query_id,
+        h.userid AS user_id,
+        h.top AS toplevel,
+        (sample_record).ts AS sample_at,
+        (sample_record).exec_user_time AS exec_user_time_seconds,
+        (sample_record).exec_system_time AS exec_system_time_seconds,
+        (sample_record).exec_reads AS filesystem_reads_bytes,
+        (sample_record).exec_writes AS filesystem_writes_bytes
+    FROM "PoWA".powa_kcache_metrics AS h
+    CROSS JOIN LATERAL unnest(h.metrics) AS sample_record
+    WHERE h.coalesce_range && tstzrange(p_start - interval '1 hour', now(), '[]')
+      AND (sample_record).ts >= p_start - interval '1 hour'
+      AND (sample_record).ts <= now()
+    UNION ALL
+    SELECT
+        c.srvid,
+        c.dbid,
+        c.queryid,
+        c.userid,
+        c.top,
+        (c.metrics).ts,
+        (c.metrics).exec_user_time,
+        (c.metrics).exec_system_time,
+        (c.metrics).exec_reads,
+        (c.metrics).exec_writes
+    FROM "PoWA".powa_kcache_metrics_current AS c
+    WHERE (c.metrics).ts >= p_start - interval '1 hour'
+      AND (c.metrics).ts <= now()
+), ordered AS (
+    SELECT
+        samples.*,
+        lag(exec_user_time_seconds) OVER metric_window AS previous_user_time,
+        lag(exec_system_time_seconds) OVER metric_window AS previous_system_time,
+        lag(filesystem_reads_bytes) OVER metric_window AS previous_reads,
+        lag(filesystem_writes_bytes) OVER metric_window AS previous_writes
+    FROM samples
+    WINDOW metric_window AS (
+        PARTITION BY server_id, database_id, query_id, user_id, toplevel
+        ORDER BY sample_at
+    )
+)
+SELECT
+    server_id,
+    database_id,
+    query_id,
+    user_id,
+    toplevel,
+    sample_at,
+    CASE WHEN exec_user_time_seconds >= previous_user_time
+         THEN exec_user_time_seconds - previous_user_time ELSE 0 END,
+    CASE WHEN exec_system_time_seconds >= previous_system_time
+         THEN exec_system_time_seconds - previous_system_time ELSE 0 END,
+    CASE
+        WHEN filesystem_reads_bytes IS NULL OR previous_reads IS NULL THEN NULL
+        WHEN filesystem_reads_bytes >= previous_reads THEN filesystem_reads_bytes - previous_reads
+        ELSE 0
+    END::bigint,
+    CASE
+        WHEN filesystem_writes_bytes IS NULL OR previous_writes IS NULL THEN NULL
+        WHEN filesystem_writes_bytes >= previous_writes THEN filesystem_writes_bytes - previous_writes
+        ELSE 0
+    END::bigint
+FROM ordered
+WHERE previous_user_time IS NOT NULL
+  AND previous_system_time IS NOT NULL
+  AND sample_at >= p_start;
+$$;
+
 -- The return shape grew in iteration 1.  Drop the three convenience views first
 -- so this migration remains rerunnable on an already initialized repository.
 DROP VIEW IF EXISTS advisor.v_query_summary;
@@ -291,6 +384,15 @@ RETURNS TABLE (
     shared_blocks_read bigint,
     temp_blocks_written bigint,
     wal_bytes numeric,
+    kcache_available boolean,
+    kcache_version text,
+    kcache_data_available boolean,
+    cpu_user_time_ms double precision,
+    cpu_system_time_ms double precision,
+    cpu_total_time_ms double precision,
+    cpu_percent_of_exec_time double precision,
+    filesystem_reads_bytes bigint,
+    filesystem_writes_bytes bigint,
     previous_calls bigint,
     previous_mean_exec_time_ms double precision,
     regression_percent double precision,
@@ -345,6 +447,7 @@ WITH period AS (
         )::double precision AS observation_hours
     FROM advisor.query_deltas(now() - (p_window * 2)) AS d
     WHERE d.sample_at >= now() - (p_window * 2)
+      AND d.toplevel
       AND NOT EXISTS (
           SELECT 1
             FROM "PoWA".powa_databases AS excluded_db
@@ -360,11 +463,39 @@ WITH period AS (
              AND excluded_role.rolname IN ('powa_collector', 'advisor_evaluator')
       )
     GROUP BY d.server_id, d.database_id, d.query_id
+), kcache_period AS (
+    SELECT
+        k.server_id,
+        k.database_id,
+        k.query_id,
+        sum(k.exec_user_time_seconds) * 1000.0 AS cpu_user_time_ms,
+        sum(k.exec_system_time_seconds) * 1000.0 AS cpu_system_time_ms,
+        sum(k.filesystem_reads_bytes)::bigint AS filesystem_reads_bytes,
+        sum(k.filesystem_writes_bytes)::bigint AS filesystem_writes_bytes
+    FROM advisor.kcache_deltas(now() - p_window) AS k
+    WHERE k.sample_at >= now() - p_window
+      AND k.toplevel
+    GROUP BY k.server_id, k.database_id, k.query_id
+), kcache_capability AS (
+    SELECT
+        config.srvid AS server_id,
+        bool_or(config.enabled) AS available,
+        max(config.version)::text AS version
+    FROM "PoWA".powa_extension_config AS config
+    WHERE config.extname = 'pg_stat_kcache'
+    GROUP BY config.srvid
 ), enriched AS (
     SELECT
         p.*,
         s.query AS sql_text,
         db.datname::text AS database_name,
+        COALESCE(cap.available, false) AS kcache_available,
+        cap.version AS kcache_version,
+        k.query_id IS NOT NULL AS kcache_data_available,
+        k.cpu_user_time_ms,
+        k.cpu_system_time_ms,
+        k.filesystem_reads_bytes,
+        k.filesystem_writes_bytes,
         p.rows / NULLIF(p.calls, 0)::double precision AS rows_per_call,
         p.total_exec_time_ms / NULLIF(p.calls, 0) AS mean_exec_time_ms,
         p.previous_total_exec_time_ms / NULLIF(p.previous_calls, 0) AS previous_mean_exec_time_ms,
@@ -390,6 +521,11 @@ WITH period AS (
      AND s.queryid = p.query_id
     LEFT JOIN "PoWA".powa_databases AS db
       ON db.srvid = p.server_id AND db.oid = p.database_id
+    LEFT JOIN kcache_period AS k
+      ON k.server_id = p.server_id
+     AND k.database_id = p.database_id
+     AND k.query_id = p.query_id
+    LEFT JOIN kcache_capability AS cap ON cap.server_id = p.server_id
     WHERE COALESCE(p.calls, 0) > 0
       AND s.query !~* '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|SET|SHOW)([[:space:]]|$)'
 ), ranked AS (
@@ -411,7 +547,9 @@ WITH period AS (
                  PARTITION BY e.server_id, e.database_id ORDER BY e.temp_blocks_written
              )
              ELSE 0 END AS temp_write_percentile_score,
-        CASE WHEN COALESCE(e.regression_percent, 0) > 0 AND COALESCE(e.previous_calls, 0) >= 5
+        CASE WHEN COALESCE(e.regression_percent, 0) >= 20
+                   AND COALESCE(e.previous_calls, 0) >= 20
+                   AND e.calls >= 20
              THEN 100.0 * cume_dist() OVER (
                  PARTITION BY e.server_id, e.database_id
                  ORDER BY greatest(COALESCE(e.regression_percent, 0), 0)
@@ -426,7 +564,11 @@ WITH period AS (
         least(1.0, e.shared_blocks_read / NULLIF(1024.0 * e.observation_hours, 0)) AS physical_read_volume_factor,
         least(1.0, e.calls / NULLIF(1000.0 * e.observation_hours, 0)) AS call_frequency_volume_factor,
         least(1.0, e.temp_blocks_written / NULLIF(512.0 * e.observation_hours, 0)) AS temp_write_volume_factor,
-        least(1.0, least(e.calls, COALESCE(e.previous_calls, 0)) / 20.0) AS regression_volume_factor,
+        CASE WHEN COALESCE(e.regression_percent, 0) >= 20
+                  AND COALESCE(e.previous_calls, 0) >= 20
+                  AND e.calls >= 20
+             THEN least(1.0, e.regression_percent / 50.0)
+             ELSE 0 END AS regression_volume_factor,
         least(1.0, e.wal_bytes / NULLIF(8388608.0 * e.observation_hours, 0)) AS wal_volume_factor,
         100.0 * e.total_exec_time_ms / NULLIF(
             sum(e.total_exec_time_ms) OVER (PARTITION BY e.server_id, e.database_id), 0
@@ -470,6 +612,16 @@ SELECT
     sc.shared_blocks_read,
     sc.temp_blocks_written,
     sc.wal_bytes,
+    sc.kcache_available,
+    sc.kcache_version,
+    sc.kcache_data_available,
+    sc.cpu_user_time_ms,
+    sc.cpu_system_time_ms,
+    sc.cpu_user_time_ms + sc.cpu_system_time_ms,
+    100.0 * (sc.cpu_user_time_ms + sc.cpu_system_time_ms)
+        / NULLIF(sc.total_exec_time_ms, 0),
+    sc.filesystem_reads_bytes,
+    sc.filesystem_writes_bytes,
     COALESCE(sc.previous_calls, 0),
     sc.previous_mean_exec_time_ms,
     sc.regression_percent,
@@ -523,8 +675,8 @@ SELECT
             'percentileScore', sc.regression_percentile_score,
             'volumeFactor', sc.regression_volume_factor,
             'absoluteValue', sc.regression_percent,
-            'volumeValue', least(sc.calls, COALESCE(sc.previous_calls, 0)),
-            'fullScoreAt', 20,
+            'volumeValue', sc.regression_percent,
+            'fullScoreAt', 50,
             'unit', '%'
         ),
         'wal', jsonb_build_object(
@@ -552,7 +704,7 @@ SELECT * FROM advisor.query_metrics(interval '24 hours');
 
 CREATE OR REPLACE VIEW advisor.v_query_regression AS
 SELECT * FROM advisor.query_metrics(interval '24 hours')
-WHERE regression_percent > 0 AND previous_calls >= 5;
+WHERE regression_percent >= 20 AND previous_calls >= 20 AND calls >= 20;
 
 CREATE OR REPLACE VIEW advisor.v_query_impact AS
 SELECT * FROM advisor.query_metrics(interval '24 hours')
@@ -1859,6 +2011,7 @@ GRANT INSERT, UPDATE ON advisor.query_annotations TO advisor_api;
 GRANT INSERT ON advisor.audit_log TO advisor_api;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA advisor TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.query_deltas(timestamptz) TO advisor_api;
+GRANT EXECUTE ON FUNCTION advisor.kcache_deltas(timestamptz) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.query_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.index_metrics(interval) TO advisor_api;
 GRANT EXECUTE ON FUNCTION advisor.database_io_metrics(interval) TO advisor_api;

@@ -2,7 +2,7 @@
 
 PDF v1.1'de tarif edilen ilk iterasyonun çalışan referans uygulamasıdır. Tek bir Docker/OrbStack hostu üzerinde **iki ayrı PostgreSQL sunucu süreci** çalışır: demo kaynak instance `5432`, PoWA repository instance `5433`. PoWA Collector istatistikleri kaynaktan repository'ye taşır; FastAPI yalnız repository'yi okur ve React arayüzü sonuçları gösterir. Aynı repository/collector, `scripts/register-source.sh` ile birden fazla gerçek PostgreSQL kaynağı izleyebilir.
 
-> Bu sürüm önce hangi sorguya bakılması gerektiğini gösterir ve dar kapsamlı WHERE adaylarını HypoPG ile doğrulayabilir. Yalnız doğrulanmış aday için kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı üretir; otomatik `CREATE/DROP INDEX`, SQL rewrite veya canlı veritabanına müdahale yapmaz.
+> Bu sürüm önce hangi sorguya bakılması gerektiğini gösterir, gerçek CPU tüketimini ayrı gözlem sinyali olarak sunar ve dar kapsamlı WHERE adaylarını HypoPG ile doğrulayabilir. Yalnız doğrulanmış aday için kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı üretir; otomatik `CREATE/DROP INDEX`, SQL rewrite veya canlı veritabanına müdahale yapmaz.
 
 ## Hızlı başlangıç
 
@@ -31,11 +31,12 @@ docker compose ps
 
 Bu komut demo PostgreSQL'ü ölçülebilir hedef olarak hazırlar ancak sürekli yük üreten `workload` servisini başlatmaz. `REGISTER_DEMO_SOURCE=false` yalnız **boş bir repository volume'ünün ilk kurulumu öncesinde** seçilirse demo kaydı oluşturulmaz; gerçek kaynak-only kurulumlarda bu seçenek kullanılabilir.
 
-İlk build sırasında PostgreSQL 18 tabanı üzerinde PoWA Archivist 5.2.0, `pg_qualstats` 2.1.4 ve HypoPG 1.4.3 doğrulanmış kaynak arşivlerinden derlenir; bu nedenle sonraki başlatmalardan daha uzun sürer. PostgreSQL 17 named volume'leri yalnız image etiketi değiştirilerek açılamaz; PG18'in `/var/lib/postgresql/18/docker` veri dizini düzenine dump/restore veya `pg_upgrade` ile taşınmalıdır. Aşağıdaki iki script aynı PostgreSQL major sürümündeki mevcut demo volume'lerini yeni extension/rol/grant düzenine geçirir; temiz volume init sırasında zaten hazırlanır.
+İlk build sırasında PostgreSQL 18 tabanı üzerinde PoWA Archivist 5.2.0, `pg_qualstats` 2.1.4, `pg_stat_kcache` 2.3.2 ve HypoPG 1.4.3 doğrulanmış kaynak arşivlerinden derlenir; bu nedenle sonraki başlatmalardan daha uzun sürer. PostgreSQL 17 named volume'leri yalnız image etiketi değiştirilerek açılamaz; PG18'in `/var/lib/postgresql/18/docker` veri dizini düzenine dump/restore veya `pg_upgrade` ile taşınmalıdır. Aşağıdaki scriptler aynı PostgreSQL major sürümündeki mevcut demo volume'lerini yeni extension/rol/grant düzenine geçirir; temiz volume init sırasında zaten hazırlanır.
 
 ```bash
 bash scripts/enable-pg-qualstats.sh
 bash scripts/enable-hypopg.sh
+bash scripts/enable-pg-stat-kcache.sh
 ```
 
 Servisler sağlıklı olduktan sonra:
@@ -44,7 +45,7 @@ Servisler sağlıklı olduktan sonra:
 bash scripts/verify.sh
 ```
 
-Başarılı sonuç İterasyon 2.1-B predicate hattı ile İterasyon 2.2 HypoPG doğrulamasının kabul edildiğini bildirir.
+Başarılı sonuç İterasyon 2.1-B predicate hattını, İterasyon 2.2 HypoPG doğrulamasını, puan kalibrasyon guard'larını ve İterasyon 2.3 CPU telemetrisini kabul eder.
 
 ## Erişim adresleri
 
@@ -62,7 +63,7 @@ Başka bir bilgisayardan yalnız `http://SUNUCU_IP:5173` adresini açın. API ç
 Arayüzde şu analiz ekranları bulunur:
 
 - Genel Bakış: yük özeti, en yüksek etkili sorgular ve trend
-- Sorgular: arama, filtreleme, sıralama, dönem karşılaştırması, pg_qualstats tabanlı WHERE gözlemleri ve isteğe bağlı HypoPG plan doğrulaması
+- Sorgular: arama, filtreleme, sıralama, dönem karşılaştırması, `pg_stat_kcache` gerçek CPU/OS I/O, pg_qualstats tabanlı WHERE gözlemleri ve isteğe bağlı HypoPG plan doğrulaması
 - Sistem Sağlığı: son repository snapshot'ındaki seq scan, dead tuple, autovacuum ve uzun transaction sinyalleri; dönem seçici bu snapshot ekranında gösterilmez
 - Operasyonlar: collector/retention görünürlüğü, repository kapasitesi, veritabanı ve cluster I/O, WAL/checkpoint ile güvenli index kullanım sinyalleri
 
@@ -102,6 +103,12 @@ HypoPG 1.4.3 kaynak PostgreSQL 18 image'ına sabitlendi ve ayrı, salt-okunur `e
 
 İlk kapsam yalnız tek statement `SELECT`/`WITH`, tek kolonlu B-tree uyumlu predicate ve yapılandırılmış `test-source/appdb` hedefidir. `EXPLAIN ANALYZE`, gerçek DDL, DML replay, SQL rewrite ve otomatik uygulama yoktur; bütün cevaplarda `ddlExecuted=false` kalır. Collector'a dış kaynak eklemek o kaynağı otomatik evaluator kapsamına almaz. Güvenlik modeli, sonuç durumları, mevcut-volume adımı ve dış kaynak runbook'u [İterasyon 2.2 belgesindedir](docs/ITERATION_2_2_HYPOPG.md).
 
+## İterasyon 2.3 — `pg_stat_kcache` gerçek CPU telemetrisi
+
+`pg_stat_kcache 2.3.2` PostgreSQL 18 image'ına sabitlendi ve PoWA 5.2 remote hattına bağlandı. Sorgu listesi ve detay ekranı execution user/system/total CPU süresini, CPU'nun DB süresindeki oranını ve OS filesystem read/write byte değerlerini gösterir. Extension kapalı, history yetersiz ve veri kullanılabilir durumları ayrı capability sonucu taşır; eksik veri sahte `0 CPU` olarak sunulmaz.
+
+CPU bu iterasyonda gözlem modundadır: `scoreIncluded=false` kalır ve mevcut Impact Score ağırlıkları değişmez. Paralel worker CPU toplamı duvar saatini aşabileceği için oran `%100` üstünde olabilir. Kurulum, mevcut-volume migration'ı, sayaç semantiği, overhead komutu ve kabul ayrıntıları [İterasyon 2.3 runbook'undadır](docs/ITERATION_2_3_PG_STAT_KCACHE.md).
+
 ## İterasyon 1 kapanış notu — 24 Temmuz 2026
 
 İlk iterasyonun mimarisi ve veri akışı çalışır durumdadır: kaynak PostgreSQL, remote PoWA collector, ayrı repository, repository-only API ve dört ana UI ekranı canlı verilerle doğrulanmıştır. Backend unit testleri, frontend unit testleri ve production build başarılıdır. Bununla birlikte puanlama ve bazı sunum kuralları üretim kararı vermeden önce yeniden kalibre edilmelidir.
@@ -117,7 +124,7 @@ Denetim sırasında agresif demo yükü 6 worker ile yaklaşık 1.164 statement 
 7. Sistem Sağlığı sinyalleri kümülatif sayaç ve küçük demo tabloları nedeniyle fazla hassastır. `stats_reset`, gözlem süresi, tablo boyutu ve zaman penceresi sinyal açıklamasına dahil edilmelidir.
 8. Sürekli workload için `normal` ve `stress` profilleri ayrılmalıdır. Kabul testi normal profille, doygunluk ve kapasite testi stress profiliyle çalışmalıdır.
 
-Bu maddeler yeni bir analiz aracı eklenmeden önce **İterasyon 2.0 — metrik doğruluğu ve kalibrasyon** başlığı altında tamamlanacaktır. İterasyon 2.0 otomatik DDL, SQL rewrite veya kaynak veritabanına yazma yetkisi eklemez.
+**25 Temmuz 2026 kısa kalibrasyon kapanışı:** En yüksek doğruluk etkili iki madde kapatıldı. Ana dashboard/trend yalnız top-level statement toplamını kullanıyor; regresyon puanı ve “yavaşlayan sorgu” sayısı için her iki dönemde en az 20 çağrı ve en az `%20` artış gerekiyor, büyüklük katsayısı `%50`de tam değere ulaşıyor. Observation-hour hacim modeli ve 85/70/40 priority sınırları korundu. Ortam profili, coverage ve uzun süreli production dağılım kalibrasyonu ayrı ürün işi olarak kalır; 2.3 CPU sinyali ölçüm görmeden skora eklenmedi.
 
 ## İterasyon 2 araç stratejisi
 
@@ -125,20 +132,22 @@ Bu maddeler yeni bir analiz aracı eklenmeden önce **İterasyon 2.0 — metrik 
 
 | Aday alt iterasyon | Tek araç | Kazandırdığı veri | Mevcut mimariye uyum | Temel dikkat noktası |
 |---|---|---|---|---|
-| `2.1-A` | `pg_stat_kcache` | Sorgu bazında CPU user/system süresi ve işletim sistemi fiziksel I/O'su | Yüksek; PoWA remote mode tarafından desteklenir | Kaynakta binary, preload ve restart gerekir; skor önce gözlem modunda doğrulanmalı |
 | `2.1-B` | `pg_qualstats` | Kaynakta `WHERE`/`JOIN`, standart repository hattında `WHERE`/filter predicate istatistikleri | Altyapı tamamlandı; JOIN tarihçesi için özel snapshotter gerekir | Sampling overhead'i ve entry büyümesi ölçülmeli; agresif demoda constants takibi sınırlanmalı |
-| `2.1-C` | `pg_wait_sampling` | CPU dışı bekleme nedenleri, lock/I/O/client wait dağılımı | Yüksek; PoWA remote mode tarafından desteklenir | Sampling frekansı ve ek yük ölçülmeli; PostgreSQL 18'deki PoWA lock-history sınırıyla karıştırılmamalı |
-| `2.1-D` | `pg_track_settings` | Ayar değişikliği ve restart zaman çizelgesi | Orta; PoWA destekler, remote kurulumda repository tarafı da hazırlanır | Sorgu önerisinden çok değişiklik korelasyonu sağlar |
 | `2.2` | `HypoPG` | Gerçek index oluşturmadan sanal index kullanımı, plan maliyeti ve tahmini boyut karşılaştırması | Tamamlandı; ayrı salt-okunur evaluator aynı kaynak oturumunu kullanır | İlk kapsam SELECT + tek kolonlu B-tree + yapılandırılmış `appdb`; dış kaynaklar ayrıca hazırlanmalı |
+| `2.3` | `pg_stat_kcache` | Sorgu bazında CPU user/system süresi ve işletim sistemi fiziksel I/O'su | Tamamlandı; PoWA remote history + API/UI capability | Skor dışında gözlem modunda; gerçek yükte dağılım izlenmeli |
+| `2.4` | `pg_wait_sampling` | CPU dışı bekleme nedenleri, lock/I/O/client wait dağılımı | Sıradaki; PoWA remote mode destekler | Sampling frekansı ve ek yük ölçülmeli |
+| `2.5` | JOIN snapshotter | PoWA'nın taşımadığı kolon-kolon JOIN ilişkileri | Ayrı düşük yetkili servis gerekir | Secret, read-only transaction, timeout ve audit sınırı |
+| `2.6` | Composite öneri | JOIN + WHERE kanıtından kolon sırası | 2.5 sonrasında | Eşitlik/range sırası ve mevcut index örtüşmesi doğrulanmalı |
+| `2.7` | İzole gerçek test | Disposable clone üzerinde gerçek index + `EXPLAIN ANALYZE` | Opsiyonel, kaynak dışı | Clone yaşam döngüsü, veri güvenliği ve maliyet |
 | Alternatif plan yakalama | `auto_explain` | Yavaş sorguların gerçek planlarını loga yazar | Düşük; PoWA repository hattına doğal olarak akmaz | Log ingestion, hassas veri, örnekleme ve planlama/çalıştırma overhead'i gerektirir |
 
-**Seçilen rota:** İterasyon `2.1-B` kapsamında repository filter-predicate adapter/API/UI sözleşmesi, `2.2` kapsamında da HypoPG evaluator ve yalnız `VALIDATED` sonuçta açılan kopyalanabilir index SQL'i tamamlandı. Sıradaki işler sinyal eşiklerini gerçek yükte kalibre etmek, sampling/evaluator overhead'ini ölçmek, JOIN'ler için düşük yetkili snapshotter ve birden fazla dış kaynak için evaluator routing tasarlamaktır. `pg_stat_kcache`, `pg_wait_sampling` ve diğer araçlar ayrı alt iterasyonların adayları olarak kalır. HypoPG gerçek index oluşturmaz; gösterilen SQL'i çalıştırma kararı DBA'ya aittir.
+**Seçilen rota:** `pg_qualstats`, HypoPG ve `pg_stat_kcache` alt iterasyonları tamamlandı. Sıradaki araç `2.4 pg_wait_sampling`; ardından PoWA'nın taşımadığı JOIN'ler için `2.5` düşük yetkili snapshotter, yeterli JOIN/WHERE kanıtından sonra `2.6` composite kolon sırası ve opsiyonel `2.7` disposable clone doğrulaması gelir. HypoPG gerçek index oluşturmaz; gösterilen SQL'i çalıştırma kararı DBA'ya aittir.
 
 PoWA'nın taşıdığı tarihsel veriler repository üzerinden sunulmaya ve ana API repository-only kalmaya devam eder. İterasyon 2.2'de HypoPG için ayrı, düşük yetkili `evaluator` servisi yalnız açıkça yapılandırılmış tek kaynak/database hedefine bağlanır. Kaynak erişimi veya HypoPG hazırlığı olmayan kurulumlarda doğrulama `UNAVAILABLE` döner; çoklu dış kaynak evaluator routing'i henüz yoktur. PoWA'nın taşımadığı JOIN snapshotları da ileride ayrı, audit edilen `source-snapshotter` gerektirir.
 
 ## Gerçek bir PostgreSQL kaynağı ekleme
 
-Bu entegrasyon yalnız PostgreSQL içindir. Kaynak cluster'a uygun PoWA Archivist, `pg_stat_statements` ve `pg_qualstats 2.1.x` paketleri önceden kurulmuş; `pg_stat_statements,pg_qualstats` `shared_preload_libraries` içinde etkin olmalıdır. Script extension binary'si veya PostgreSQL ayarı kurmaz; preload değişikliği ve gerekli restart kaynak DBA'ya aittir.
+Bu entegrasyon yalnız PostgreSQL içindir. Kaynak cluster'a uygun PoWA Archivist, `pg_stat_statements`, `pg_qualstats 2.1.x` ve `pg_stat_kcache 2.3.x` paketleri önceden kurulmuş; `pg_stat_statements,pg_qualstats,pg_stat_kcache` `shared_preload_libraries` içinde etkin olmalıdır. Script extension binary'si veya PostgreSQL ayarı kurmaz; preload değişikliği ve gerekli restart kaynak DBA'ya aittir.
 
 1. Örneği Git dışındaki güvenli bir konuma kopyalayın:
 
@@ -164,7 +173,7 @@ Komut tekrar çalıştırılabilir: aynı alias yeni satır açmaz; bağlantı/f
 
 | Compose servisi | Görev | Kalıcı veri |
 |---|---|---|
-| `source-db` | PostgreSQL 18, `appdb`, `pg_stat_statements`, `pg_qualstats`, HypoPG ve remote PoWA fonksiyonları | `source_data` |
+| `source-db` | PostgreSQL 18, `appdb`, `pg_stat_statements`, `pg_qualstats`, `pg_stat_kcache`, HypoPG ve remote PoWA fonksiyonları | `source_data` |
 | `repository-db` | PostgreSQL 18, PoWA geçmişi ve `advisor` şeması | `repository_data` |
 | `collector` | PoWA Collector 1.3.2; kaynaktan snapshot alır | Yok |
 | `api` | Repository-only FastAPI okuma/annotation katmanı | Repository'de |
@@ -251,14 +260,16 @@ docker compose down
 - [İterasyon 1.1 belge boşluk analizi](docs/ITERATION_1_1_GAP_ANALYSIS.md)
 - [İterasyon 2.1-B `pg_qualstats` durum ve işletim notu](docs/ITERATION_2_1_B_PG_QUALSTATS.md)
 - [İterasyon 2.2 HypoPG plan doğrulaması ve dış kaynak runbook'u](docs/ITERATION_2_2_HYPOPG.md)
+- [İterasyon 2.3 `pg_stat_kcache` CPU telemetrisi](docs/ITERATION_2_3_PG_STAT_KCACHE.md)
 
 ## Sabitlenen temel sürümler
 
 - PostgreSQL `18` (`postgres:18-trixie`; doğrulanan patch sürümü `18.4`)
 - PoWA Archivist `5.2.0` / `REL_5_2_0` — kaynak arşiv SHA-256 ile doğrulanır
 - `pg_qualstats 2.1.4` — kaynak arşiv SHA-256 ile doğrulanır; sabit sürüme hedefli shared-memory düzeltmesi uygulanır
+- `pg_stat_kcache 2.3.2` — PostgreSQL 18 uyumlu kaynak arşiv SHA-256 ile doğrulanır
 - HypoPG `1.4.3` — tam upstream commit ve kaynak arşiv SHA-256 ile doğrulanır
 - PoWA Collector `1.3.2` — wheel SHA-256 ile sabitlenir
 - Python `3.12`, Node `22`, Nginx `1.27`
 
-Güncel tasarım dayanakları: [PoWA remote setup](https://powa.readthedocs.io/en/latest/remote_setup.html), [PoWA destekli stats extension'ları](https://powa.readthedocs.io/en/latest/components/stats_extensions/), [pg_qualstats](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_qualstats.html), [HypoPG](https://github.com/HypoPG/hypopg), [PoWA güvenlik](https://powa.readthedocs.io/en/latest/security.html), [Docker Engine kurulumu](https://docs.docker.com/engine/install/).
+Güncel tasarım dayanakları: [PoWA remote setup](https://powa.readthedocs.io/en/latest/remote_setup.html), [PoWA destekli stats extension'ları](https://powa.readthedocs.io/en/latest/components/stats_extensions/), [pg_qualstats](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_qualstats.html), [pg_stat_kcache](https://powa.readthedocs.io/en/latest/components/stats_extensions/pg_stat_kcache.html), [HypoPG](https://github.com/HypoPG/hypopg), [PoWA güvenlik](https://powa.readthedocs.io/en/latest/security.html), [Docker Engine kurulumu](https://docs.docker.com/engine/install/).

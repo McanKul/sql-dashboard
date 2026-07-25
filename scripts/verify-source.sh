@@ -35,10 +35,22 @@ SELECT s.id, s.hostname, s.port, s.dbname, s.frequency,
          + (SELECT count(*)
               FROM "PoWA".powa_qualstats_quals_history h
              WHERE h.srvid = s.id)
+       ,coalesce(kcache.version, ''),
+       coalesce(kcache.enabled, false),
+       (SELECT count(*) = 4
+          FROM "PoWA".powa_functions f
+         WHERE f.srvid = s.id
+           AND f.name = 'pg_stat_kcache'
+           AND f.enabled
+           AND f.operation IN ('snapshot', 'aggregate', 'purge', 'reset')),
+       (SELECT count(*) FROM "PoWA".powa_kcache_metrics_current h WHERE h.srvid = s.id)
+         + (SELECT count(*) FROM "PoWA".powa_kcache_metrics h WHERE h.srvid = s.id)
   FROM "PoWA".powa_servers AS s
   JOIN "PoWA".powa_snapshot_metas AS m ON m.srvid = s.id
   LEFT JOIN "PoWA".powa_extension_config AS ec
     ON ec.srvid = s.id AND ec.extname = 'pg_qualstats'
+  LEFT JOIN "PoWA".powa_extension_config AS kcache
+    ON kcache.srvid = s.id AND kcache.extname = 'pg_stat_kcache'
  WHERE s.alias = :'source_alias';
 SQL
 row="$(printf '%s\n' "$repo_sql" | docker compose exec -T repository-db \
@@ -47,7 +59,7 @@ row="$(printf '%s\n' "$repo_sql" | docker compose exec -T repository-db \
   --set=source_alias="$alias_name")"
 
 [[ -n "$row" ]] || fail "Repository'de alias bulunamadi: ${alias_name}"
-IFS='|' read -r server_id hostname port database frequency password_null has_snapshot error_count pgqs_version pgqs_enabled pgqs_functions pgqs_history_rows <<< "$row"
+IFS='|' read -r server_id hostname port database frequency password_null has_snapshot error_count pgqs_version pgqs_enabled pgqs_functions pgqs_history_rows pgsk_version pgsk_enabled pgsk_functions pgsk_history_rows <<< "$row"
 [[ "$server_id" =~ ^[0-9]+$ ]] || fail "Server id gecersiz: ${server_id}"
 [[ "$frequency" =~ ^[0-9]+$ ]] && ((frequency >= 5)) || fail "Kaynak aktif degil: frequency=${frequency}"
 [[ "$password_null" == t ]] || fail "Kaynak parolasi repository'de saklaniyor"
@@ -56,7 +68,10 @@ IFS='|' read -r server_id hostname port database frequency password_null has_sna
 [[ "$pgqs_version" =~ ^2\.1\. && "$pgqs_enabled" == t && "$pgqs_functions" == t ]] \
   || fail "pg_qualstats datasource eksik: version=${pgqs_version:-yok}, enabled=${pgqs_enabled}, functions=${pgqs_functions}"
 [[ "$pgqs_history_rows" =~ ^[0-9]+$ ]] || fail "pg_qualstats history sayaci gecersiz: ${pgqs_history_rows}"
-pass "PoWA/pg_qualstats kaydi aktif; parola NULL ve snapshot saglikli (server id ${server_id}, qual history ${pgqs_history_rows})"
+[[ "$pgsk_version" =~ ^2\.3\. && "$pgsk_enabled" == t && "$pgsk_functions" == t ]] \
+  || fail "pg_stat_kcache datasource eksik: version=${pgsk_version:-yok}, enabled=${pgsk_enabled}, functions=${pgsk_functions}"
+[[ "$pgsk_history_rows" =~ ^[0-9]+$ ]] || fail "pg_stat_kcache history sayaci gecersiz: ${pgsk_history_rows}"
+pass "PoWA/pg_qualstats/pg_stat_kcache kaydi aktif; parola NULL ve snapshot saglikli (server id ${server_id}, qual history ${pgqs_history_rows}, CPU history ${pgsk_history_rows})"
 
 secret_path="runtime/collector/sources/${alias_name}.pgpass"
 [[ -f "$secret_path" ]] || fail "Collector secret dosyasi bulunamadi: ${secret_path}"

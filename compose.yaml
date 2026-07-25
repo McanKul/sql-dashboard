@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: deployment/postgres/Dockerfile
-    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-hypopg-1.4.3
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-hypopg-1.4.3
     shm_size: ${SOURCE_DB_SHM_SIZE:-256mb}
     environment:
       POSTGRES_DB: appdb
@@ -16,7 +16,7 @@ services:
     command:
       - postgres
       - -c
-      - shared_preload_libraries=pg_stat_statements,pg_qualstats
+      - shared_preload_libraries=pg_stat_statements,pg_qualstats,pg_stat_kcache
       - -c
       - compute_query_id=on
       - -c
@@ -36,6 +36,10 @@ services:
       - -c
       - pg_qualstats.sample_rate=${PG_QUALSTATS_SAMPLE_RATE:-0.1}
       - -c
+      - pg_stat_kcache.track=top
+      - -c
+      - pg_stat_kcache.track_planning=off
+      - -c
       - track_io_timing=on
       - -c
       - powa.ignored_users=powa_collector,advisor_evaluator
@@ -54,7 +58,7 @@ services:
     networks: [advisor, evaluator_source]
 
   repository-db:
-    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-hypopg-1.4.3
+    image: postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-hypopg-1.4.3
     environment:
       PGPORT: 5433
       POSTGRES_DB: powa_repository
@@ -123,7 +127,7 @@ services:
   api:
     build:
       context: ./backend
-    image: postgresql-advisor/api:iteration-2.2
+    image: postgresql-advisor/api:iteration-2.3
     environment:
       DATABASE_URL: postgresql://advisor_api:${ADVISOR_API_PASSWORD:-advisor_dev_api}@repository-db:5433/powa_repository
       DEFAULT_WINDOW: ${DEFAULT_WINDOW:-24h}
@@ -155,7 +159,7 @@ services:
   evaluator:
     build:
       context: ./backend
-    image: postgresql-advisor/api:iteration-2.2
+    image: postgresql-advisor/api:iteration-2.3
     command: ["uvicorn", "app.evaluator:app", "--host", "0.0.0.0", "--port", "8010"]
     environment:
       EVALUATOR_DATABASE_URL: postgresql://advisor_evaluator:${ADVISOR_EVALUATOR_PASSWORD:-advisor_dev_evaluator}@source-db:5432/appdb
@@ -206,7 +210,7 @@ services:
   web:
     build:
       context: ./frontend
-    image: postgresql-advisor/web:iteration-2.2
+    image: postgresql-advisor/web:iteration-2.3
     ports:
       - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-5173}:80"
     depends_on:

@@ -11,7 +11,13 @@ DECLARE
 BEGIN
     SELECT string_agg(required.name, ', ' ORDER BY required.name)
       INTO missing
-      FROM (VALUES ('pg_stat_statements'), ('pg_qualstats'), ('btree_gist'), ('powa')) AS required(name)
+      FROM (VALUES
+          ('pg_stat_statements'),
+          ('pg_qualstats'),
+          ('pg_stat_kcache'),
+          ('btree_gist'),
+          ('powa')
+      ) AS required(name)
      WHERE NOT EXISTS (
          SELECT 1
            FROM pg_available_extensions AS available
@@ -36,6 +42,13 @@ BEGIN
     )) THEN
         RAISE EXCEPTION
           'pg_qualstats shared_preload_libraries icinde degil. Ayari ekleyip PostgreSQL clusterini yeniden baslatin.';
+    END IF;
+
+    IF NOT ('pg_stat_kcache' = ANY (
+        string_to_array(replace(current_setting('shared_preload_libraries'), ' ', ''), ',')
+    )) THEN
+        RAISE EXCEPTION
+          'pg_stat_kcache shared_preload_libraries icinde degil. Ayari ekleyip PostgreSQL clusterini yeniden baslatin.';
     END IF;
 
     IF current_setting('compute_query_id', true) = 'off' THEN
@@ -73,9 +86,11 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO %I', datname, :'collector_user')
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pg_qualstats;
+CREATE EXTENSION IF NOT EXISTS pg_stat_kcache;
 CREATE SCHEMA IF NOT EXISTS "PoWA";
 CREATE EXTENSION IF NOT EXISTS powa WITH SCHEMA "PoWA";
 SELECT "PoWA".powa_activate_extension(0, 'pg_qualstats');
+SELECT "PoWA".powa_activate_extension(0, 'pg_stat_kcache');
 
 SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), :'collector_user')
 \gexec
@@ -110,4 +125,5 @@ SELECT current_database() AS monitoring_database,
        (SELECT extversion FROM pg_extension WHERE extname = 'powa') AS powa_version,
        (SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements') AS pgss_version,
        (SELECT extversion FROM pg_extension WHERE extname = 'pg_qualstats') AS pg_qualstats_version,
+       (SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_kcache') AS pg_stat_kcache_version,
        pg_has_role(current_user, 'pg_read_all_stats', 'member') AS admin_can_read_stats;

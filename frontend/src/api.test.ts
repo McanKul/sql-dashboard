@@ -71,6 +71,16 @@ describe('advisor API contracts', () => {
       sharedBlocksRead: 6,
       tempBlocksWritten: 0,
       walBytes: 0,
+      cpu: {
+        capability: { available: true, version: '2.3.2', dataAvailable: true, source: 'PoWA pg_stat_kcache', coverage: 'EXECUTION_ONLY', reason: 'CPU ölçüldü.' },
+        userTimeMs: 8,
+        systemTimeMs: 2,
+        totalTimeMs: 10,
+        percentOfExecTime: 50,
+        filesystemReadsBytes: 4096,
+        filesystemWritesBytes: 0,
+        scoreIncluded: false,
+      },
       previousCalls: 0,
       previousMeanExecTimeMs: 0,
       regressionPercent: 0,
@@ -91,6 +101,8 @@ describe('advisor API contracts', () => {
     expect(data.p95DurationMs).toBeUndefined()
     expect(data.durationDistribution).toEqual({ available: false, reason: 'Dağılım verisi yok.' })
     expect(data.rowsPerCall).toBe(3)
+    expect(data.cpu).toMatchObject({ totalTimeMs: 10, percentOfExecTime: 50, scoreIncluded: false })
+    expect(data.cpu.capability).toMatchObject({ available: true, version: '2.3.2', dataAvailable: true })
     expect(data.scoreBreakdown[0]).toMatchObject({ contribution: 0.03, volumeFactor: 0.006, fullScoreAt: 1000 })
     expect(data.predicates.capability).toMatchObject({ available: true, coverage: 'WHERE_FILTER_ONLY', joinsAvailable: false, ddlGenerated: false })
     expect(data.predicates.items[0]).toMatchObject({ tableName: 'orders', columns: ['status'], occurrences: 12, rowsProcessed: 1000, rowsFiltered: 750, signal: 'REVIEW' })

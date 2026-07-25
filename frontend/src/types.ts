@@ -51,12 +51,31 @@ export interface QuerySummary {
   sharedBlocksRead: number
   tempBlocksWritten: number
   walBytes: number
+  cpu: QueryCpuTelemetry
   impactScore: number
   priority: string
   severity: Severity
   lastSeenAt: string
   changePercent: number
   hasComparison: boolean
+}
+
+export interface QueryCpuTelemetry {
+  capability: {
+    available: boolean
+    version?: string | null
+    dataAvailable: boolean
+    source: string
+    coverage: 'EXECUTION_ONLY'
+    reason: string
+  }
+  userTimeMs: number | null
+  systemTimeMs: number | null
+  totalTimeMs: number | null
+  percentOfExecTime: number | null
+  filesystemReadsBytes: number | null
+  filesystemWritesBytes: number | null
+  scoreIncluded: false
 }
 
 export interface ScoreBreakdown {
@@ -221,7 +240,7 @@ export interface QueryListParams {
   databaseId?: number
   minCalls?: number
   minDurationMs?: number
-  sort?: 'impact' | 'regression' | 'meanTime' | 'calls' | 'totalTime' | 'reads'
+  sort?: 'impact' | 'regression' | 'meanTime' | 'calls' | 'totalTime' | 'reads' | 'cpu'
 }
 
 export interface ServerOption {

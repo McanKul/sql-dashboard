@@ -9,7 +9,7 @@
 │                                                                                 │
 │  source-db (demo PG 18.4, :5432)             repository-db (PG 18.4, :5433)      │
 │  ├─ appdb + örnek iş yükü                    ├─ powa_repository                  │
-│  ├─ pg_stat_statements + pg_qualstats        ├─ PoWA 5.2 geçmişi                 │
+│  ├─ pg_stat_statements + qualstats + kcache  ├─ PoWA 5.2 geçmişi                 │
 │  ├─ HypoPG 1.4.3 + evaluator rolü            ├─ advisor view/not/audit katmanı   │
 │  ├─ dedicated powa DB                        └─ 90 gün retention                 │
 │  └─ powa_collector read role                                                     │
@@ -41,7 +41,8 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 ### Kaynak instance
 
 - Uygulama test veritabanı `appdb` ve örnek tabloları barındırır.
-- `shared_preload_libraries=pg_stat_statements,pg_qualstats`, `compute_query_id=on`, `track_io_timing=on` kullanır.
+- `shared_preload_libraries=pg_stat_statements,pg_qualstats,pg_stat_kcache`, `compute_query_id=on`, `track_io_timing=on` kullanır.
+- `pg_stat_kcache.track=top`, `track_planning=off` ile yalnız execution CPU ve OS filesystem sayaçlarını toplar.
 - HypoPG 1.4.3 yalnız `appdb` içinde `advisor_hypopg` şemasında etkinleştirilir; preload gerektirmez ve gerçek index oluşturmaz.
 - Salt-okunur `advisor_evaluator` rolü yalnız gerekli tablo SELECT ve HypoPG fonksiyon EXECUTE yetkilerini taşır.
 - Demo görünürlüğü için `pg_stat_statements.track=all` ayarlanmıştır.
@@ -55,6 +56,7 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 - Kaynak `source-db:5432` adıyla, 5 saniye frekans ve açıkça 90 gün retention ile kaydedilir.
 - PoWA tablolarına kolon/trigger eklenmez; ürün nesneleri ayrı `advisor` şemasındadır.
 - `advisor.query_metrics(interval)` 1h, 24h, 7d ve 30d pencerelerini besler.
+- `advisor.kcache_deltas(timestamptz)` PoWA CPU sayaçlarını reset-safe farklara çevirir; capability olmayan kaynaklarda sorgu ekranları çalışmaya devam eder.
 - Kullanıcı annotation'ları ve değişiklik audit kayıtları burada tutulur.
 
 ### Collector
@@ -74,6 +76,7 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 - Hostta API/DB portları varsayılan olarak `127.0.0.1` üzerinde, web `0.0.0.0:5173` üzerindedir.
 - Frontend varsayılan build'de gerçek API kullanır; demo modu kapalıdır.
 - API repository-only güvenlik sınırını korur. `GET /api/v1/queries/{query_id}/predicates` endpoint'i PoWA repository geçmişini okur; kaynak PostgreSQL'e doğrudan bağlanmaz.
+- Sorgu nesnesindeki `cpu` alanı PoWA repository geçmişinden user/system/total CPU ve filesystem I/O sunar; `scoreIncluded=false` ile gözlem modundadır.
 - Sorgu detayındaki “WHERE filtreleri ve index adayı gözlemleri” paneli endpoint'in capability bilgisini ve predicate kanıtlarını gösterir. Predicate endpoint'i DDL üretmez veya çalıştırmaz.
 - `POST /api/v1/queries/{query_id}/index-evaluations`, analyst yetkisi ve repository'deki seçili predicate kimliğiyle ayrı evaluator'a kontrollü istek gönderir. İstemciden SQL veya identifier kabul edilmez.
 
@@ -126,6 +129,15 @@ UI seçili predicate kimliği
 
 Bu yol telemetry toplama hattından ayrıdır ve yalnız kullanıcı isteğinde çalışır. Collector parolası evaluator tarafından kullanılmaz. Mevcut Compose evaluator'ı internal source ağı üzerinden yalnız `test-source/appdb` hedefine erişir; collector'a kaydedilmiş diğer kaynaklar kendiliğinden doğrulama kapsamına girmez. Dış kaynak veya çoklu database için ayrı düşük yetkili rol, DSN, ağ allowlist'i ve evaluator routing gerekir. Ayrıntılı runbook [İterasyon 2.2 belgesindedir](ITERATION_2_2_HYPOPG.md).
 
+## `pg_stat_kcache` veri akışı
+
+`pg_stat_kcache()` kümülatif execution CPU ve filesystem sayaçlarını üretir.
+PoWA collector bunları `powa_kcache_metrics` history tablolarına taşır;
+`advisor.kcache_deltas` ardışık örnekleri reset-safe farklara çevirir ve yalnız
+top-level statement'ları `query_metrics` ile birleştirir. CPU saniyeleri API'de
+milisaniyeye çevrilir. Paralel worker toplamı duvar saatini aşabildiği için CPU
+oranı clamp edilmez. Ayrıntı [İterasyon 2.3 runbook'undadır](ITERATION_2_3_PG_STAT_KCACHE.md).
+
 ## Analiz modeli
 
 Impact Score, aynı rapor penceresinde **kaynak sunucu + veritabanı** içindeki sorguları göreli olarak sıralar:
@@ -139,7 +151,7 @@ Impact Score, aynı rapor penceresinde **kaynak sunucu + veritabanı** içindeki
 | Önceki eş döneme regresyon | %10 |
 | WAL üretimi | %5 |
 
-Eşikler: `CRITICAL >= 85`, `HIGH >= 70`, `MEDIUM >= 40`, aksi `LOW`. Puan bir mutlak sağlık garantisi değildir; seçilen pencere ve ilgili veritabanı içindeki öncelik sırasıdır. `dbLoadPercent` de ilgili server+database'in ölçülen sorgu süresindeki paydır. Aynı `query_id` birden fazla PostgreSQL rolünce çalıştırılmışsa metrikler tek sorgu satırında birleştirilir; annotation anahtarı `server_id + database_id + query_id` ile çakışmaz.
+Eşikler: `CRITICAL >= 85`, `HIGH >= 70`, `MEDIUM >= 40`, aksi `LOW`. Regresyon bileşeni ve “yavaşlayan sorgu” sayısı için her iki eş pencerede en az 20 çağrı ve en az `%20` ortalama süre artışı gerekir; büyüklük katsayısı `%50` artışta tamdır. Puan bir mutlak sağlık garantisi değildir; seçilen pencere ve ilgili veritabanı içindeki öncelik sırasıdır. `pg_stat_kcache` CPU sinyali bu iterasyonda puana katılmaz. `dbLoadPercent` de ilgili server+database'in ölçülen top-level sorgu süresindeki paydır. Aynı `query_id` birden fazla PostgreSQL rolünce çalıştırılmışsa metrikler tek sorgu satırında birleştirilir; annotation anahtarı `server_id + database_id + query_id` ile çakışmaz.
 
 Sorgu analiz listesi `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE` ve `MERGE` ifadelerine odaklanır; baştaki SQL yorumları desteklenir. Bootstrap `CREATE/ALTER/GRANT` DDL kayıtları puanlamaya alınmaz. Bu erken filtre, yeni hazırlanmış cluster'lardaki binlerce extension DDL kaydının rapor sorgularını yavaşlatmasını engeller.
 

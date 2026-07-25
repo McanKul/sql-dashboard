@@ -63,6 +63,23 @@ interface RawQuery {
   sharedBlocksRead: number
   tempBlocksWritten: number
   walBytes: number
+  cpu?: {
+    capability?: {
+      available?: boolean
+      version?: string | null
+      dataAvailable?: boolean
+      source?: string
+      coverage?: 'EXECUTION_ONLY'
+      reason?: string
+    }
+    userTimeMs?: number | null
+    systemTimeMs?: number | null
+    totalTimeMs?: number | null
+    percentOfExecTime?: number | null
+    filesystemReadsBytes?: number | null
+    filesystemWritesBytes?: number | null
+    scoreIncluded?: false
+  }
   previousCalls: number
   previousMeanExecTimeMs: number
   regressionPercent: number
@@ -274,6 +291,8 @@ function queryTitle(query: RawQuery): string {
 
 function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): QuerySummary {
   const impactScore = clamp(Number(query.impactScore))
+  const cpuAvailable = Boolean(query.cpu?.capability?.available)
+  const cpuDataAvailable = cpuAvailable && Boolean(query.cpu?.capability?.dataAvailable)
   return {
     id: queryKey(query),
     queryId: String(query.queryId),
@@ -292,12 +311,29 @@ function mapSummary(query: RawQuery, observedAt = new Date().toISOString()): Que
     sharedBlocksRead: Number(query.sharedBlocksRead || 0),
     tempBlocksWritten: Number(query.tempBlocksWritten || 0),
     walBytes: Number(query.walBytes || 0),
+    cpu: {
+      capability: {
+        available: cpuAvailable,
+        version: query.cpu?.capability?.version,
+        dataAvailable: cpuDataAvailable,
+        source: query.cpu?.capability?.source || 'PoWA pg_stat_kcache',
+        coverage: 'EXECUTION_ONLY',
+        reason: query.cpu?.capability?.reason || 'pg_stat_kcache telemetrisi kullanilamiyor.',
+      },
+      userTimeMs: cpuDataAvailable ? optionalNumber(query.cpu?.userTimeMs) ?? null : null,
+      systemTimeMs: cpuDataAvailable ? optionalNumber(query.cpu?.systemTimeMs) ?? null : null,
+      totalTimeMs: cpuDataAvailable ? optionalNumber(query.cpu?.totalTimeMs) ?? null : null,
+      percentOfExecTime: cpuDataAvailable ? optionalNumber(query.cpu?.percentOfExecTime) ?? null : null,
+      filesystemReadsBytes: cpuDataAvailable ? optionalNumber(query.cpu?.filesystemReadsBytes) ?? null : null,
+      filesystemWritesBytes: cpuDataAvailable ? optionalNumber(query.cpu?.filesystemWritesBytes) ?? null : null,
+      scoreIncluded: false,
+    },
     impactScore: Math.round(impactScore),
     priority: (query.priority || 'LOW').toUpperCase(),
     severity: severityFromPriority(query.priority),
     lastSeenAt: observedAt,
     changePercent: Number(query.regressionPercent || 0),
-    hasComparison: comparisonAvailable(Number(query.previousCalls || 0)),
+    hasComparison: comparisonAvailable(Number(query.previousCalls || 0), Number(query.calls || 0)),
   }
 }
 

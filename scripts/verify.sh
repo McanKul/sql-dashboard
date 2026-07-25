@@ -58,7 +58,7 @@ repo_data_directory="$(docker compose exec -T repository-db psql -U postgres -p 
   || fail "Repository PG18 data directory hatali: ${repo_data_directory}"
 pass "Iki PostgreSQL instance PG18 ve kalici data directory duzeni dogru"
 
-expected_pg_image="postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-hypopg-1.4.3"
+expected_pg_image="postgresql-advisor/powa-postgres:18-5.2.0-qualstats-2.1.4-kcache-2.3.2-hypopg-1.4.3"
 source_pg_image="$(docker inspect --format '{{.Config.Image}}' "$(docker compose ps -q source-db)")"
 repository_pg_image="$(docker inspect --format '{{.Config.Image}}' "$(docker compose ps -q repository-db)")"
 [[ "$source_pg_image" == "$expected_pg_image" ]] \
@@ -76,12 +76,12 @@ repository_hypopg_available="$(docker compose exec -T repository-db psql -U post
 pass "Kaynak ve repository image'lari PG18 + HypoPG 1.4.3 olarak sabit"
 
 source_ext="$(docker compose exec -T source-db psql -U postgres -d powa -Atqc \
-  "SELECT string_agg(extname || '=' || extversion, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('powa','pg_stat_statements','pg_qualstats','btree_gist')")"
+  "SELECT string_agg(extname || '=' || extversion, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('powa','pg_stat_statements','pg_qualstats','pg_stat_kcache','btree_gist')")"
 repo_ext="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
   "SELECT string_agg(extname || '=' || extversion, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('powa','pg_stat_statements','btree_gist')")"
-[[ "$source_ext" == *"powa=5.2.0"* && "$source_ext" == *"pg_stat_statements="* && "$source_ext" == *"pg_qualstats=2.1.4"* ]] || fail "Kaynak extension seti eksik: ${source_ext}"
+[[ "$source_ext" == *"powa=5.2.0"* && "$source_ext" == *"pg_stat_statements="* && "$source_ext" == *"pg_qualstats=2.1.4"* && "$source_ext" == *"pg_stat_kcache=2.3.2"* ]] || fail "Kaynak extension seti eksik: ${source_ext}"
 [[ "$repo_ext" == *"powa=5.2.0"* && "$repo_ext" == *"pg_stat_statements="* ]] || fail "Repository extension seti eksik: ${repo_ext}"
-pass "Kaynak pg_qualstats 2.1.4 ve iki PoWA extension seti dogru"
+pass "Kaynak pg_qualstats 2.1.4, pg_stat_kcache 2.3.2 ve iki PoWA extension seti dogru"
 
 source_hypopg_version="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'")"
@@ -122,8 +122,16 @@ fi
 pass "Evaluator saglikli, HypoPG 1.4.3 yetenekli, read-only ve yalniz ic agda"
 
 preload="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc 'SHOW shared_preload_libraries')"
-[[ "$preload" == *"pg_stat_statements"* && "$preload" == *"pg_qualstats"* ]] \
-  || fail "pg_stat_statements/pg_qualstats preload edilmemis: ${preload}"
+[[ "$preload" == *"pg_stat_statements"* && "$preload" == *"pg_qualstats"* && "$preload" == *"pg_stat_kcache"* ]] \
+  || fail "pg_stat_statements/pg_qualstats/pg_stat_kcache preload edilmemis: ${preload}"
+
+kcache_settings="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
+  "SELECT current_setting('pg_stat_kcache.track'),
+          current_setting('pg_stat_kcache.track_planning'),
+          (SELECT count(*) >= 0 FROM \"PoWA\".powa_kcache_src(0))")"
+[[ "$kcache_settings" == "top|off|t" ]] \
+  || fail "pg_stat_kcache gozlem ayarlari/datasource beklenmiyor: ${kcache_settings:-bos}"
+pass "pg_stat_kcache top-level execution CPU takibi etkin; planning takibi kapali"
 
 qualstats_settings="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
   "SELECT current_setting('pg_qualstats.track_constants'),
@@ -206,6 +214,20 @@ qualstats_registration="$(docker compose exec -T repository-db psql -U postgres 
   || fail "Repository pg_qualstats datasource kaydi eksik: ${qualstats_registration:-yok}"
 pass "Repository pg_qualstats datasource ve dort PoWA islemi etkin"
 
+kcache_registration="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
+  "SELECT ec.enabled, ec.version,
+          (SELECT count(*) = 4
+             FROM \"PoWA\".powa_functions f
+            WHERE f.srvid = ec.srvid
+              AND f.name = 'pg_stat_kcache'
+              AND f.enabled
+              AND f.operation IN ('snapshot','aggregate','purge','reset'))
+     FROM \"PoWA\".powa_extension_config ec
+    WHERE ec.srvid = ${demo_server_id} AND ec.extname = 'pg_stat_kcache'")"
+[[ "$kcache_registration" == "t|2.3.2|t" ]] \
+  || fail "Repository pg_stat_kcache datasource kaydi eksik: ${kcache_registration:-yok}"
+pass "Repository pg_stat_kcache datasource ve dort PoWA islemi etkin"
+
 # Yepyeni repository'de ilk snapshot bir delta degil, kaynak sayaclarinin
 # baseline'idir. Kontrollu workload'u bundan sonra calistirarak API metriklerinin
 # temiz kurulumda da ilk farktan uretilmesini garanti ederiz.
@@ -221,14 +243,18 @@ for attempt in $(seq 1 20); do
        EXISTS (
          SELECT 1 FROM \"PoWA\".powa_statements_history_current h
           WHERE h.srvid = m.srvid
+       ),
+       EXISTS (
+         SELECT 1 FROM \"PoWA\".powa_kcache_metrics_current h
+          WHERE h.srvid = m.srvid
        )
      FROM \"PoWA\".powa_snapshot_metas m
     WHERE m.srvid = ${demo_server_id}")"
-  if [[ "$baseline_state" == "t|0|t" ]]; then
+  if [[ "$baseline_state" == "t|0|t|t" ]]; then
     break
   fi
 done
-[[ "$baseline_state" == "t|0|t" ]] \
+[[ "$baseline_state" == "t|0|t|t" ]] \
   || fail "Ilk collector baseline snapshot'i olusmadi: ${baseline_state:-bos}"
 pass "Collector baseline snapshot'i hazir"
 
@@ -240,6 +266,11 @@ previous_qual_epoch="$(docker compose exec -T repository-db psql -U postgres -p 
   "SELECT greatest(
       coalesce((SELECT max(extract(epoch FROM ts)) FROM \"PoWA\".powa_qualstats_quals_history_current WHERE srvid=${demo_server_id}), 0),
       coalesce((SELECT max(extract(epoch FROM upper(coalesce_range))) FROM \"PoWA\".powa_qualstats_quals_history WHERE srvid=${demo_server_id}), 0)
+   )")"
+previous_kcache_epoch="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
+  "SELECT greatest(
+      coalesce((SELECT max(extract(epoch FROM (metrics).ts)) FROM \"PoWA\".powa_kcache_metrics_current WHERE srvid=${demo_server_id}), 0),
+      coalesce((SELECT max(extract(epoch FROM upper(coalesce_range))) FROM \"PoWA\".powa_kcache_metrics WHERE srvid=${demo_server_id}), 0)
    )")"
 
 # Collector pg_qualstats'i her snapshot sonrasinda resetler. Kontrollu workload
@@ -311,21 +342,35 @@ for attempt in $(seq 1 20); do
                      FROM \"PoWA\".powa_qualstats_quals_history
                     WHERE srvid = ${demo_server_id}), 0)
        ) > ${previous_qual_epoch},
+       greatest(
+         coalesce((SELECT max(extract(epoch FROM (metrics).ts))
+                     FROM \"PoWA\".powa_kcache_metrics_current
+                    WHERE srvid = ${demo_server_id}), 0),
+         coalesce((SELECT max(extract(epoch FROM upper(coalesce_range)))
+                     FROM \"PoWA\".powa_kcache_metrics
+                    WHERE srvid = ${demo_server_id}), 0)
+       ) > ${previous_kcache_epoch},
        coalesce((SELECT version
                    FROM \"PoWA\".powa_extension_config
                   WHERE srvid = ${demo_server_id} AND extname = 'pg_qualstats'), ''),
        coalesce((SELECT enabled
                    FROM \"PoWA\".powa_extension_config
                   WHERE srvid = ${demo_server_id} AND extname = 'pg_qualstats'), false),
+       coalesce((SELECT version
+                   FROM \"PoWA\".powa_extension_config
+                  WHERE srvid = ${demo_server_id} AND extname = 'pg_stat_kcache'), ''),
+       coalesce((SELECT enabled
+                   FROM \"PoWA\".powa_extension_config
+                  WHERE srvid = ${demo_server_id} AND extname = 'pg_stat_kcache'), false),
        coalesce((SELECT cardinality(coalesce(errors, ARRAY[]::text[]))
                    FROM \"PoWA\".powa_snapshot_metas
                   WHERE srvid = ${demo_server_id}), -1)")"
-  if [[ "$qual_pipeline" == "t|t|2.1.4|t|0" ]]; then
+  if [[ "$qual_pipeline" == "t|t|t|2.1.4|t|2.3.2|t|0" ]]; then
     break
   fi
 done
-[[ "$qual_pipeline" == "t|t|2.1.4|t|0" ]] \
-  || fail "pg_qualstats snapshot/tarihce akisi ilerlemedi: ${qual_pipeline:-bos}"
+[[ "$qual_pipeline" == "t|t|t|2.1.4|t|2.3.2|t|0" ]] \
+  || fail "pg_qualstats/pg_stat_kcache snapshot ve tarihce akisi ilerlemedi: ${qual_pipeline:-bos}"
 
 repo_qualstats="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
   "SELECT
@@ -338,6 +383,18 @@ IFS='|' read -r repo_qual_rows repo_qual_history repo_qual_tmp <<< "$repo_qualst
   || fail "Repository pg_qualstats sonucu sayisal degil: ${repo_qualstats}"
 (( repo_qual_rows > 0 && repo_qual_history > 0 && repo_qual_tmp == 0 )) \
   || fail "Repository pg_qualstats satir/tarihce/staging beklenmiyor: ${repo_qualstats}"
+
+repo_kcache="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
+  "SELECT
+     (SELECT count(*) FROM \"PoWA\".powa_kcache_metrics_current WHERE srvid = ${demo_server_id})
+       + (SELECT count(*) FROM \"PoWA\".powa_kcache_metrics WHERE srvid = ${demo_server_id}),
+     (SELECT count(*) FROM \"PoWA\".powa_kcache_src_tmp WHERE srvid = ${demo_server_id})")"
+IFS='|' read -r repo_kcache_history repo_kcache_tmp <<< "$repo_kcache"
+[[ "$repo_kcache_history" =~ ^[0-9]+$ && "$repo_kcache_tmp" =~ ^[0-9]+$ ]] \
+  || fail "Repository pg_stat_kcache sonucu sayisal degil: ${repo_kcache}"
+(( repo_kcache_history > 0 && repo_kcache_tmp == 0 )) \
+  || fail "Repository pg_stat_kcache tarihce/staging beklenmiyor: ${repo_kcache}"
+pass "PoWA repository pg_stat_kcache CPU/filesystem tarihcesi calisti"
 
 mapped_qual_columns="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
   "SELECT string_agg(DISTINCT c.relname || '.' || a.attname, ',' ORDER BY c.relname || '.' || a.attname)
@@ -426,6 +483,14 @@ item = data['items'][0]
 assert item['sqlVisible'] is True
 assert item['calls'] > 0
 assert 0 <= item['impactScore'] <= 100
+cpu = item['cpu']
+assert cpu['capability']['available'] is True, item
+assert cpu['capability']['dataAvailable'] is True, item
+assert cpu['capability']['version'] == '2.3.2', item
+assert cpu['totalTimeMs'] >= 0, item
+assert cpu['userTimeMs'] >= 0 and cpu['systemTimeMs'] >= 0, item
+assert cpu['percentOfExecTime'] >= 0, item
+assert cpu['scoreIncluded'] is False, item
 print(item['serverId'], item['databaseId'], item['queryId'])
 PY
 )
@@ -439,7 +504,33 @@ assert data['items'], data
 assert all(item['sqlVisible'] is False for item in data['items'])
 assert all('analyst yetkisi' in item['sql'] for item in data['items'])
 PY
-pass "Sorgu API'si gercek metrik donuyor ve yetkisiz SQL maskeleniyor"
+pass "Sorgu API'si gercek CPU dahil metrik donuyor ve yetkisiz SQL maskeleniyor"
+
+calibration_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
+  "WITH metrics AS (SELECT * FROM advisor.query_metrics(interval '1 hour'))
+   SELECT
+     NOT EXISTS (
+       SELECT 1 FROM metrics
+        WHERE (regression_percent < 20 OR previous_calls < 20 OR calls < 20)
+          AND regression_score <> 0
+     ),
+     NOT EXISTS (
+       SELECT 1 FROM metrics m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM advisor.query_deltas(now() - interval '1 hour') d
+           WHERE d.server_id=m.server_id AND d.database_id=m.database_id
+             AND d.query_id=m.query_id AND d.toplevel
+             AND d.sample_at >= now() - interval '1 hour'
+        )
+     ),
+     count(*) FILTER (WHERE priority='CRITICAL'),
+     round(min(impact_score)::numeric, 2),
+     round(max(impact_score)::numeric, 2)
+   FROM metrics")"
+IFS='|' read -r regression_gate top_level_only critical_count min_score max_score <<< "$calibration_state"
+[[ "$regression_gate" == t && "$top_level_only" == t ]] \
+  || fail "Puan kalibrasyon guard'lari basarisiz: ${calibration_state:-bos}"
+pass "Kalibrasyon: top-level toplam, %20/20-cagri regresyon gate'i ve skor araligi dogru (critical=${critical_count}, min=${min_score}, max=${max_score})"
 
 predicate_identity="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
   "SELECT query_id, database_id
@@ -677,4 +768,4 @@ if docker compose ps --services --status running | grep -qx web; then
 fi
 
 echo
-echo "Iterasyon 1, Iterasyon 2.1-B pg_qualstats ve Iterasyon 2.2 HypoPG kabul kontrolleri tamamlandi."
+echo "Iterasyon 1, 2.1-B pg_qualstats, 2.2 HypoPG, kalibrasyon ve 2.3 pg_stat_kcache kabul kontrolleri tamamlandi."

@@ -401,6 +401,10 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .predicate-empty svg { flex: 0 0 auto; color: #71809a; }
 .predicate-empty strong { color: #4d586c; font-size: 11px; }
 .predicate-empty p { margin: 4px 0 0; font-size: 9.5px; line-height: 1.45; }
+.cpu-metric-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.cpu-metric-grid > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; padding: 11px; border: 1px solid #e7eaf0; border-radius: 9px; background: #fafbfc; }
+.cpu-metric-grid span, .cpu-metric-grid small { color: #8b95a6; font-size: 9px; }
+.cpu-metric-grid strong { overflow: hidden; color: #39465d; font-size: 13px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .comparison-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 15px; }
 .comparison-item { padding: 12px; border: 1px solid #e8ebf0; border-radius: 9px; background: #fbfcfd; }
 .comparison-item > span { color: #828b9c; font-size: 8.5px; font-weight: 630; }
@@ -572,6 +576,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .telemetry-metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .query-table th:nth-child(4), .query-table td:nth-child(4) { display: none; }
   .query-metrics-table th:nth-child(4), .query-metrics-table td:nth-child(4) { display: table-cell; }
+  .cpu-metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 @media (max-width: 980px) {
@@ -644,6 +649,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .trend-metrics { grid-template-columns: 1fr 1fr; gap: 12px 0; }
   .trend-metrics > div:nth-child(2) { border: 0; }
   .telemetry-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cpu-metric-grid { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 500px) {
@@ -664,6 +670,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .search-field, .sort-field { grid-column: auto; }
   .select-field select { width: auto; max-width: none; flex: 1; }
   .telemetry-metric-grid { grid-template-columns: 1fr; }
+  .cpu-metric-grid { grid-template-columns: 1fr; }
   .operations-flow > div { min-width: 120px; }
 }
 

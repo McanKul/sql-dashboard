@@ -368,7 +368,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
     <section className="page-section" aria-labelledby="queries-title">
       <PageHeading eyebrow={`Sorgu envanteri · ${windowLabels[window]}`} title="Etkiyi bulun, nedeni anlayın" description={`${formatNumber(state.data?.total || 0)} benzersiz sorgu; repository telemetrisiyle sunucu tarafında filtrelenir.`} />
 
-      <ReadingGuide>Etki puanı seçili penceredeki diğer sorgulara göre inceleme önceliğini gösterir. Ham DB yükü, süre, blok, temp ve WAL değerlerini birlikte okuyun; göreli puan tek başına mutlak bir sorun kanıtı değildir.</ReadingGuide>
+      <ReadingGuide>Etki puanı seçili penceredeki diğer sorgulara göre inceleme önceliğini gösterir. Ham DB yükü, gerçek CPU, süre, blok, temp ve WAL değerlerini birlikte okuyun; göreli puan tek başına mutlak bir sorun kanıtı değildir.</ReadingGuide>
 
       <div className="query-toolbar query-toolbar-expanded" role="search" onKeyDown={(event) => { if (event.key === 'Enter' && (event.target as HTMLElement).tagName === 'INPUT') applyFilters() }}>
         <label className="search-field"><Search size={18} aria-hidden="true" /><span className="sr-only">Sorgularda ara</span><input value={draft.search || ''} onChange={(event) => setDraft((value) => ({ ...value, search: event.target.value || undefined }))} placeholder="SQL veya sorgu kimliği ara…" /></label>
@@ -377,7 +377,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
         <label className="select-field"><CircleDot size={15} /><span className="sr-only">Öncelik</span><select value={draft.priority || ''} onChange={(event) => setDraft((value) => ({ ...value, priority: event.target.value || undefined }))}><option value="">Tüm öncelikler</option><option value="CRITICAL">Kritik</option><option value="HIGH">Yüksek</option><option value="MEDIUM">Orta</option><option value="LOW">Düşük</option></select><ChevronDown size={14} /></label>
         <label className="number-field"><span>Min. çağrı</span><input type="number" min="0" value={draft.minCalls ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minCalls: event.target.value ? Number(event.target.value) : undefined }))} /></label>
         <label className="number-field"><span>Min. toplam süre</span><input type="number" min="0" step="10" value={draft.minDurationMs ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minDurationMs: event.target.value ? Number(event.target.value) : undefined }))} /><small>ms</small></label>
-        <label className="select-field sort-field"><span>Sırala:</span><select value={draft.sort || 'impact'} onChange={(event) => setDraft((value) => ({ ...value, sort: event.target.value as QueryListParams['sort'] }))}><option value="impact">Etki</option><option value="totalTime">Toplam süre</option><option value="meanTime">Ortalama süre</option><option value="calls">Çağrı</option><option value="reads">Fiziksel okuma</option><option value="regression">Regresyon</option></select><ChevronDown size={14} /></label>
+        <label className="select-field sort-field"><span>Sırala:</span><select value={draft.sort || 'impact'} onChange={(event) => setDraft((value) => ({ ...value, sort: event.target.value as QueryListParams['sort'] }))}><option value="impact">Etki</option><option value="totalTime">Toplam süre</option><option value="meanTime">Ortalama süre</option><option value="cpu">Gerçek CPU</option><option value="calls">Çağrı</option><option value="reads">Fiziksel okuma</option><option value="regression">Regresyon</option></select><ChevronDown size={14} /></label>
         <button type="button" className="primary-button filter-button" onClick={applyFilters}>Uygula</button>
       </div>
 
@@ -387,7 +387,7 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
         <div className="query-table-card">
           <table className="query-table query-metrics-table">
             <caption className="sr-only">Analiz edilen PostgreSQL sorguları ve ham performans metrikleri</caption>
-            <thead><tr><th scope="col">Sorgu</th><th scope="col">İnceleme puanı</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
+            <thead><tr><th scope="col">Sorgu</th><th scope="col">İnceleme puanı</th><th scope="col">DB yükü</th><th scope="col">Çalışma süresi</th><th scope="col">Gerçek CPU</th><th scope="col">Shared blok</th><th scope="col">Temp / WAL</th><th scope="col">Çağrı / regresyon</th><th scope="col"><span className="sr-only">Aç</span></th></tr></thead>
             <tbody>
               {state.data.items.map((query) => (
                 <tr key={query.id} onClick={() => onOpenQuery(query.id)}>
@@ -395,6 +395,9 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
                   <td><div className="table-score"><ImpactRing impact={query.impactScore} severity={query.severity} size="small" /><QueryImpactBadge severity={query.severity} /></div></td>
                   <td><strong className="tabular">%{formatNumber(query.dbLoadPercent)}</strong><small>ölçülen DB zamanı</small></td>
                   <td><strong className="tabular">{formatDuration(query.totalTimeMs)}</strong><small>{formatDuration(query.avgDurationMs)} ortalama</small></td>
+                  <td>{query.cpu.capability.dataAvailable && query.cpu.totalTimeMs !== null
+                    ? <><strong className="tabular">{formatDuration(query.cpu.totalTimeMs)}</strong><small>%{formatNumber(query.cpu.percentOfExecTime ?? 0)} DB süresi</small></>
+                    : <><strong>—</strong><small>{query.cpu.capability.available ? 'veri birikiyor' : 'kcache kapalı'}</small></>}</td>
                   <td><strong className="tabular">{formatLargeNumber(query.sharedBlocksRead)} okuma</strong><small>{formatLargeNumber(query.sharedBlocksHit)} cache hit</small></td>
                   <td><strong className="tabular">{formatLargeNumber(query.tempBlocksWritten)} temp blok</strong><small>{formatBytes(query.walBytes)} WAL</small></td>
                   <td><strong className="tabular">{formatLargeNumber(query.calls)} çağrı</strong>{query.hasComparison
@@ -624,7 +627,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
             </div>
 
             <div className="modal-reading-guide">
-              <ReadingGuide>Yüksek inceleme puanı önce bakılması gereken sorguyu, pozitif değişim ise yavaşlamayı gösterir. Bu puan yalnızca sıralama yapar; SQL üzerinde otomatik değişiklik yapmaz. Shared blok okuması veya geçici yazma yükseliyorsa sorgu planını, bellek kullanımını ve veri erişim biçimini birlikte inceleyin.</ReadingGuide>
+              <ReadingGuide>Yüksek inceleme puanı önce bakılması gereken sorguyu, pozitif değişim ise yavaşlamayı gösterir. Bu puan yalnızca sıralama yapar; SQL üzerinde otomatik değişiklik yapmaz. Gerçek CPU oranını DB süresiyle, filesystem I/O'yu shared bloklarla birlikte okuyun.</ReadingGuide>
             </div>
 
             <div className="query-detail-layout">
@@ -642,6 +645,24 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                   <MiniTrend points={state.data.trend.map((point) => ({ label: point.label.replace(' Tem', ''), value: point.durationMs }))} tone={!state.data.hasComparison ? 'blue' : state.data.changePercent > 0 ? 'red' : 'green'} height={142} label={`Sorgunun ${windowLabels[window].toLocaleLowerCase('tr')} çalışma süresi`} />
                   <div className="trend-metrics"><div><span>Ortalama</span><strong>{formatDuration(state.data.avgDurationMs)}</strong></div><div><span>Çağrı</span><strong>{formatLargeNumber(state.data.calls)}</strong></div><div><span>Okunan shared blok</span><strong>{formatLargeNumber(state.data.sharedBlocksRead)}</strong></div><div><span>Toplam süre</span><strong>{formatDuration(state.data.totalTimeMs)}</strong></div>{state.data.rowsPerCall !== undefined && <div><span>Satır / çağrı</span><strong>{formatNumber(state.data.rowsPerCall)}</strong></div>}{state.data.p95DurationMs !== undefined && <div><span>Gerçek p95</span><strong>{formatDuration(state.data.p95DurationMs)}</strong></div>}</div>
                   {state.data.p95DurationMs === undefined && state.data.durationDistribution?.available === false && <div className="metric-unavailable"><Info size={15} /><span><strong>p95 gösterilemiyor.</strong> {state.data.durationDistribution.reason || 'PoWA yürütme süresi dağılımını saklamıyor.'}</span></div>}
+                </article>
+
+                <article className="detail-card cpu-card">
+                  <div className="detail-card-heading"><div><span className="panel-kicker">pg_stat_kcache {state.data.cpu.capability.version || ''}</span><h2>Gerçek CPU ve işletim sistemi I/O'su</h2></div><span className="simulation-label"><Activity size={14} /> Skora dahil değil</span></div>
+                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.cpu.capability.reason} Bu metrik bu iterasyonda yalnız gözlemdir ve inceleme puanını değiştirmez.</span></div>
+                  {!state.data.cpu.capability.available ? (
+                    <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>CPU telemetrisi kapalı</strong><p>Kaynakta pg_stat_kcache preload, extension ve PoWA datasource kaydı gerekir.</p></div></div>
+                  ) : !state.data.cpu.capability.dataAvailable ? (
+                    <div className="predicate-empty"><Clock3 size={20} /><div><strong>CPU verisi henüz oluşmadı</strong><p>Aynı sorgu iki collector snapshot'ı arasında çalıştığında reset-safe fark metrikleri görünür.</p></div></div>
+                  ) : (
+                    <div className="cpu-metric-grid">
+                      <div><span>Toplam CPU</span><strong>{formatDuration(state.data.cpu.totalTimeMs ?? 0)}</strong><small>%{formatNumber(state.data.cpu.percentOfExecTime ?? 0)} DB süresi</small></div>
+                      <div><span>User CPU</span><strong>{formatDuration(state.data.cpu.userTimeMs ?? 0)}</strong><small>uygulama kodu</small></div>
+                      <div><span>System CPU</span><strong>{formatDuration(state.data.cpu.systemTimeMs ?? 0)}</strong><small>kernel çağrıları</small></div>
+                      <div><span>Filesystem okuma</span><strong>{state.data.cpu.filesystemReadsBytes === null ? '—' : formatBytes(state.data.cpu.filesystemReadsBytes)}</strong><small>OS katmanı</small></div>
+                      <div><span>Filesystem yazma</span><strong>{state.data.cpu.filesystemWritesBytes === null ? '—' : formatBytes(state.data.cpu.filesystemWritesBytes)}</strong><small>OS katmanı</small></div>
+                    </div>
+                  )}
                 </article>
 
                 <article className="detail-card">

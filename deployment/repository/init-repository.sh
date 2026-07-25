@@ -44,7 +44,7 @@ SELECT "PoWA".powa_register_server(
     powa_coalesce => 100,
     retention => interval '90 days',
     allow_ui_connection => false,
-    extensions => ARRAY['pg_qualstats']::text[]
+    extensions => ARRAY['pg_qualstats', 'pg_stat_kcache']::text[]
 );
 SQL
     ;;

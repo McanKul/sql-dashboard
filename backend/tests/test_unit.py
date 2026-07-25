@@ -35,6 +35,15 @@ BASE_ROW = {
     "shared_blocks_read": 80,
     "temp_blocks_written": 5,
     "wal_bytes": 2_000_000,
+    "kcache_available": True,
+    "kcache_version": "2.3.2",
+    "kcache_data_available": True,
+    "cpu_user_time_ms": 700.0,
+    "cpu_system_time_ms": 100.0,
+    "cpu_total_time_ms": 800.0,
+    "cpu_percent_of_exec_time": 66.67,
+    "filesystem_reads_bytes": 4096,
+    "filesystem_writes_bytes": 1024,
     "previous_calls": 80,
     "previous_mean_exec_time_ms": 8.0,
     "regression_percent": 50.0,
@@ -99,6 +108,43 @@ def test_query_rows_per_call_is_real_and_p95_is_not_fabricated() -> None:
     assert item["p95ExecTimeMs"] is None
     assert item["durationDistribution"]["available"] is False
     assert "p95" in item["durationDistribution"]["reason"]
+
+
+def test_query_cpu_telemetry_is_explicit_and_observation_only() -> None:
+    item = serialize_query(BASE_ROW, sql_visible=True)
+
+    assert item["cpu"]["capability"] == {
+        "available": True,
+        "version": "2.3.2",
+        "dataAvailable": True,
+        "source": "PoWA pg_stat_kcache",
+        "coverage": "EXECUTION_ONLY",
+        "reason": (
+            "CPU user/system ve filesystem I/O degerleri PoWA pg_stat_kcache gecmisinden gelir; "
+            "paralel calismada toplam CPU suresi duvar saatini asabilir."
+        ),
+    }
+    assert item["cpu"]["totalTimeMs"] == 800.0
+    assert item["cpu"]["filesystemReadsBytes"] == 4096
+    assert item["cpu"]["scoreIncluded"] is False
+
+
+def test_query_cpu_capability_does_not_turn_missing_data_into_zero() -> None:
+    item = serialize_query(
+        {
+            **BASE_ROW,
+            "kcache_data_available": False,
+            "cpu_user_time_ms": None,
+            "cpu_system_time_ms": None,
+            "cpu_total_time_ms": None,
+            "cpu_percent_of_exec_time": None,
+        },
+        sql_visible=True,
+    )
+
+    assert item["cpu"]["capability"]["available"] is True
+    assert item["cpu"]["capability"]["dataAvailable"] is False
+    assert item["cpu"]["totalTimeMs"] is None
 
 
 def test_findings_are_explainable() -> None:

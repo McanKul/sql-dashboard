@@ -16,6 +16,7 @@ SORT_COLUMNS = {
     "calls": "calls",
     "regression": "regression_percent",
     "reads": "shared_blocks_read",
+    "cpu": "cpu_total_time_ms",
 }
 
 
@@ -79,12 +80,24 @@ def findings_for(row: Mapping[str, Any]) -> list[str]:
         findings.append("Toplam veritabani suresinin onemli bir bolumunu kullaniyor.")
     if int(row.get("shared_blocks_read") or 0) > int(row.get("shared_blocks_hit") or 0) * 0.25:
         findings.append("Okunan shared blok miktari yuksek; sorgu plani incelenmeli.")
-    if _as_float(row.get("regression_percent")) >= 20 and int(row.get("previous_calls") or 0) >= 5:
+    if (
+        _as_float(row.get("regression_percent")) >= 20
+        and int(row.get("previous_calls") or 0) >= 20
+        and int(row.get("calls") or 0) >= 20
+    ):
         findings.append("Onceki es doneme gore ortalama calisma suresi geriledi.")
     if int(row.get("temp_blocks_written") or 0) > 0:
         findings.append("Gecici blok yazimi var; siralama/hash bellek kullanimi incelenmeli.")
     if _as_float(row.get("wal_bytes")) > 1_000_000:
         findings.append("WAL uretimi yuksek.")
+    if row.get("kcache_data_available"):
+        cpu_percent = _as_float(row.get("cpu_percent_of_exec_time"))
+        if cpu_percent >= 70:
+            findings.append("Calisma suresinin onemli bir bolumu gercek CPU tuketimi olarak olculdu.")
+        elif _as_float(row.get("total_exec_time_ms")) >= 1000 and cpu_percent < 20:
+            findings.append(
+                "CPU payi dusuk; kalan sure bekleme veya I/O kaynakli olabilir ve wait telemetrisiyle ayrilmalidir."
+            )
     if not findings:
         findings.append("Belirgin bir risk esigi asilmadi; trend izlenmeli.")
     return findings
@@ -92,6 +105,17 @@ def findings_for(row: Mapping[str, Any]) -> list[str]:
 
 def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, Any]:
     raw_sql = str(row.get("sql_text") or "")
+    kcache_available = bool(row.get("kcache_available"))
+    kcache_data_available = kcache_available and bool(row.get("kcache_data_available"))
+    if not kcache_available:
+        kcache_reason = "pg_stat_kcache bu kaynakta etkin degil."
+    elif not kcache_data_available:
+        kcache_reason = "pg_stat_kcache etkin, ancak secili pencere ve sorgu icin iki snapshot arasinda CPU verisi yok."
+    else:
+        kcache_reason = (
+            "CPU user/system ve filesystem I/O degerleri PoWA pg_stat_kcache gecmisinden gelir; "
+            "paralel calismada toplam CPU suresi duvar saatini asabilir."
+        )
     return {
         "serverId": row["server_id"],
         "serverAlias": row.get("server_alias") or f"server-{row['server_id']}",
@@ -118,6 +142,31 @@ def serialize_query(row: Mapping[str, Any], *, sql_visible: bool) -> dict[str, A
         "sharedBlocksRead": int(row.get("shared_blocks_read") or 0),
         "tempBlocksWritten": int(row.get("temp_blocks_written") or 0),
         "walBytes": round(_as_float(row.get("wal_bytes")), 2),
+        "cpu": {
+            "capability": {
+                "available": kcache_available,
+                "version": row.get("kcache_version"),
+                "dataAvailable": kcache_data_available,
+                "source": "PoWA pg_stat_kcache",
+                "coverage": "EXECUTION_ONLY",
+                "reason": kcache_reason,
+            },
+            "userTimeMs": round(_as_float(row.get("cpu_user_time_ms")), 2) if kcache_data_available else None,
+            "systemTimeMs": round(_as_float(row.get("cpu_system_time_ms")), 2) if kcache_data_available else None,
+            "totalTimeMs": round(_as_float(row.get("cpu_total_time_ms")), 2) if kcache_data_available else None,
+            "percentOfExecTime": round(_as_float(row.get("cpu_percent_of_exec_time")), 2) if kcache_data_available else None,
+            "filesystemReadsBytes": (
+                int(row["filesystem_reads_bytes"])
+                if kcache_data_available and row.get("filesystem_reads_bytes") is not None
+                else None
+            ),
+            "filesystemWritesBytes": (
+                int(row["filesystem_writes_bytes"])
+                if kcache_data_available and row.get("filesystem_writes_bytes") is not None
+                else None
+            ),
+            "scoreIncluded": False,
+        },
         "previousCalls": int(row.get("previous_calls") or 0),
         "previousMeanExecTimeMs": round(_as_float(row.get("previous_mean_exec_time_ms")), 2),
         "regressionPercent": round(_as_float(row.get("regression_percent")), 2),
@@ -232,7 +281,11 @@ class PowaRepository:
             conditions.append("database_id = %s")
             filters.append(database_id)
         if regressions_only:
-            conditions.extend(["regression_percent > 0", "previous_calls >= 5"])
+            conditions.extend([
+                "regression_percent >= 20",
+                "previous_calls >= 20",
+                "calls >= 20",
+            ])
 
         where_sql = " AND ".join(conditions)
         order_column = SORT_COLUMNS.get(sort_by, SORT_COLUMNS["impact"])
@@ -272,7 +325,9 @@ class PowaRepository:
                         count(*)::bigint AS tracked_queries,
                         count(*) FILTER (WHERE priority = 'CRITICAL')::bigint AS critical_queries,
                         count(*) FILTER (
-                            WHERE regression_percent > 0 AND previous_calls >= 5
+                            WHERE regression_percent >= 20
+                              AND previous_calls >= 20
+                              AND calls >= 20
                         )::bigint AS regressions
                     FROM advisor.query_metrics(%s::interval)
                     """,
@@ -323,7 +378,7 @@ class PowaRepository:
     ) -> list[dict[str, Any]]:
         interval = interval_for(window)
         bucket = WINDOW_BUCKETS[window]
-        clauses = ["sample_at >= now() - %s::interval"]
+        clauses = ["sample_at >= now() - %s::interval", "toplevel"]
         params: list[Any] = [bucket, interval, interval]
         if query_id is not None:
             clauses.append("query_id = %s")

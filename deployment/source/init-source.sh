@@ -167,6 +167,7 @@ psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname powa <<'SQL'
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pg_qualstats;
+CREATE EXTENSION IF NOT EXISTS pg_stat_kcache;
 CREATE SCHEMA IF NOT EXISTS "PoWA";
 CREATE EXTENSION IF NOT EXISTS powa WITH SCHEMA "PoWA";
 -- Normal fresh installs already populate powa_roles.  A dump/restore can leave
@@ -180,6 +181,7 @@ WHERE NOT EXISTS (
 -- PoWA 5.2 kurulum sonunda mevcut destekli extension'lari etkinlestirir.
 -- Acik cagri, tekrar calistirilan bootstrap/upgrade akisini da guvenli tutar.
 SELECT "PoWA".powa_activate_extension(0, 'pg_qualstats');
+SELECT "PoWA".powa_activate_extension(0, 'pg_stat_kcache');
 
 GRANT CONNECT ON DATABASE powa TO powa_collector;
 GRANT USAGE ON SCHEMA "PoWA" TO powa_collector;

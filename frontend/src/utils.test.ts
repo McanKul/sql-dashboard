@@ -13,9 +13,10 @@ describe('formatDuration', () => {
 })
 
 describe('comparisonAvailable', () => {
-  it('requires at least five calls in the previous window', () => {
-    expect(comparisonAvailable(4)).toBe(false)
-    expect(comparisonAvailable(5)).toBe(true)
+  it('requires at least twenty calls in both windows', () => {
+    expect(comparisonAvailable(19, 20)).toBe(false)
+    expect(comparisonAvailable(20, 19)).toBe(false)
+    expect(comparisonAvailable(20, 20)).toBe(true)
     expect(comparisonAvailable(Number.NaN)).toBe(false)
   })
 })

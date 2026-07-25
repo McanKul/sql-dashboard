@@ -84,8 +84,9 @@ export function formatDuration(milliseconds: number): string {
   return `${formatNumber(hours / 24)} gün`
 }
 
-export function comparisonAvailable(previousCalls: number): boolean {
-  return Number.isFinite(previousCalls) && previousCalls >= 5
+export function comparisonAvailable(previousCalls: number, currentCalls = Number.POSITIVE_INFINITY): boolean {
+  return Number.isFinite(previousCalls) && previousCalls >= 20
+    && currentCalls >= 20
 }
 
 export function formatDateTime(value: string): string {
