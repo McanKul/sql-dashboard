@@ -4,7 +4,7 @@ set -Eeuo pipefail
 usage() {
   cat >&2 <<'EOF'
 Kullanim:
-  bash scripts/prepare-realistic-workload.sh <quick|normal|stress> --yes
+  bash scripts/prepare-realistic-workload.sh <quick|normal|stress|erp> --yes
 
 Bu opt-in komut yalniz calisan source-db/appdb verisini secilen hedefe kadar
 buyutur. Satir silmez, volume temizlemez ve init-source.sh dosyasini kullanmaz.
@@ -51,6 +51,8 @@ case "$profile" in
     target_payments=200000
     target_jobs=25000
     batch_size=25000
+    target_erp_tables=0
+    erp_rows_per_table=64
     ;;
   normal)
     target_customers=100000
@@ -63,6 +65,8 @@ case "$profile" in
     target_payments=800000
     target_jobs=100000
     batch_size=100000
+    target_erp_tables=0
+    erp_rows_per_table=64
     ;;
   stress)
     target_customers=250000
@@ -75,6 +79,22 @@ case "$profile" in
     target_payments=2400000
     target_jobs=250000
     batch_size=250000
+    target_erp_tables=0
+    erp_rows_per_table=64
+    ;;
+  erp)
+    target_customers=100000
+    target_orders=1000000
+    target_order_items=4000000
+    target_events=6000000
+    target_tenants=1000
+    target_products=100000
+    target_inventory=200000
+    target_payments=800000
+    target_jobs=100000
+    batch_size=100000
+    target_erp_tables=500
+    erp_rows_per_table=2000
     ;;
   *)
     usage
@@ -204,11 +224,22 @@ current_inventory="$(source_table_count workload_inventory)"
 current_payments="$(source_table_count workload_payments)"
 current_jobs="$(source_table_count workload_jobs)"
 current_hotspots="$(source_table_count advisor_workload_hotspots)"
+erp_catalog_state="$(docker compose exec -T source-db \
+  psql -X -U postgres -d appdb -AtF '|' -v ON_ERROR_STOP=1 -c \
+  "SELECT count(*),
+          coalesce(sum(greatest(relation.reltuples, 0)::bigint), 0)
+   FROM pg_class AS relation
+   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+   WHERE namespace.nspname = 'advisor_erp'
+     AND relation.relkind = 'r'
+     AND relation.relname ~ '^erp_entity_[0-9]{4}$'")"
+IFS='|' read -r current_erp_tables current_erp_rows <<<"$erp_catalog_state"
 
 for count_value in \
   "$current_customers" "$current_orders" "$current_order_items" "$current_events" \
   "$current_tenants" "$current_customer_tenants" "$current_products" \
-  "$current_inventory" "$current_payments" "$current_jobs" "$current_hotspots"; do
+  "$current_inventory" "$current_payments" "$current_jobs" "$current_hotspots" \
+  "$current_erp_tables" "$current_erp_rows"; do
   [[ "$count_value" =~ ^[0-9]+$ ]] || fail "Tablo satir sayisi okunamadi."
 done
 
@@ -223,6 +254,9 @@ missing_inventory="$(missing_rows "$target_inventory" "$current_inventory")"
 missing_payments="$(missing_rows "$target_payments" "$current_payments")"
 missing_jobs="$(missing_rows "$target_jobs" "$current_jobs")"
 missing_hotspots="$(missing_rows "$target_hotspots" "$current_hotspots")"
+target_erp_rows=$((target_erp_tables * erp_rows_per_table))
+missing_erp_tables="$(missing_rows "$target_erp_tables" "$current_erp_tables")"
+missing_erp_rows="$(missing_rows "$target_erp_rows" "$current_erp_rows")"
 
 # Estimate only missing rows in the managed workload relations. Unrelated appdb
 # objects and bloat therefore cannot mask the required growth. The result is
@@ -239,6 +273,8 @@ estimated_growth_bytes=$((
   + missing_payments * 320
   + missing_jobs * 320
   + missing_hotspots * 128
+  + missing_erp_tables * 196608
+  + missing_erp_rows * 384
 ))
 required_free_bytes=$((estimated_growth_bytes * 2 + 2 * 1024 * 1024 * 1024))
 
@@ -254,11 +290,15 @@ printf '  Hedefler        : customers=%s orders=%s items=%s events=%s\n' \
 printf '                    tenants=%s products=%s inventory=%s payments=%s jobs=%s hotspots=%s\n' \
   "$target_tenants" "$target_products" "$target_inventory" \
   "$target_payments" "$target_jobs" "$target_hotspots"
+printf '                    erpTables=%s erpRowsPerTable=%s erpRows=%s\n' \
+  "$target_erp_tables" "$erp_rows_per_table" "$target_erp_rows"
 printf '  Eksik satirlar  : customers=%s orders=%s items=%s events=%s\n' \
   "$missing_customers" "$missing_orders" "$missing_order_items" "$missing_events"
 printf '                    tenants=%s mappings=%s products=%s inventory=%s payments=%s jobs=%s hotspots=%s\n' \
   "$missing_tenants" "$missing_customer_tenants" "$missing_products" \
   "$missing_inventory" "$missing_payments" "$missing_jobs" "$missing_hotspots"
+printf '                    erpTables=%s erpRows~=%s\n' \
+  "$missing_erp_tables" "$missing_erp_rows"
 
 (( available_bytes >= required_free_bytes )) || fail \
   "Disk preflight basarisiz: en az $(human_bytes "$required_free_bytes") bos alan gerekli."
@@ -280,6 +320,8 @@ docker compose exec -T -e WORKLOAD_DB_PASSWORD source-db \
   -v target_payments="$target_payments" \
   -v target_jobs="$target_jobs" \
   -v target_hotspots="$target_hotspots" \
+  -v target_erp_tables="$target_erp_tables" \
+  -v erp_rows_per_table="$erp_rows_per_table" \
   < "$seed_file"
 
 manifest_row="$(docker compose exec -T source-db \
@@ -296,6 +338,8 @@ manifest_row="$(docker compose exec -T source-db \
           actual_counts ->> 'workload_payments',
           actual_counts ->> 'workload_jobs',
           actual_counts ->> 'advisor_workload_hotspots',
+          actual_counts ->> 'advisor_erp_tables',
+          actual_counts ->> 'advisor_erp_rows',
           pg_size_pretty(pg_database_size(current_database()))
    FROM advisor_workload_seed_manifest
    WHERE seed_key = 'active'")"
@@ -303,7 +347,7 @@ manifest_row="$(docker compose exec -T source-db \
 IFS='|' read -r actual_profile manifest_status \
   actual_customers actual_orders actual_items actual_events actual_tenants \
   actual_products actual_inventory actual_payments actual_jobs actual_hotspots \
-  final_db_size <<<"$manifest_row"
+  actual_erp_tables actual_erp_rows final_db_size <<<"$manifest_row"
 
 [[ "$actual_profile" == "$profile" ]] || fail "Manifest profil uyusmazligi: $actual_profile"
 [[ "$manifest_status" == "READY" ]] || fail "Manifest READY degil: $manifest_status"
@@ -316,5 +360,6 @@ printf '  Baz tablolar  : customers=%s orders=%s items=%s events=%s\n' \
 printf '  Yardimci      : tenants=%s products=%s inventory=%s payments=%s jobs=%s hotspots=%s\n' \
   "$actual_tenants" "$actual_products" "$actual_inventory" \
   "$actual_payments" "$actual_jobs" "$actual_hotspots"
+printf '  ERP           : tables=%s rows=%s\n' "$actual_erp_tables" "$actual_erp_rows"
 printf '  Manifest      : public.advisor_workload_seed_manifest (%s)\n' "$manifest_status"
 printf '\nHicbir satir/volume silinmedi. Ayni profil tekrar calistirilirsa target-count nedeniyle yeni kopya uretmez.\n'

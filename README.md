@@ -109,7 +109,7 @@ Kaynak veritabanındaki `run_advisor_test_workload(iterations integer)` fonksiyo
 bash scripts/run-test-workload.sh 20
 ```
 
-`iterations` değeri `1–1000` arasında olmalıdır. Script yalnız bu test oturumunda `pg_qualstats.sample_rate=1` kullanır; global varsayılan `0.1` kalır. Collector frekansı demo için 5 saniyedir; iki snapshot oluşması ve fark metriklerinin görünmesi için komuttan sonra yaklaşık 10 saniye bekleyin.
+`iterations` değeri `1–1000` arasında olmalıdır. Script yalnız bu test oturumunda `pg_qualstats.sample_rate=1` kullanır; global varsayılan `0.1` kalır. Fresh demo collector frekansı üretim-temsili `60` saniyedir; script çalışan kaydın gerçek frekansını ve iki snapshot için yaklaşık bekleme süresini yazdırır. Çok kısa yerel kabul döngüsü gerekiyorsa yalnız yeni/boş volume kurulurken `DEMO_SOURCE_FREQUENCY=5` seçilebilir; ERP kapasite benchmark'ı varsayılan olarak en az `30` saniye ister.
 
 Varsayılan kurulum **sürekli sentetik trafik üretmez**. Küçük fixture üzerinde
 trafik gerektiğinde yukarıdaki komut tekrarlanabilir; sürekli ve hacimli karma
@@ -136,6 +136,41 @@ komutu ise `WORKLOAD_DURATION_SECONDS=0` varsayılanıyla elle durdurulana kadar
 çalışır.
 
 Kısa makine kontrolü için `quick`, açık kapasite testi için `stress` seçilebilir.
+Geniş katalog davranışı için `erp`, normal veri setine ek olarak 500 gerçek tablo,
+tablo başına 2.000 satır ve sekiz salt-okunur sorgu ailesiyle 4.000 bounded
+fingerprint hedefini deterministik olarak dolaşır:
+
+```bash
+bash scripts/run-realistic-workload.sh erp 600 32
+```
+
+Hazırlanmış aynı ERP manifesti üzerinde ölçümü yalnız steady-state trafiğe ayırmak
+için `REALISTIC_SKIP_PREPARE=true` kullanılabilir; profil veya ERP hedefi
+uyuşmazsa wrapper fail-closed kapanır.
+
+Source ve repository maliyetini API trafiğiyle aynı sınırda ölçmek için kapasite
+harness'ı kullanılır:
+
+```bash
+bash scripts/benchmark-erp-stack.sh run erp
+```
+
+Harness yük boyunca varsayılan `24h` penceresinde query-list → global overview →
+listeden seçilmiş query-detail/trend batch'lerini round-robin çalıştırır. Varsayılan
+concurrency list/detail için `2`, overview için `1`; p95 tavanları sırasıyla
+`2s / 8s / 2s`'dir. Raporun legacy `api` root alanları query-list'i temsil etmeye
+devam eder; endpoint kırılımı `api.byEndpoint`, toplam matris hatası
+`api.matrixErrorCount`, gerçek rotation ve delay ise `api.probePlan` altındadır.
+Additive `derivedMetrics`, source/repository container read-write-total byte/s
+hızlarını ve pencerenin PoWA aggregate/purge sınırına denk gelip gelmediğini
+`maintenanceInclusive` / `steadyStateEligible` olarak verir; eksik veya
+uyumsuz sequence/config kanıtı steady-state iddiası üretmez.
+Bu koşu 7d/30d veya dolu retention soak testi ve observer kapalı/açık A/B ölçümü
+yerine geçmez. API p95 kapıları bounded warmup sonrası SWR yolunu ölçer; 4.000+
+queryid referansında expired-cache ilk fill'i `22,12s` olduğundan katı cold-start
+`<2s` isteyen deployment için temporal rollup optimizasyonu açık P1'dir.
+Ayrıntılar [ERP benchmark runbook'undadır](docs/ERP_STACK_BENCHMARK.md).
+
 PoWA snapshot, CPU/wait/JOIN/composite ve API kabul kontrolleri koşunun sonunda
 otomatik çalışır. `real-validation` servisleri ve admin token hazırsa izole gerçek
 index testini de aynı zincire eklemek için:
@@ -172,7 +207,7 @@ CPU bu iterasyonda gözlem modundadır: `scoreIncluded=false` kalır ve mevcut I
 
 `pg_wait_sampling` release 1.1.11 sorgu bazındaki bekleme örneklerini I/O, lock, LWLock, client, IPC, timeout, activity, extension ve other sınıflarına ayırır. Değerler örnek sayısıdır; duvar saati veya CPU yüzdesi değildir ve `scoreIncluded=false` kalır. Sürüm, overhead ve mevcut-volume runbook'u [pg_wait_sampling belgesindedir](docs/PG_WAIT_SAMPLING.md).
 
-PoWA'nın taşımadığı kolon-kolon JOIN kayıtları, `pg_qualstats` reset'iyle aynı source transaction'ında durable outbox'a alınır. Ayrı `join-snapshotter` yalnız source `fetch/ack` ve repository `ingest/status/purge` fonksiyonlarını çağırabilir. Repository commit edilmeden source batch ack edilmez; tekrar teslim candidate/evidence anahtarlarında idempotenttir.
+PoWA'nın taşımadığı kolon-kolon JOIN kayıtları, `pg_qualstats` reset'iyle aynı source transaction'ında durable outbox'a alınır. Ayrı `join-snapshotter` yalnız source bounded header/chunk `fetch/ack` ve repository `ingest/finalize/status/purge` fonksiyonlarını çağırabilir. Repository finalize commit edilmeden source batch ack edilmez; tekrar teslim chunk receipt ile candidate/evidence anahtarlarında idempotenttir ve başarısız head batch sonraki batch'leri bloke etmez. Aynı batch/doğal anahtarla gelen birden çok ham `pg_qualstats` satırı finalde deterministik birleştirilir ve sayaçları toplanır; ham chunk konumları ile batch satır sayısı taşıma doğrulaması için korunur. Source-primary koruması için varsayılan `1.000.000` pending satır, `1 GiB` outbox storage veya `300 saniye` en eski batch eşiklerinden biri dolduğunda yeni capture/reset fail-closed durur; PoWA collector hatayı görünür kılar ve snapshotter son batch'i ack edince devre kendiliğinden kapanır.
 
 JOIN eşitliği ile aynı tablodaki WHERE equality/range kanıtı en az iki snapshot ve asgari occurrence eşiklerini geçtiğinde iki kolonlu B-tree adayı oluşur. Equality/range kuralı kolon sırasını açıklar; mevcut index prefix'i ve planner faydası canlı kaynakta salt-okunur HypoPG evaluator tarafından doğrulanır. Bu kanıt da ana inceleme skoruna katılmaz.
 
@@ -191,7 +226,7 @@ Denetim sırasında agresif demo yükü 6 worker ile yaklaşık 1.164 statement 
 5. Bir saatlik rolling index penceresinde ölçülen aralık pratikte `1 saat`ten birkaç saniye kısa kaldığı için `observed_hours < 1` kontrolü indexleri sürekli `INSUFFICIENT_DATA` durumunda bırakabilir. Snapshot frekansını tolere eden kapsam kontrolü kullanılmalıdır.
 6. Bir saatlik grafik etiketleri dakika içermeli; sıfır hareketli `pg_stat_io` bağlamları varsayılan görünümden çıkarılmalı; Genel Bakış sorgu önizlemesi Sorgular ekranındaki eski filtrelerden etkilenmemelidir.
 7. Sistem Sağlığı sinyalleri kümülatif sayaç ve küçük demo tabloları nedeniyle fazla hassastır. `stats_reset`, gözlem süresi, tablo boyutu ve zaman penceresi sinyal açıklamasına dahil edilmelidir.
-8. Sürekli workload için gerekli `quick`, `normal` ve açık opt-in `stress` ayrımı artık gerçekçi yük runbook'u ve bounded generator ile uygulanmıştır; mutlak TPS hosttan bağımsız bir hard gate değildir.
+8. Sürekli workload için gerekli `quick`, `normal`, geniş katalog `erp` ve açık opt-in `stress` ayrımı artık gerçekçi yük runbook'u ve bounded generator ile uygulanmıştır; mutlak TPS hosttan bağımsız bir hard gate değildir.
 
 **25 Temmuz 2026 kısa kalibrasyon kapanışı:** En yüksek doğruluk etkili maddeler kapatıldı. Ana dashboard/trend yalnız top-level statement toplamını kullanıyor; regresyon puanı ve “yavaşlayan sorgu” sayısı için her iki dönemde en az 20 çağrı ve en az `%20` artış gerekiyor, büyüklük katsayısı `%50`de tam değere ulaşıyor. Query/kcache sayaç resetinde reset sonrası ilk aktivite korunuyor; uzun collector gap'leri dönem sınırında yanlış toplam üretemiyor. API ve UI gerçek gözlem aralığını, coverage'ı, warm-up'ı ve önceki dönem güvenilirliğini açıkça gösteriyor; geçmiş yokken regresyon alanları `null` kalıyor. Observation-hour hacim modeli ve 85/70/40 priority sınırları korundu. Ortam profili ile uzun süreli production dağılım kalibrasyonu ayrı ürün işi olarak kalır; 2.3 CPU sinyali ölçüm görmeden skora eklenmedi.
 
@@ -252,6 +287,19 @@ Komut tekrar çalıştırılabilir: aynı alias yeni satır açmaz; bağlantı/f
 | `workload` | Yalnız `realistic-load` profilinde; wrapper ile süreli veya açıkça `0` seçilirse sürekli karma yük | Yok |
 | `web` | React + TypeScript arayüzü ve Nginx API proxy | Yok |
 
+ERP ölçeğinde query-list satırları, overview kartları ve query detail'in temel
+query-metrics satırı aynı window snapshot cache'ini paylaşır. Overview'un global
+trendi ayrı bir window cache'inde aynı `60s` fresh / `300s` bounded-stale,
+`4` entry LRU ve `100.000` satır sınırını kullanır. Her cache pencere başına
+single-flight'tır; query-metrics ve global-trend refresh'leri aynı repository-wide
+lock ile serialize edilir, dolayısıyla iki pahalı tarama aynı anda çalışmaz.
+Scoped query-detail trendi ile collector-health her istekte repository'den canlı
+okunur; endpoint bileşenleri farklı ölçüm sınırlarına sahip olabilir. Metrics
+snapshot'ı için ayrıca `64 MiB` payload hard cap'i ve API için `1 GiB` container
+zarfı vardır. Sınır aşımı eksik sonuç üretmek yerine fail-closed davranır. Ayar
+ve çok-replica notları
+[kurulum rehberindedir](docs/INSTALLATION.md#query-metrics-cache-kapasitesi).
+
 ```text
 source-db:5432 ───────┐
 external PG #1 ──────┼──okuma──> collector ──yazma──> repository-db:5433
@@ -302,7 +350,10 @@ integration kabulü olarak çalıştırılmalıdır.
 Haftalık ve manuel [PostgreSQL integration workflow'u](.github/workflows/postgres-integration.yml)
 Ubuntu amd64 runner'da PostgreSQL/PoWA image'ını sıfırdan derler, temiz named
 volume'leri başlatır, migration idempotency/temporal fixture'ı ve gerçek rol
-drift onarımını doğrular; sonunda yalnız kendi disposable CI volume'lerini siler.
+drift onarımını doğrular. JOIN fixture'ı duplicate sayaç birleştirmesini,
+overflow rollback'ini ve 25.001 satırlık üç parçalı taşımayı da gerçek
+PostgreSQL üzerinde sınar; workflow sonunda yalnız kendi disposable CI
+volume'lerini siler.
 
 Temel stack çalışma zamanı kabul kontrolleri:
 
@@ -372,7 +423,8 @@ docker compose down
 
 ## Sabitlenen temel sürümler
 
-- PostgreSQL `18` (`postgres:18-trixie`; doğrulanan patch sürümü `18.4`)
+- PostgreSQL `18.x` (`postgres:18-trixie`; mevcut kabul ortamında `18.4`
+  doğrulandı, fresh image rebuild'i daha yeni bir `18.x` patch'ine ilerleyebilir)
 - PoWA Archivist `5.2.0` / `REL_5_2_0` — kaynak arşiv SHA-256 ile doğrulanır
 - `pg_qualstats 2.1.4` — kaynak arşiv SHA-256 ile doğrulanır; sabit sürüme hedefli shared-memory düzeltmesi uygulanır
 - `pg_stat_kcache 2.3.2` — PostgreSQL 18 uyumlu kaynak arşiv SHA-256 ile doğrulanır

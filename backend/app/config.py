@@ -71,6 +71,22 @@ class Settings(BaseSettings):
     database_sslmode: str | None = None
     default_window: str = "24h"
     max_query_page_size: int = 200
+    # PoWA's default demo collector cadence is 60 seconds.  Keep one complete
+    # metrics snapshot per supported window fresh for one cadence, then serve
+    # bounded stale data while one refresh protects the repository from a
+    # thundering herd of expensive metrics scans.
+    query_list_cache_fresh_seconds: float = Field(default=60.0, ge=0, le=3_600)
+    query_list_cache_stale_seconds: float = Field(default=300.0, gt=0, le=86_400)
+    query_list_cache_max_entries: int = Field(default=4, ge=1, le=4)
+    query_list_cache_max_rows: int = Field(default=100_000, ge=1, le=1_000_000)
+    # PostgreSQL's composite-row size is a conservative, deterministic input
+    # budget for each cached window.  The API container also has a hard memory
+    # envelope because Python object overhead is necessarily larger.
+    query_list_cache_max_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=1024 * 1024 * 1024,
+    )
     sql_text_visibility: str = "authorized"
     retention_days: int = 90
     log_level: str = "INFO"
@@ -126,6 +142,14 @@ class Settings(BaseSettings):
             raise ValueError("advisor_auth_principals credential_id degerleri benzersiz olmali")
         if len(token_hashes) != len(set(token_hashes)):
             raise ValueError("advisor_auth_principals token_sha256 degerleri benzersiz olmali")
+        return self
+
+    @model_validator(mode="after")
+    def valid_query_list_cache_window(self) -> Settings:
+        if self.query_list_cache_stale_seconds < self.query_list_cache_fresh_seconds:
+            raise ValueError(
+                "query_list_cache_stale_seconds fresh suresinden kisa olamaz"
+            )
         return self
 
 

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+import asyncio
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Callable, Mapping
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import logging
+from time import monotonic
 from typing import Any
 
-from app.config import WINDOW_BUCKETS, WINDOW_INTERVALS
+from app.config import WINDOW_BUCKETS, WINDOW_INTERVALS, get_settings
 from app.db import pool
+
+
+logger = logging.getLogger(__name__)
 
 
 SORT_COLUMNS = {
@@ -21,6 +30,142 @@ SORT_COLUMNS = {
 }
 
 EXPORT_FETCH_SIZE = 500
+QUERY_METRICS_CACHE_FETCH_SIZE = 1_000
+
+
+class QueryMetricsSnapshotTooLarge(RuntimeError):
+    """The complete metrics snapshot exceeded its configured memory guard."""
+
+
+class QueryMetricsRefreshBackoff(RuntimeError):
+    """A failed refresh is inside its bounded repository-protection backoff."""
+
+
+class GlobalTrendRefreshBackoff(RuntimeError):
+    """A failed global-trend refresh is inside its bounded retry backoff."""
+
+
+class GlobalTrendSnapshotTooLarge(RuntimeError):
+    """The global trend exceeded the configured cache row guard."""
+
+
+@dataclass(slots=True)
+class _QueryMetricsCacheEntry:
+    rows: list[dict[str, Any]]
+    refreshed_at: float
+
+
+@dataclass(slots=True)
+class _GlobalTrendCacheEntry:
+    rows: list[dict[str, Any]]
+    refreshed_at: float
+
+
+@dataclass(slots=True)
+class _QueryMetricsRetryState:
+    failures: int
+    retry_not_before: float
+
+
+def _sql_numeric_ge(value: Any, minimum: int | float) -> bool:
+    """Apply SQL-like numeric >= filtering, where NULL/invalid is not true."""
+    if value is None:
+        return False
+    try:
+        numeric = Decimal(str(value))
+        # PostgreSQL sorts numeric/float NaN above finite values, therefore a
+        # SQL `metric >= finite_threshold` predicate includes it.
+        if numeric.is_nan():
+            return True
+        return numeric >= Decimal(str(minimum))
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+class _IlikeMatcher:
+    """PostgreSQL-LIKE wildcard matcher without regex backtracking.
+
+    The NFA state set is encoded as one Python integer, so each input
+    character performs a bounded number of bit operations.  This preserves
+    ``%``, ``_`` and backslash escaping while preventing an unauthenticated
+    search pattern from blocking the API event loop through catastrophic
+    regular-expression backtracking.
+    """
+
+    def __init__(self, search: str) -> None:
+        # `lower()` preserves one-codepoint wildcard width for characters such
+        # as German sharp-s and tracks PostgreSQL ILIKE more closely than
+        # Unicode `casefold()`, which can expand one character into several.
+        pattern = f"%{search}%".lower()
+        tokens: list[tuple[str, str | None]] = []
+        index = 0
+        while index < len(pattern):
+            character = pattern[index]
+            if character == "\\" and index + 1 < len(pattern):
+                index += 1
+                tokens.append(("literal", pattern[index]))
+            elif character == "%":
+                # Consecutive percent tokens are equivalent to one and would
+                # otherwise require repeated epsilon-closure passes.
+                if not tokens or tokens[-1][0] != "many":
+                    tokens.append(("many", None))
+            elif character == "_":
+                tokens.append(("one", None))
+            else:
+                tokens.append(("literal", character))
+            index += 1
+
+        self._accept_mask = 1 << len(tokens)
+        self._many_mask = 0
+        self._one_mask = 0
+        self._literal_masks: dict[str, int] = {}
+        for token_index, (token_type, value) in enumerate(tokens):
+            state_mask = 1 << token_index
+            if token_type == "many":
+                self._many_mask |= state_mask
+            elif token_type == "one":
+                self._one_mask |= state_mask
+            else:
+                assert value is not None
+                self._literal_masks[value] = (
+                    self._literal_masks.get(value, 0) | state_mask
+                )
+
+    def _epsilon_closure(self, states: int) -> int:
+        # Consecutive percent tokens are collapsed during parsing, therefore
+        # one transition is the complete epsilon closure.
+        return states | ((states & self._many_mask) << 1)
+
+    def fullmatch(self, value: str) -> bool:
+        states = self._epsilon_closure(1)
+        for character in value.lower():
+            matching = self._one_mask | self._literal_masks.get(character, 0)
+            states = (
+                ((states & matching) << 1)
+                | (states & self._many_mask)
+            )
+            states = self._epsilon_closure(states)
+            if states == 0:
+                return False
+        return bool(self._epsilon_closure(states) & self._accept_mask)
+
+
+def _ilike_matcher(search: str) -> _IlikeMatcher:
+    return _IlikeMatcher(search)
+
+
+def _query_id_sort_value(row: Mapping[str, Any]) -> int:
+    return int(row.get("query_id") or 0)
+
+
+def _metric_sort_value(row: Mapping[str, Any], column: str) -> tuple[int, Decimal]:
+    value = Decimal(str(row[column]))
+    # PostgreSQL numeric/float NaN sorts above ordinary numbers.  The tuple
+    # avoids Decimal's InvalidOperation during comparisons while retaining
+    # that ordering for DESC.
+    if value.is_nan():
+        return (1, Decimal(0))
+    return (0, value)
 
 
 def interval_for(window: str) -> str:
@@ -365,6 +510,538 @@ def _mask_sql(query: str) -> str:
 
 
 class PowaRepository:
+    def __init__(
+        self,
+        *,
+        query_list_cache_fresh_seconds: float | None = None,
+        query_list_cache_stale_seconds: float | None = None,
+        query_list_cache_max_entries: int | None = None,
+        query_list_cache_max_rows: int | None = None,
+        query_list_cache_max_bytes: int | None = None,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
+        settings = get_settings()
+        self._query_list_cache_fresh_seconds = (
+            settings.query_list_cache_fresh_seconds
+            if query_list_cache_fresh_seconds is None
+            else query_list_cache_fresh_seconds
+        )
+        self._query_list_cache_stale_seconds = (
+            settings.query_list_cache_stale_seconds
+            if query_list_cache_stale_seconds is None
+            else query_list_cache_stale_seconds
+        )
+        self._query_list_cache_max_entries = (
+            settings.query_list_cache_max_entries
+            if query_list_cache_max_entries is None
+            else query_list_cache_max_entries
+        )
+        self._query_list_cache_max_rows = (
+            settings.query_list_cache_max_rows
+            if query_list_cache_max_rows is None
+            else query_list_cache_max_rows
+        )
+        self._query_list_cache_max_bytes = (
+            settings.query_list_cache_max_bytes
+            if query_list_cache_max_bytes is None
+            else query_list_cache_max_bytes
+        )
+        if self._query_list_cache_fresh_seconds < 0:
+            raise ValueError("query-list cache fresh suresi negatif olamaz")
+        if (
+            self._query_list_cache_stale_seconds
+            < self._query_list_cache_fresh_seconds
+        ):
+            raise ValueError("query-list cache stale suresi fresh suresinden kisa olamaz")
+        if not 1 <= self._query_list_cache_max_entries <= len(WINDOW_INTERVALS):
+            raise ValueError("query-list cache entry siniri 1 ile desteklenen pencere sayisi arasinda olmali")
+        if not 1 <= self._query_list_cache_max_rows <= 1_000_000:
+            raise ValueError("query-list cache satir siniri 1 ile 1000000 arasinda olmali")
+        if not 1024 * 1024 <= self._query_list_cache_max_bytes <= 1024 * 1024 * 1024:
+            raise ValueError("query-list cache byte siniri 1 MiB ile 1 GiB arasinda olmali")
+
+        self._query_metrics_cache: OrderedDict[str, _QueryMetricsCacheEntry] = (
+            OrderedDict()
+        )
+        self._query_metrics_cache_generation = 0
+        self._query_metrics_retry: dict[str, _QueryMetricsRetryState] = {}
+        self._query_metrics_cache_lock = asyncio.Lock()
+        # Deliberately shared by query_metrics and global query_trend across
+        # every window. The repository must never run two expensive dashboard
+        # refresh scans concurrently.
+        self._repository_refresh_lock = asyncio.Lock()
+        # Retain the old private name for compatibility with diagnostics while
+        # making its repository-wide scope explicit above.
+        self._query_metrics_refresh_lock = self._repository_refresh_lock
+        self._query_metrics_refresh_tasks: dict[
+            tuple[int, str], asyncio.Task[list[dict[str, Any]]]
+        ] = {}
+        self._global_trend_cache: OrderedDict[str, _GlobalTrendCacheEntry] = (
+            OrderedDict()
+        )
+        self._global_trend_cache_generation = 0
+        self._global_trend_retry: dict[str, _QueryMetricsRetryState] = {}
+        self._global_trend_cache_lock = asyncio.Lock()
+        self._global_trend_refresh_tasks: dict[
+            tuple[int, str], asyncio.Task[list[dict[str, Any]]]
+        ] = {}
+        self._clock = clock
+
+    async def _load_query_metrics_snapshot(self, window: str) -> list[dict[str, Any]]:
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            # A transaction-local application name remains visible while the
+            # named cursor executes FETCH statements. This lets the benchmark
+            # include stale-while-revalidate work in its measurement boundary.
+            async with connection.cursor() as control_cursor:
+                await control_cursor.execute(
+                    "SET LOCAL application_name = "
+                    "'advisor-query-metrics-cache-refresh'"
+                )
+
+            # LIMIT max+1 detects an oversized row set without truncating it
+            # silently. The named cursor keeps libpq from buffering the whole
+            # result, while pg_column_size enforces a second payload-byte cap.
+            async with connection.cursor(
+                name="advisor_query_metrics_cache_refresh"
+            ) as cursor:
+                await cursor.execute(
+                    """
+                    /* advisor-query-metrics-cache-refresh */
+                    SELECT metrics.*,
+                           servers.alias AS server_alias,
+                           pg_column_size(metrics)
+                             + COALESCE(pg_column_size(servers.alias), 0)
+                               AS _cache_row_bytes
+                    FROM advisor.query_metrics(%s::interval) AS metrics
+                    LEFT JOIN "PoWA".powa_servers AS servers
+                      ON servers.id = metrics.server_id
+                    LIMIT %s
+                    /* advisor-query-metrics-cache-refresh */
+                    """,
+                    (interval, self._query_list_cache_max_rows + 1),
+                )
+                rows: list[dict[str, Any]] = []
+                payload_bytes = 0
+                while True:
+                    remaining = self._query_list_cache_max_rows + 1 - len(rows)
+                    fetched = await cursor.fetchmany(
+                        min(QUERY_METRICS_CACHE_FETCH_SIZE, remaining)
+                    )
+                    if not fetched:
+                        return rows
+                    for raw_row in fetched:
+                        row = dict(raw_row)
+                        row_bytes = row.pop("_cache_row_bytes", None)
+                        if row_bytes is None:
+                            raise RuntimeError(
+                                "query metrics snapshot byte olcumu eksik"
+                            )
+                        payload_bytes += int(row_bytes)
+                        if payload_bytes > self._query_list_cache_max_bytes:
+                            raise QueryMetricsSnapshotTooLarge(
+                                "query metrics snapshot configured byte limitini asti"
+                            )
+                        rows.append(row)
+                        if len(rows) > self._query_list_cache_max_rows:
+                            raise QueryMetricsSnapshotTooLarge(
+                                "query metrics snapshot configured row limitini asti"
+                            )
+
+    @staticmethod
+    def _observe_query_metrics_refresh(
+        task: asyncio.Task[list[dict[str, Any]]],
+    ) -> None:
+        """Consume background failures so asyncio never reports orphan errors."""
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            # Do not include query/search values or connection details in this
+            # best-effort background diagnostic.
+            logger.warning(
+                "query metrics cache refresh failed (%s)",
+                type(exception).__name__,
+            )
+
+    def _start_query_metrics_refresh_locked(
+        self,
+        *,
+        window: str,
+        generation: int,
+    ) -> asyncio.Task[list[dict[str, Any]]]:
+        task_key = (generation, window)
+        existing = self._query_metrics_refresh_tasks.get(task_key)
+        if existing is not None:
+            return existing
+
+        task = asyncio.create_task(
+            self._refresh_query_metrics_snapshot(
+                window=window,
+                generation=generation,
+            ),
+            name=f"query-metrics-cache-refresh-{window}",
+        )
+        self._query_metrics_refresh_tasks[task_key] = task
+        task.add_done_callback(self._observe_query_metrics_refresh)
+        return task
+
+    async def _refresh_query_metrics_snapshot(
+        self,
+        *,
+        window: str,
+        generation: int,
+    ) -> list[dict[str, Any]]:
+        task_key = (generation, window)
+        try:
+            async with self._repository_refresh_lock:
+                loaded_rows = await self._load_query_metrics_snapshot(window)
+            if len(loaded_rows) > self._query_list_cache_max_rows:
+                # Defense in depth for tests/custom repository subclasses that
+                # override the bounded server-cursor loader.
+                raise QueryMetricsSnapshotTooLarge(
+                    "query metrics snapshot configured row limitini asti"
+                )
+            # Consumers treat raw rows as immutable and copy only the selected
+            # page/detail. Retaining this single object avoids doubling a full
+            # ERP-scale snapshot during every refresh.
+            cached_rows = loaded_rows
+            async with self._query_metrics_cache_lock:
+                if generation == self._query_metrics_cache_generation:
+                    self._query_metrics_retry.pop(window, None)
+                    self._query_metrics_cache[window] = _QueryMetricsCacheEntry(
+                        rows=cached_rows,
+                        refreshed_at=self._clock(),
+                    )
+                    self._query_metrics_cache.move_to_end(window)
+                    while (
+                        len(self._query_metrics_cache)
+                        > self._query_list_cache_max_entries
+                    ):
+                        self._query_metrics_cache.popitem(last=False)
+            return loaded_rows
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            async with self._query_metrics_cache_lock:
+                if generation == self._query_metrics_cache_generation:
+                    previous = self._query_metrics_retry.get(window)
+                    failures = 1 if previous is None else previous.failures + 1
+                    # A persistent oversized snapshot or repository failure
+                    # must not turn high request rate into repeated full scans.
+                    delay_seconds = min(2 ** min(failures - 1, 6), 60)
+                    self._query_metrics_retry[window] = _QueryMetricsRetryState(
+                        failures=failures,
+                        retry_not_before=self._clock() + delay_seconds,
+                    )
+            raise
+        finally:
+            async with self._query_metrics_cache_lock:
+                current = self._query_metrics_refresh_tasks.get(task_key)
+                if current is asyncio.current_task():
+                    self._query_metrics_refresh_tasks.pop(task_key, None)
+
+    async def _query_metrics_snapshot(self, window: str) -> list[dict[str, Any]]:
+        """Return a role-neutral complete window snapshot with bounded SWR."""
+        interval_for(window)
+        async with self._query_metrics_cache_lock:
+            generation = self._query_metrics_cache_generation
+            entry = self._query_metrics_cache.get(window)
+            retry = self._query_metrics_retry.get(window)
+            now_monotonic = self._clock()
+            if entry is not None:
+                self._query_metrics_cache.move_to_end(window)
+                age = max(0.0, now_monotonic - entry.refreshed_at)
+                if age <= self._query_list_cache_fresh_seconds:
+                    return entry.rows
+
+                if age <= self._query_list_cache_stale_seconds:
+                    if retry is None or now_monotonic >= retry.retry_not_before:
+                        self._start_query_metrics_refresh_locked(
+                            window=window,
+                            generation=generation,
+                        )
+                    # Rows are never exposed directly: query_rows filters them
+                    # read-only and deep-copies only the selected page.
+                    return entry.rows
+
+            if retry is not None and now_monotonic < retry.retry_not_before:
+                raise QueryMetricsRefreshBackoff(
+                    "query metrics refresh gecici backoff araliginda"
+                )
+            refresh = self._start_query_metrics_refresh_locked(
+                window=window,
+                generation=generation,
+            )
+
+        # Cold or too-old snapshots wait for the shared refresh. Shielding it
+        # prevents a disconnected HTTP client from cancelling everybody's
+        # single-flight database query.
+        return await asyncio.shield(refresh)
+
+    async def _load_global_trend_snapshot(
+        self, window: str
+    ) -> list[dict[str, Any]]:
+        interval = interval_for(window)
+        bucket = WINDOW_BUCKETS[window]
+        async with pool.connection() as connection:
+            # Keep background SWR work visible to the benchmark so its
+            # repository cost cannot leak beyond the measurement boundary.
+            async with connection.cursor() as control_cursor:
+                await control_cursor.execute(
+                    "SET LOCAL application_name = "
+                    "'advisor-global-trend-cache-refresh'",
+                    [],
+                )
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    /* advisor-global-trend-cache-refresh */
+                    SELECT bucket_at AS timestamp,
+                           total_exec_time_ms,
+                           calls
+                    FROM advisor.query_trend(
+                        now() - %s::interval,
+                        %s::interval
+                    )
+                    LIMIT %s
+                    /* advisor-global-trend-cache-refresh */
+                    """,
+                    [
+                        interval,
+                        bucket,
+                        self._query_list_cache_max_rows + 1,
+                    ],
+                )
+                rows = [dict(row) for row in await cursor.fetchall()]
+        if len(rows) > self._query_list_cache_max_rows:
+            raise GlobalTrendSnapshotTooLarge(
+                "global trend snapshot configured row limitini asti"
+            )
+        return rows
+
+    @staticmethod
+    def _observe_global_trend_refresh(
+        task: asyncio.Task[list[dict[str, Any]]],
+    ) -> None:
+        """Consume background failures so asyncio never reports orphan errors."""
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logger.warning(
+                "global trend cache refresh failed (%s)",
+                type(exception).__name__,
+            )
+
+    def _start_global_trend_refresh_locked(
+        self,
+        *,
+        window: str,
+        generation: int,
+    ) -> asyncio.Task[list[dict[str, Any]]]:
+        task_key = (generation, window)
+        existing = self._global_trend_refresh_tasks.get(task_key)
+        if existing is not None:
+            return existing
+
+        task = asyncio.create_task(
+            self._refresh_global_trend_snapshot(
+                window=window,
+                generation=generation,
+            ),
+            name=f"global-trend-cache-refresh-{window}",
+        )
+        self._global_trend_refresh_tasks[task_key] = task
+        task.add_done_callback(self._observe_global_trend_refresh)
+        return task
+
+    async def _refresh_global_trend_snapshot(
+        self,
+        *,
+        window: str,
+        generation: int,
+    ) -> list[dict[str, Any]]:
+        task_key = (generation, window)
+        try:
+            async with self._repository_refresh_lock:
+                loaded_rows = await self._load_global_trend_snapshot(window)
+            if len(loaded_rows) > self._query_list_cache_max_rows:
+                # Defense in depth for tests/custom subclasses that override
+                # the bounded loader.
+                raise GlobalTrendSnapshotTooLarge(
+                    "global trend snapshot configured row limitini asti"
+                )
+            # Trend results are small. Copy on both sides of the cache boundary
+            # so neither custom loaders nor response serializers can mutate a
+            # shared snapshot.
+            cached_rows = deepcopy(loaded_rows)
+            async with self._global_trend_cache_lock:
+                if generation == self._global_trend_cache_generation:
+                    self._global_trend_retry.pop(window, None)
+                    self._global_trend_cache[window] = _GlobalTrendCacheEntry(
+                        rows=cached_rows,
+                        refreshed_at=self._clock(),
+                    )
+                    self._global_trend_cache.move_to_end(window)
+                    while (
+                        len(self._global_trend_cache)
+                        > self._query_list_cache_max_entries
+                    ):
+                        self._global_trend_cache.popitem(last=False)
+            return cached_rows
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            async with self._global_trend_cache_lock:
+                if generation == self._global_trend_cache_generation:
+                    previous = self._global_trend_retry.get(window)
+                    failures = 1 if previous is None else previous.failures + 1
+                    delay_seconds = min(2 ** min(failures - 1, 6), 60)
+                    self._global_trend_retry[window] = _QueryMetricsRetryState(
+                        failures=failures,
+                        retry_not_before=self._clock() + delay_seconds,
+                    )
+            raise
+        finally:
+            async with self._global_trend_cache_lock:
+                current = self._global_trend_refresh_tasks.get(task_key)
+                if current is asyncio.current_task():
+                    self._global_trend_refresh_tasks.pop(task_key, None)
+
+    async def _global_trend_snapshot(self, window: str) -> list[dict[str, Any]]:
+        """Return an immutable-by-contract global trend with bounded SWR."""
+        interval_for(window)
+        async with self._global_trend_cache_lock:
+            generation = self._global_trend_cache_generation
+            entry = self._global_trend_cache.get(window)
+            retry = self._global_trend_retry.get(window)
+            now_monotonic = self._clock()
+            if entry is not None:
+                self._global_trend_cache.move_to_end(window)
+                age = max(0.0, now_monotonic - entry.refreshed_at)
+                if age <= self._query_list_cache_fresh_seconds:
+                    return deepcopy(entry.rows)
+
+                if age <= self._query_list_cache_stale_seconds:
+                    if retry is None or now_monotonic >= retry.retry_not_before:
+                        self._start_global_trend_refresh_locked(
+                            window=window,
+                            generation=generation,
+                        )
+                    return deepcopy(entry.rows)
+
+            if retry is not None and now_monotonic < retry.retry_not_before:
+                raise GlobalTrendRefreshBackoff(
+                    "global trend refresh gecici backoff araliginda"
+                )
+            refresh = self._start_global_trend_refresh_locked(
+                window=window,
+                generation=generation,
+            )
+
+        # Cold or too-old misses wait for the per-window single-flight task.
+        # Shielding prevents one disconnected request from cancelling it for
+        # every concurrent overview request.
+        return deepcopy(await asyncio.shield(refresh))
+
+    @staticmethod
+    def _filter_and_page_query_rows(
+        rows: list[dict[str, Any]],
+        *,
+        page: int,
+        page_size: int,
+        search: str | None,
+        priority: str | None,
+        server_id: int | None,
+        database_id: int | None,
+        min_calls: int,
+        min_duration_ms: float,
+        sort_by: str,
+        regressions_only: bool,
+    ) -> tuple[list[dict[str, Any]], int]:
+        search_matcher = _ilike_matcher(search) if search else None
+        normalized_priority = priority.upper() if priority else None
+
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            if not _sql_numeric_ge(row.get("calls"), min_calls):
+                continue
+            if not _sql_numeric_ge(row.get("total_exec_time_ms"), min_duration_ms):
+                continue
+            if search_matcher is not None:
+                sql_text = row.get("sql_text")
+                query_id = row.get("query_id")
+                sql_matches = sql_text is not None and search_matcher.fullmatch(
+                    str(sql_text)
+                )
+                query_id_matches = query_id is not None and search_matcher.fullmatch(
+                    str(query_id)
+                )
+                if not sql_matches and not query_id_matches:
+                    continue
+            if normalized_priority is not None and row.get("priority") != normalized_priority:
+                continue
+            if server_id is not None and row.get("server_id") != server_id:
+                continue
+            if database_id is not None and row.get("database_id") != database_id:
+                continue
+            if regressions_only and not (
+                row.get("previous_period_available") is True
+                and row.get("comparison_reliable") is True
+                and _sql_numeric_ge(row.get("regression_percent"), 20)
+                and _sql_numeric_ge(row.get("previous_calls"), 20)
+                and _sql_numeric_ge(row.get("calls"), 20)
+            ):
+                continue
+            filtered.append(row)
+
+        order_column = SORT_COLUMNS.get(sort_by, SORT_COLUMNS["impact"])
+        non_null = [row for row in filtered if row.get(order_column) is not None]
+        nulls = [row for row in filtered if row.get(order_column) is None]
+        # Two stable sorts exactly model `metric DESC NULLS LAST, query_id ASC`.
+        non_null.sort(key=_query_id_sort_value)
+        non_null.sort(key=lambda row: _metric_sort_value(row, order_column), reverse=True)
+        nulls.sort(key=_query_id_sort_value)
+        ordered = non_null + nulls
+
+        total = len(ordered)
+        offset = (page - 1) * page_size
+        # Only the returned page is copied, keeping CPU/memory bounded while
+        # preventing serializers/callers from mutating shared cache objects.
+        return deepcopy(ordered[offset : offset + page_size]), total
+
+    async def invalidate_query_rows_cache(self) -> None:
+        """Invalidate cached dashboard snapshots after a local mutation."""
+        async with self._query_metrics_cache_lock:
+            self._query_metrics_cache_generation += 1
+            self._query_metrics_cache.clear()
+            self._query_metrics_retry.clear()
+        async with self._global_trend_cache_lock:
+            self._global_trend_cache_generation += 1
+            self._global_trend_cache.clear()
+            self._global_trend_retry.clear()
+
+    async def close_query_rows_cache(self) -> None:
+        """Cancel every tracked dashboard refresh before pool shutdown."""
+        async with self._query_metrics_cache_lock:
+            self._query_metrics_cache_generation += 1
+            self._query_metrics_cache.clear()
+            self._query_metrics_retry.clear()
+            query_tasks = list(self._query_metrics_refresh_tasks.values())
+            self._query_metrics_refresh_tasks.clear()
+        async with self._global_trend_cache_lock:
+            self._global_trend_cache_generation += 1
+            self._global_trend_cache.clear()
+            self._global_trend_retry.clear()
+            trend_tasks = list(self._global_trend_refresh_tasks.values())
+            self._global_trend_refresh_tasks.clear()
+        tasks = [*query_tasks, *trend_tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def ping(self) -> dict[str, Any]:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
@@ -441,53 +1118,23 @@ class PowaRepository:
         sort_by: str = "impact",
         regressions_only: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
-        interval = interval_for(window)
-        where_sql, filters = _query_filters(
+        rows = await self._query_metrics_snapshot(window)
+        # Filtering/sorting a 100k-row snapshot is CPU work. Keep it away from
+        # the Uvicorn event loop so health and unrelated requests stay live.
+        return await asyncio.to_thread(
+            self._filter_and_page_query_rows,
+            rows,
+            page=page,
+            page_size=page_size,
             search=search,
             priority=priority,
             server_id=server_id,
             database_id=database_id,
             min_calls=min_calls,
             min_duration_ms=min_duration_ms,
+            sort_by=sort_by,
             regressions_only=regressions_only,
         )
-        order_column = SORT_COLUMNS.get(sort_by, SORT_COLUMNS["impact"])
-        offset = (page - 1) * page_size
-
-        data_query = f"""
-            SELECT metrics.*, servers.alias AS server_alias,
-                   count(*) OVER () AS filtered_total
-            FROM advisor.query_metrics(%s::interval) AS metrics
-            LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
-            WHERE {where_sql}
-            ORDER BY {order_column} DESC NULLS LAST, query_id
-            LIMIT %s OFFSET %s
-        """
-
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(data_query, [interval, *filters, page_size, offset])
-                rows = [dict(row) for row in await cursor.fetchall()]
-                if rows:
-                    total = int(rows[0]["filtered_total"])
-                    for row in rows:
-                        row.pop("filtered_total", None)
-                elif page == 1:
-                    total = 0
-                else:
-                    # An out-of-range page has no row carrying the window
-                    # count.  Keep that rare fallback correct without making
-                    # every normal list request evaluate query_metrics twice.
-                    await cursor.execute(
-                        f"""
-                        SELECT count(*) AS total
-                        FROM advisor.query_metrics(%s::interval)
-                        WHERE {where_sql}
-                        """,
-                        [interval, *filters],
-                    )
-                    total = int((await cursor.fetchone())["total"])
-        return rows, total
 
     async def stream_query_rows(
         self,
@@ -538,27 +1185,32 @@ class PowaRepository:
 
     async def overview_summary(self, *, window: str) -> dict[str, Any]:
         """Aggregate every tracked query; pagination must never affect cards."""
-        interval = interval_for(window)
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    """
-                    SELECT
-                        COALESCE(sum(total_exec_time_ms), 0)::double precision AS total_db_time_ms,
-                        count(*)::bigint AS tracked_queries,
-                        count(*) FILTER (WHERE priority = 'CRITICAL')::bigint AS critical_queries,
-                        count(*) FILTER (
-                            WHERE previous_period_available IS TRUE
-                              AND comparison_reliable IS TRUE
-                              AND regression_percent >= 20
-                              AND previous_calls >= 20
-                              AND calls >= 20
-                        )::bigint AS regressions
-                    FROM advisor.query_metrics(%s::interval)
-                    """,
-                    (interval,),
+        rows = await self._query_metrics_snapshot(window)
+        return await asyncio.to_thread(self._overview_summary_from_rows, rows)
+
+    @staticmethod
+    def _overview_summary_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "total_db_time_ms": float(
+                sum(
+                    (_as_float(row.get("total_exec_time_ms")) for row in rows),
+                    start=0.0,
                 )
-                return dict(await cursor.fetchone())
+            ),
+            "tracked_queries": len(rows),
+            "critical_queries": sum(
+                1 for row in rows if row.get("priority") == "CRITICAL"
+            ),
+            "regressions": sum(
+                1
+                for row in rows
+                if row.get("previous_period_available") is True
+                and row.get("comparison_reliable") is True
+                and _sql_numeric_ge(row.get("regression_percent"), 20)
+                and _sql_numeric_ge(row.get("previous_calls"), 20)
+                and _sql_numeric_ge(row.get("calls"), 20)
+            ),
+        }
 
     async def query_by_id(
         self,
@@ -568,30 +1220,48 @@ class PowaRepository:
         server_id: int | None = None,
         database_id: int | None = None,
     ) -> dict[str, Any] | None:
-        interval = interval_for(window)
-        clauses = ["query_id = %s"]
-        params: list[Any] = [interval, query_id]
-        if server_id is not None:
-            clauses.append("server_id = %s")
-            params.append(server_id)
-        if database_id is not None:
-            clauses.append("database_id = %s")
-            params.append(database_id)
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    f"""
-                    SELECT metrics.*, servers.alias AS server_alias
-                    FROM advisor.query_metrics(%s::interval) AS metrics
-                    LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = metrics.server_id
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY impact_score DESC
-                    LIMIT 1
-                    """,
-                    params,
-                )
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        rows = await self._query_metrics_snapshot(window)
+        return await asyncio.to_thread(
+            self._query_by_id_from_rows,
+            rows,
+            query_id=query_id,
+            server_id=server_id,
+            database_id=database_id,
+        )
+
+    @staticmethod
+    def _query_by_id_from_rows(
+        rows: list[dict[str, Any]],
+        *,
+        query_id: int,
+        server_id: int | None,
+        database_id: int | None,
+    ) -> dict[str, Any] | None:
+        candidates = [
+            row
+            for row in rows
+            if row.get("query_id") == query_id
+            and (server_id is None or row.get("server_id") == server_id)
+            and (database_id is None or row.get("database_id") == database_id)
+        ]
+        if not candidates:
+            return None
+
+        # Preserve the prior SQL's `ORDER BY impact_score DESC` behavior:
+        # DESC defaults to NULLS FIRST, and Python's stable max keeps snapshot
+        # order for otherwise unspecified ties.
+        selected = max(
+            candidates,
+            key=lambda row: (
+                row.get("impact_score") is None,
+                (
+                    _metric_sort_value(row, "impact_score")
+                    if row.get("impact_score") is not None
+                    else (0, Decimal(0))
+                ),
+            ),
+        )
+        return deepcopy(selected)
 
     async def trend(
         self,
@@ -601,37 +1271,29 @@ class PowaRepository:
         server_id: int | None = None,
         database_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        scope = (server_id, database_id, query_id)
+        if all(value is None for value in scope):
+            return await self._global_trend_snapshot(window)
+        if not all(value is not None for value in scope):
+            raise ValueError(
+                "Trend kapsami server_id, database_id ve query_id "
+                "alanlarini birlikte gerektirir."
+            )
         interval = interval_for(window)
         bucket = WINDOW_BUCKETS[window]
-        clauses = [
-            "sample_at >= now() - %s::interval",
-            "toplevel",
-            "predecessor_available",
-            "NOT (gap_detected AND previous_sample_at < now() - %s::interval)",
-        ]
-        params: list[Any] = [bucket, interval, interval, interval]
-        if query_id is not None:
-            clauses.append("query_id = %s")
-            params.append(query_id)
-        if server_id is not None:
-            clauses.append("server_id = %s")
-            params.append(server_id)
-        if database_id is not None:
-            clauses.append("database_id = %s")
-            params.append(database_id)
+        function_sql = (
+            "advisor.query_trend("
+            "now() - %s::interval, %s::interval, %s, %s, %s)"
+        )
+        params: list[Any] = [interval, bucket, server_id, database_id, query_id]
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     f"""
-                    SELECT date_bin(%s::interval, sample_at, timestamptz '2000-01-01') AS timestamp,
-                           sum(total_exec_time_ms)::double precision AS total_exec_time_ms,
-                           sum(calls)::bigint AS calls
-                    FROM advisor.query_deltas(now() - %s::interval) AS deltas
-                    JOIN "PoWA".powa_databases AS db
-                      ON db.srvid = deltas.server_id AND db.oid = deltas.database_id
-                    WHERE db.datname <> 'powa' AND {' AND '.join(clauses)}
-                    GROUP BY 1
-                    ORDER BY 1
+                    SELECT bucket_at AS timestamp,
+                           total_exec_time_ms,
+                           calls
+                    FROM {function_sql}
                     """,
                     params,
                 )
@@ -969,7 +1631,12 @@ class PowaRepository:
                     """,
                     (server_id, database_id, query_id, status, note, actor),
                 )
-                return dict(await cursor.fetchone())
+                row = dict(await cursor.fetchone())
+        # Annotation columns are embedded in every window snapshot.  The
+        # generation guard also prevents an older in-flight refresh from
+        # repopulating the cache after this mutation.
+        await self.invalidate_query_rows_cache()
+        return row
 
     async def record_query_export_audit(
         self,

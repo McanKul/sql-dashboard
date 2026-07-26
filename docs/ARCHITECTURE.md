@@ -7,7 +7,7 @@
 ```text
 ┌──────────────────────────── Docker / OrbStack hostu ────────────────────────────┐
 │                                                                                 │
-│  source-db (demo PG 18.4, :5432)             repository-db (PG 18.4, :5433)      │
+│  source-db (demo PG 18.x, :5432)             repository-db (PG 18.x, :5433)      │
 │  ├─ appdb + örnek iş yükü                    ├─ powa_repository                  │
 │  ├─ statement + qualstats + kcache + waits   ├─ PoWA 5.2 geçmişi                 │
 │  ├─ HypoPG 1.4.3 + evaluator rolü            ├─ advisor view/not/audit katmanı   │
@@ -51,16 +51,34 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 - Salt-okunur `advisor_evaluator` rolü yalnız gerekli tablo SELECT ve HypoPG fonksiyon EXECUTE yetkilerini taşır.
 - Demo görünürlüğü için `pg_stat_statements.track=all` ayarlanmıştır.
 - Remote snapshot fonksiyonları dedicated `powa` veritabanındadır.
-- JOIN içeren sorguların JOIN ve ilgili WHERE satırları reset sınırında private, yedi günle sınırlı outbox'a yazılır.
+- JOIN içeren sorguların JOIN ve ilgili WHERE satırları reset sınırında private outbox'a yazılır; ack edilmemiş batch otomatik yaşlandırılmaz.
+- Outbox `1m satır / 1 GiB / 300 sn` varsayılan high-water sınırlarından birine ulaşırsa source aynı transaction içinde herhangi bir outbox insertinden ve `pg_qualstats_reset()` çağrısından önce yeni capture'ı reddeder. Bu, collector errors alanını ve health durumunu `DEGRADED` yaparken uygulama veritabanının diskini korur; ack ile canlı kuyruk boşalınca sonraki snapshot otomatik toparlar.
 - Collector kullanıcısı `powa.ignored_users` ile sorgu sonuçlarından çıkarılır.
 
 ### Repository instance
 
 - PoWA'nın remote snapshot geçmişini saklar.
 - `pg_qualstats` repository tabloları/fonksiyonları PoWA 5.2 şemasından gelir; repository database içinde ayrıca extension oluşturulmaz.
-- Kaynak `source-db:5432` adıyla, 5 saniye frekans ve açıkça 90 gün retention ile kaydedilir.
+- Kaynak `source-db:5432` adıyla, varsayılan 60 saniye frekans (`DEMO_SOURCE_FREQUENCY`) ve açıkça 90 gün retention ile kaydedilir.
 - PoWA tablolarına kolon/trigger eklenmez; ürün nesneleri ayrı `advisor` şemasındadır. Tek istisna, pinned PoWA 5.2.0 paketindeki hatalı iki-parametreli `powa_qualstats_purge` kilit çağrısını doğru tek-parametreli imzaya çeviren, sürüm ve fonksiyon gövdesiyle korunan uyumluluk migrasyonudur.
 - `advisor.query_metrics(interval)` 1h, 24h, 7d ve 30d pencerelerini besler.
+- API, her zaman penceresi için tam ve rol-bağımsız query metric snapshot'ını
+  sınırlı LRU bellekte tutar. Aynı metrics snapshot query-list sayfa/arama/sıralama,
+  overview kartları ve detail'in temel satırı arasında paylaşılır. Overview'un
+  global trendi ayrı, bounded bir window LRU cache'indedir; iki cache aynı
+  fresh/stale/max-entry/max-row ayarlarını kullanır ve pencere başına
+  single-flight yenilenir. Query-metrics ile global-trend refresh'leri ortak
+  repository-wide lock üzerinde serialize edilir. Fresh süre dolduğunda stale
+  değer anında dönerken refresh arka planda çalışır; cold/too-old istek ortak
+  refresh'i bekler. Scoped detail trendi ve collector health cache dışındadır ve
+  her istekte repository'den canlı okunur. `observedTo` cache edilen metrics
+  verisinin gerçek zamanını taşır. Metrics named cursor + satır/payload-byte,
+  global trend satır sınırı ve API container memory zarfı büyük snapshot'ları
+  fail-closed tutar.
+  Annotation değişikliği aynı process içindeki metrics ve global-trend cache'lerini
+  temizler; process kapanışında iki cache'in arka plan refresh'leri iptal edilir.
+  Multi-replica kurulum shared invalidation eklenene kadar bounded-stale
+  annotation riski taşır.
 - `advisor.kcache_deltas(timestamptz)` PoWA CPU sayaçlarını reset-safe farklara çevirir; capability olmayan kaynaklarda sorgu ekranları çalışmaya devam eder.
 - `advisor.wait_deltas(timestamptz)` sampled wait sayaçlarını reset-safe farklara ve wait sınıflarına çevirir.
 - Private `advisor_ingest` şeması JOIN batch'lerini saklar; public adapter'lar JOIN kanıtı ve iki kolonlu adayları API'ye açar.
@@ -79,8 +97,11 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 ### JOIN snapshotter
 
 - Source ve repository için birbirinden ayrı login/secret kullanır; API veya collector credential'ı almaz.
-- Source tarafında yalnız `fetch_batches()`/`ack_batch()`, repository tarafında yalnız kontrollü ingest/status/purge fonksiyonlarını çağırır.
-- Repository commitinden önce source batch'i silmez. Tekrar teslim `(server_id, batch_id)` anahtarıyla idempotenttir.
+- Source tarafında yalnız bounded header list/chunk fetch/`ack_batch()`, repository tarafında yalnız kontrollü chunk ingest/finalize/status/purge fonksiyonlarını çağırır.
+- Capture/reset batch sınırını korurken her payload en fazla 10.000 satır ve 8 MiB'dir. Kısmi parçalar private staging'de kalır; yalnız eksiksiz, bitişik batch atomik olarak evidence tablolarına finalize edilir.
+- Repository finalize commitinden önce source batch'i silmez. Tekrar teslim `(server_id, batch_id,chunk_no)` ve payload hash'iyle idempotenttir.
+- Her listed batch ayrı hata sınırıdır; başarısız head batch ack edilmeden korunurken aynı cycle'daki sonraki batch'ler ilerler.
+- Source outbox circuit-breaker'ı satır, fiziksel relation boyutu ve en eski ack'siz batch yaşını her capture öncesi ölçer. Eşik açıkken insert/reset yoktur; JOIN kapsamı eksik kabul edilir ve source disk tüketimi sınırlanır.
 - Salt-okunur container filesystem'i, düşürülmüş capability'ler ve yalnız source/repository ile paylaşılan iki internal ağla çalışır; ana `advisor` ağına katılmaz, DSN veya payload loglamaz.
 
 ### API ve web
@@ -221,8 +242,8 @@ sabit subject'tir; `X-Advisor-Actor`, `X-Advisor-Admin-Token` ve body
 - HypoPG kapsamı SELECT/tek statement, en fazla iki kolonlu B-tree adayı ve yapılandırılmış tek alias/database ile sınırlıdır. DML, expression/partial/covering index ve çoklu evaluator routing desteklenmez.
 - Planner cost düşüşü gerçek süre garantisi değildir; gösterilen SQL üretimde ayrıca DBA incelemesi gerektirir.
 - Clone runtime sonucu yalnız template verisinin istatistikleri, operator onaylı sentetik/anonim bind fixture'ı ve seçilen cache profili için geçerlidir. Fixture exact persisted aday + query kimliği + normalize SQL hash'ine bağlı, private ve süreli olabilir; eşleşme yoksa `EXPLAIN ANALYZE` başlamadan fail-closed durur.
-- PostgreSQL 18.4 + PoWA 5.2 ile geçmiş lock/blocker zinciri sunulmaz. PoWA'nın `pg_stat_lock` veri kaynağı PostgreSQL 19 gerektirir; UI bunu unavailable capability olarak açıklar.
-- Demo snapshot frekansı 5 saniyedir. Canlıda ölçülen yük ve ihtiyaç doğrultusunda daha yüksek frekans seçilmelidir.
+- PostgreSQL 18.x + PoWA 5.2 ile geçmiş lock/blocker zinciri sunulmaz. PoWA'nın `pg_stat_lock` veri kaynağı PostgreSQL 19 gerektirir; UI bunu unavailable capability olarak açıklar.
+- Fresh demo snapshot frekansı üretim-temsili olarak 60 saniyedir. Yalnız kısa yerel acceptance için yeni volume'de 5 saniyeye indirilebilir; canlıda ölçülen yük ve ihtiyaç doğrultusunda seçilmelidir.
 - Kaynakta PoWA ile `pg_stat_statements`, `pg_qualstats`, `pg_stat_kcache` ve `pg_wait_sampling` binary/preload hazırlığı gerekir; salt bağlantı parolası vanilla PostgreSQL'ü izlenebilir hale getirmez.
 - Raw JOIN predicate'leri kaynakta yakalanır ancak PoWA 5.2 standart remote qualstats datasource'u bunları repository geçmişine taşımaz.
 - Bütün dış kaynaklar bir collector deployment'ında ortak libpq `PGSSLMODE` kullanır. Kaynak başına farklı client certificate/SSL profili gerekirse ayrı collector deployment'ı gerekir.

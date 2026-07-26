@@ -42,6 +42,42 @@ server kimliğine bağlar. Dış kaynakta DBA ayrıca
 ile yapmalıdır. Bu tasarım, dış kaynak kurulumu beklerken tüm repository
 açılışını bloke etmez.
 
+`0010` JOIN transport staging/chunk protokolünü ve retention purge indekslerini
+ileri yönlü ekler. Eski tek-payload fonksiyonları rolling upgrade sırasında
+çağrılabilir kalır; yeni daemon yalnız bütün chunk receipt/range/row sayıları
+eşleştiğinde batch'i public evidence tablolarına finalize eder. Source tarafındaki
+metadata-only header list/chunk fonksiyonları versioned repository migration'ı
+değildir; mevcut source volume'lerinde `scripts/enable-join-snapshotter.sh`
+bunları rolling-compatible biçimde uygular.
+
+`0011`, aynı source batch içinde `pg_qualstats` tarafından aynı final doğal
+anahtarla üretilebilen birden çok ham satırı destekler. Staging kimliği yalnız
+`chunk_no + row_in_chunk` ham konumudur; batch'in `row_count` değeri ham taşıma
+sayısını korur. Finalize aşaması tekrarları doğal anahtarda deterministik olarak
+birleştirir ve `occurences`, `execution_count`, `nbfiltered` sayaçlarını toplar.
+Toplam `bigint` sınırını aşarsa batch public tabloya kısmen yazılmadan SQLSTATE
+`22003` ile durur ve source ack edilmez. Rolling upgrade için korunan
+`ingest_join_batch()` da aynı toplama kuralını uygular.
+
+`0012`, binlerce fingerprint bulunan ERP repository'lerinde query-list
+hesabının ölçek davranışını düzeltir. `powa_statements_history_current` artık
+her sorgu serisi için iki ayrı index probe ile değil, tek set-wise taramayla
+okunur; pencere öncesindeki son predecessor yine deterministik olarak korunur.
+Planner'ın düşük set-returning-function tahmini yüzünden CPU/wait CTE'lerini
+milyonlarca kez nested-loop ile karşılaştırması yalnız
+`advisor.query_metrics(interval)` çağrısı içinde kapatılır. Çağıranın session
+ayarı değişmez; fonksiyon imzası, grant'leri, reset/gap ve çok-rollü coverage
+semantiği korunur. Migration checksum-frozen `0009` gövdesini yalnız beklenen
+fragment tam bir kez bulunursa değiştirir, özelleştirilmiş/beklenmeyen şemada
+fail-closed durur.
+
+`0013`, overview ve query-detail trendlerini genel amaçlı delta fonksiyonunun
+dışında tekrar gruplatmak yerine repository içinde doğrudan zaman kovalarına
+indirger. Global ve tam sorgu kimliğiyle scoped iki overload bulunur. Scoped
+çağrı server/database/query filtrelerini PoWA history/current taramalarına iter;
+iki çağrı da her aktif seri için pencere öncesindeki tek gerçek predecessor'ı
+okuyarak counter reset ve `3 x frequency` sınır-gap davranışını korur.
+
 ## Yeni migration ekleme
 
 1. Mevcut migration dosyalarını değiştirmeyin. Özellikle

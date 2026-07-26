@@ -87,6 +87,7 @@ async def test_repository_annotation_uses_restricted_database_function(
 ) -> None:
     cursor = _Cursor()
     monkeypatch.setattr(powa_module, "pool", _Pool(cursor))
+    generation_before = repository._query_metrics_cache_generation
 
     row = await repository.annotate(
         server_id=1,
@@ -102,6 +103,7 @@ async def test_repository_annotation_uses_restricted_database_function(
     assert "set_config" not in cursor.query
     assert cursor.params == (1, 16_384, 42, "IN_REVIEW", "Kontrol", "user:reviewer")
     assert row["updated_by"] == "user:reviewer"
+    assert repository._query_metrics_cache_generation == generation_before + 1
 
 
 @pytest.mark.asyncio

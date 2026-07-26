@@ -58,6 +58,20 @@ SELECT pg_try_advisory_lock(
   END $abort$;
 \endif
 
+-- Older preparation scripts do not pass ERP knobs.  Preserve quick/normal/
+-- stress behavior, while the explicit ERP profile receives the bounded target
+-- requested by the catalog-scale workload.
+\if :{?target_erp_tables}
+\else
+  SELECT CASE WHEN :'seed_profile' = 'erp' THEN 500 ELSE 0 END AS target_erp_tables
+  \gset
+\endif
+\if :{?erp_rows_per_table}
+\else
+  SELECT CASE WHEN :'seed_profile' = 'erp' THEN 2000 ELSE 64 END AS erp_rows_per_table
+  \gset
+\endif
+
 SELECT set_config('advisor.seed.profile', :'seed_profile', false);
 SELECT set_config('advisor.seed.batch_size', :'batch_size', false);
 SELECT set_config('advisor.seed.target_customers', :'target_customers', false);
@@ -70,6 +84,8 @@ SELECT set_config('advisor.seed.target_inventory', :'target_inventory', false);
 SELECT set_config('advisor.seed.target_payments', :'target_payments', false);
 SELECT set_config('advisor.seed.target_jobs', :'target_jobs', false);
 SELECT set_config('advisor.seed.target_hotspots', :'target_hotspots', false);
+SELECT set_config('advisor.seed.target_erp_tables', :'target_erp_tables', false);
+SELECT set_config('advisor.seed.erp_rows_per_table', :'erp_rows_per_table', false);
 
 DO $roles$
 BEGIN
@@ -199,6 +215,24 @@ CREATE TABLE IF NOT EXISTS advisor_workload_hotspots (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE SCHEMA IF NOT EXISTS advisor_erp;
+REVOKE ALL ON SCHEMA advisor_erp FROM PUBLIC;
+CREATE TABLE IF NOT EXISTS advisor_erp.table_manifest (
+    table_number integer PRIMARY KEY,
+    table_name text NOT NULL UNIQUE,
+    target_rows integer NOT NULL,
+    actual_rows bigint NOT NULL,
+    seeded_at timestamptz NOT NULL,
+    CONSTRAINT advisor_erp_table_number_check
+      CHECK (table_number BETWEEN 1 AND 500),
+    CONSTRAINT advisor_erp_table_name_check
+      CHECK (table_name ~ '^erp_entity_[0-9]{4}$'),
+    CONSTRAINT advisor_erp_target_rows_check
+      CHECK (target_rows BETWEEN 1 AND 5000),
+    CONSTRAINT advisor_erp_actual_rows_check
+      CHECK (actual_rows >= target_rows)
+);
+
 CREATE TABLE IF NOT EXISTS advisor_workload_seed_manifest (
     seed_key text PRIMARY KEY,
     schema_version integer NOT NULL,
@@ -209,9 +243,61 @@ CREATE TABLE IF NOT EXISTS advisor_workload_seed_manifest (
     started_at timestamptz NOT NULL,
     completed_at timestamptz,
     CONSTRAINT advisor_workload_seed_key_check CHECK (seed_key = 'active'),
-    CONSTRAINT advisor_workload_seed_profile_check CHECK (profile IN ('quick', 'normal', 'stress')),
+    CONSTRAINT advisor_workload_seed_profile_check CHECK (profile IN ('quick', 'normal', 'stress', 'erp')),
     CONSTRAINT advisor_workload_seed_status_check CHECK (status IN ('SEEDING', 'READY'))
 );
+
+-- Existing seed manifests retain the previous three-profile check because
+-- CREATE TABLE IF NOT EXISTS does not reconcile constraints.
+ALTER TABLE advisor_workload_seed_manifest
+  DROP CONSTRAINT IF EXISTS advisor_workload_seed_profile_check;
+ALTER TABLE advisor_workload_seed_manifest
+  ADD CONSTRAINT advisor_workload_seed_profile_check
+  CHECK (profile IN ('quick', 'normal', 'stress', 'erp'));
+
+-- The bounded event writer keeps only the newest tagged fixture rows.  Without
+-- this partial index every cleanup walks the multi-million-row ERP event table
+-- while holding the shared retention lock, which turns fixture maintenance
+-- into artificial lock pressure rather than representative application load.
+DO $repair_event_cleanup_index$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_class AS index_relation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = index_relation.relnamespace
+        LEFT JOIN pg_index AS index_record
+          ON index_record.indexrelid = index_relation.oid
+        LEFT JOIN pg_am AS access_method
+          ON access_method.oid = index_relation.relam
+        WHERE namespace.nspname = 'public'
+          AND index_relation.relname = 'idx_events_advisor_realistic_id_desc'
+          AND (
+              index_record.indexrelid IS NULL
+              OR index_record.indrelid <> 'public.events'::regclass
+              OR NOT index_record.indisvalid
+              OR NOT index_record.indisready
+              OR NOT index_record.indislive
+              OR index_record.indisunique
+              OR index_record.indisprimary
+              OR index_record.indisexclusion
+              OR access_method.amname IS DISTINCT FROM 'btree'
+              OR index_record.indnkeyatts <> 1
+              OR index_record.indnatts <> 1
+              OR pg_get_indexdef(index_record.indexrelid, 1, true) <> 'id'
+              OR index_record.indoption::text <> '3'
+              OR pg_get_expr(index_record.indpred, index_record.indrelid, true)
+                   <> '(metadata ->> ''source''::text) = ''advisor-realistic''::text'
+          )
+    ) THEN
+        DROP INDEX public.idx_events_advisor_realistic_id_desc;
+    END IF;
+END
+$repair_event_cleanup_index$;
+
+CREATE INDEX IF NOT EXISTS idx_events_advisor_realistic_id_desc
+  ON events (id DESC)
+  WHERE metadata ->> 'source' = 'advisor-realistic';
 
 INSERT INTO advisor_workload_seed_manifest (
     seed_key, schema_version, profile, target_counts, actual_counts,
@@ -219,7 +305,7 @@ INSERT INTO advisor_workload_seed_manifest (
 )
 VALUES (
     'active',
-    1,
+    2,
     current_setting('advisor.seed.profile'),
     jsonb_build_object(
         'customers', current_setting('advisor.seed.target_customers')::bigint,
@@ -232,7 +318,11 @@ VALUES (
         'workload_inventory', current_setting('advisor.seed.target_inventory')::bigint,
         'workload_payments', current_setting('advisor.seed.target_payments')::bigint,
         'workload_jobs', current_setting('advisor.seed.target_jobs')::bigint,
-        'advisor_workload_hotspots', current_setting('advisor.seed.target_hotspots')::bigint
+        'advisor_workload_hotspots', current_setting('advisor.seed.target_hotspots')::bigint,
+        'advisor_erp_tables', current_setting('advisor.seed.target_erp_tables')::bigint,
+        'advisor_erp_rows',
+          current_setting('advisor.seed.target_erp_tables')::bigint
+          * current_setting('advisor.seed.erp_rows_per_table')::bigint
     ),
     NULL,
     'SEEDING',
@@ -263,15 +353,39 @@ DECLARE
     v_target_payments bigint := current_setting('advisor.seed.target_payments')::bigint;
     v_target_jobs bigint := current_setting('advisor.seed.target_jobs')::bigint;
     v_target_hotspots bigint := current_setting('advisor.seed.target_hotspots')::bigint;
+    v_target_erp_tables integer := current_setting('advisor.seed.target_erp_tables')::integer;
+    v_erp_rows_per_table integer := current_setting('advisor.seed.erp_rows_per_table')::integer;
     v_current bigint;
     v_add bigint;
     v_inserted bigint;
     v_customer_count bigint;
     v_order_count bigint;
     v_product_count bigint;
+    v_erp_table_number integer;
+    v_erp_table_name text;
+    v_erp_index_name text;
+    v_erp_actual_rows bigint;
 BEGIN
     IF v_batch < 1000 OR v_batch > 500000 THEN
         RAISE EXCEPTION 'batch_size must be between 1000 and 500000';
+    END IF;
+    IF v_target_erp_tables < 0 OR v_target_erp_tables > 500 THEN
+        RAISE EXCEPTION 'target_erp_tables must be between 0 and 500';
+    END IF;
+    IF v_erp_rows_per_table < 1 OR v_erp_rows_per_table > 5000 THEN
+        RAISE EXCEPTION 'erp_rows_per_table must be between 1 and 5000';
+    END IF;
+    IF current_setting('advisor.seed.profile') = 'erp'
+       AND v_target_erp_tables <> 500 THEN
+        RAISE EXCEPTION 'ERP profile requires exactly 500 business tables';
+    END IF;
+    IF current_setting('advisor.seed.profile') = 'erp'
+       AND v_erp_rows_per_table <> 2000 THEN
+        RAISE EXCEPTION 'ERP profile requires exactly 2000 rows per table';
+    END IF;
+    IF current_setting('advisor.seed.profile') <> 'erp'
+       AND v_target_erp_tables <> 0 THEN
+        RAISE EXCEPTION 'ERP tables require the explicit ERP seed profile';
     END IF;
 
     INSERT INTO workload_tenants (id, name, region, plan, status, created_at)
@@ -609,6 +723,136 @@ BEGIN
     COMMIT;
     RAISE NOTICE 'advisor_workload_hotspots: inserted %, target %',
       v_inserted, v_target_hotspots;
+
+    -- ERP catalog DDL is finite, identifier-only and runs solely inside this
+    -- explicitly confirmed seeder.  Commit every 25 tables so one million
+    -- fixture rows never become one catalog-wide transaction or long lock.
+    FOR v_erp_table_number IN 1..v_target_erp_tables LOOP
+        v_erp_table_name := format(
+            'erp_entity_%s', lpad(v_erp_table_number::text, 4, '0')
+        );
+        v_erp_index_name := format(
+            'idx_erp_entity_%s_tenant_state_time',
+            lpad(v_erp_table_number::text, 4, '0')
+        );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I ('
+            'id bigint PRIMARY KEY, '
+            'tenant_id bigint NOT NULL, '
+            'parent_id bigint NOT NULL, '
+            'status_code smallint NOT NULL CHECK (status_code BETWEEN 0 AND 7), '
+            'amount numeric(14,2) NOT NULL, '
+            'external_key text NOT NULL, '
+            'payload jsonb NOT NULL, '
+            'created_at timestamptz NOT NULL, '
+            'updated_at timestamptz NOT NULL'
+            ')',
+            'advisor_erp', v_erp_table_name
+        );
+        IF EXISTS (
+            SELECT 1
+            FROM pg_class AS index_relation
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = index_relation.relnamespace
+            LEFT JOIN pg_index AS index_record
+              ON index_record.indexrelid = index_relation.oid
+            LEFT JOIN pg_am AS access_method
+              ON access_method.oid = index_relation.relam
+            WHERE namespace.nspname = 'advisor_erp'
+              AND index_relation.relname = v_erp_index_name
+              AND (
+                  index_record.indexrelid IS NULL
+                  OR index_record.indrelid <> format(
+                      '%I.%I', 'advisor_erp', v_erp_table_name
+                  )::regclass
+                  OR NOT index_record.indisvalid
+                  OR NOT index_record.indisready
+                  OR NOT index_record.indislive
+                  OR index_record.indisunique
+                  OR index_record.indisprimary
+                  OR index_record.indisexclusion
+                  OR access_method.amname IS DISTINCT FROM 'btree'
+                  OR index_record.indnkeyatts <> 3
+                  OR index_record.indnatts <> 3
+                  OR index_record.indpred IS NOT NULL
+                  OR pg_get_indexdef(index_record.indexrelid, 1, true)
+                       <> 'tenant_id'
+                  OR pg_get_indexdef(index_record.indexrelid, 2, true)
+                       <> 'status_code'
+                  OR pg_get_indexdef(index_record.indexrelid, 3, true)
+                       <> 'updated_at'
+                  OR index_record.indoption::text <> '0 0 3'
+              )
+        ) THEN
+            EXECUTE format(
+                'DROP INDEX %I.%I', 'advisor_erp', v_erp_index_name
+            );
+        END IF;
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS %I ON %I.%I '
+            '(tenant_id, status_code, updated_at DESC)',
+            v_erp_index_name, 'advisor_erp', v_erp_table_name
+        );
+
+        EXECUTE format(
+            'INSERT INTO %I.%I ('
+            'id, tenant_id, parent_id, status_code, amount, external_key, '
+            'payload, created_at, updated_at'
+            ') '
+            'SELECT row_number::bigint, '
+            '       1 + mod(row_number + $2 - 2, $3), '
+            '       1 + mod(row_number * 13 + $2 - 2, $1), '
+            '       mod(row_number * 7 + $2, 8)::smallint, '
+            '       (100 + mod(row_number * 104729 + $2 * 97, 500000))::numeric / 100, '
+            '       %L || lpad(row_number::text, 6, ''0''), '
+            '       jsonb_build_object('
+            '           ''channel'', (ARRAY[''web'', ''mobile'', ''store'', ''partner''])['
+            '             1 + mod(row_number * 11 + $2, 4)::integer'
+            '           ], '
+            '           ''module'', $2, '
+            '           ''seed'', ''advisor-erp-v1'''
+            '       ), '
+            '       now() - (mod(row_number * 1223 + $2, 63072000)::text || '' seconds'')::interval, '
+            '       now() - (mod(row_number * 97 + $2, 7776000)::text || '' seconds'')::interval '
+            'FROM generate_series(1, $1) AS row_number '
+            'ON CONFLICT (id) DO NOTHING',
+            'advisor_erp', v_erp_table_name,
+            format('ERP-%s-', lpad(v_erp_table_number::text, 4, '0'))
+        )
+        USING v_erp_rows_per_table, v_erp_table_number, v_target_tenants;
+
+        EXECUTE format(
+            'SELECT count(*) FROM %I.%I',
+            'advisor_erp', v_erp_table_name
+        ) INTO v_erp_actual_rows;
+        IF v_erp_actual_rows <> v_erp_rows_per_table THEN
+            RAISE EXCEPTION 'ERP table % has % rows, expected exactly %',
+              v_erp_table_name, v_erp_actual_rows, v_erp_rows_per_table;
+        END IF;
+
+        INSERT INTO advisor_erp.table_manifest (
+            table_number, table_name, target_rows, actual_rows, seeded_at
+        )
+        VALUES (
+            v_erp_table_number, v_erp_table_name,
+            v_erp_rows_per_table, v_erp_actual_rows, clock_timestamp()
+        )
+        ON CONFLICT (table_number) DO UPDATE
+        SET table_name = EXCLUDED.table_name,
+            target_rows = EXCLUDED.target_rows,
+            actual_rows = EXCLUDED.actual_rows,
+            seeded_at = EXCLUDED.seeded_at;
+
+        EXECUTE format(
+            'ANALYZE %I.%I', 'advisor_erp', v_erp_table_name
+        );
+        IF mod(v_erp_table_number, 25) = 0 THEN
+            COMMIT;
+            RAISE NOTICE 'advisor_erp tables: % / %',
+              v_erp_table_number, v_target_erp_tables;
+        END IF;
+    END LOOP;
 END
 $seed$;
 
@@ -616,6 +860,17 @@ CALL pg_temp.seed_advisor_realistic_workload();
 
 GRANT USAGE ON SCHEMA public
   TO advisor_workload_reader, advisor_workload_writer, advisor_workload_reporter;
+
+REVOKE ALL PRIVILEGES ON SCHEMA advisor_erp
+  FROM PUBLIC, advisor_workload_reader, advisor_workload_writer,
+       advisor_workload_reporter, advisor_workload_login;
+GRANT USAGE ON SCHEMA advisor_erp
+  TO advisor_workload_reader, advisor_workload_reporter;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA advisor_erp
+  FROM PUBLIC, advisor_workload_reader, advisor_workload_writer,
+       advisor_workload_reporter, advisor_workload_login;
+GRANT SELECT ON ALL TABLES IN SCHEMA advisor_erp
+  TO advisor_workload_reader, advisor_workload_reporter;
 
 -- Reconcile privilege drift on every idempotent seed before granting the exact
 -- read envelope.  Reader/reporter roles never need DML or sequence access.
@@ -708,6 +963,7 @@ ANALYZE workload_payments;
 ANALYZE workload_jobs;
 ANALYZE advisor_workload_hotspots;
 ANALYZE advisor_workload_seed_manifest;
+ANALYZE advisor_erp.table_manifest;
 
 DO $verify$
 DECLARE
@@ -730,8 +986,25 @@ BEGIN
         'workload_inventory', (SELECT count(*) FROM workload_inventory),
         'workload_payments', (SELECT count(*) FROM workload_payments),
         'workload_jobs', (SELECT count(*) FROM workload_jobs),
-        'advisor_workload_hotspots', (SELECT count(*) FROM advisor_workload_hotspots)
+        'advisor_workload_hotspots', (SELECT count(*) FROM advisor_workload_hotspots),
+        'advisor_erp_tables', (
+            SELECT count(*)
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'advisor_erp'
+              AND relation.relkind IN ('r', 'p')
+              AND relation.relname ~ '^erp_entity_[0-9]{4}$'
+        ),
+        'advisor_erp_rows', (
+            SELECT COALESCE(sum(actual_rows), 0)
+            FROM advisor_erp.table_manifest
+        )
     );
+
+    IF current_setting('advisor.seed.profile') = 'erp'
+       AND (v_actual ->> 'advisor_erp_tables')::integer <> 500 THEN
+        RAISE EXCEPTION 'ERP catalog must contain exactly 500 managed business tables';
+    END IF;
 
     FOR v_name IN SELECT jsonb_object_keys(v_targets)
     LOOP
@@ -812,6 +1085,54 @@ BEGIN
            OR has_table_privilege(role_name, relation_name, 'DELETE')
     ) THEN
         RAISE EXCEPTION 'workload reader/reporter retains a forbidden DML privilege';
+    END IF;
+
+    IF NOT has_schema_privilege('advisor_workload_reader', 'advisor_erp', 'USAGE')
+       OR NOT has_schema_privilege('advisor_workload_reporter', 'advisor_erp', 'USAGE')
+       OR has_schema_privilege('advisor_workload_writer', 'advisor_erp', 'USAGE') THEN
+        RAISE EXCEPTION 'ERP schema role envelope is invalid';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'advisor_erp'
+          AND relation.relkind IN ('r', 'p')
+          AND (
+              NOT has_table_privilege(
+                  'advisor_workload_reader', relation.oid, 'SELECT'
+              )
+              OR NOT has_table_privilege(
+                  'advisor_workload_reporter', relation.oid, 'SELECT'
+              )
+          )
+    ) THEN
+        RAISE EXCEPTION 'ERP reader/reporter is missing SELECT privilege';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM unnest(ARRAY[
+            'advisor_workload_reader', 'advisor_workload_reporter',
+            'advisor_workload_writer'
+        ]) AS role_name
+        CROSS JOIN LATERAL (
+            SELECT relation.oid
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'advisor_erp'
+              AND relation.relkind IN ('r', 'p')
+        ) AS erp_relation
+        WHERE has_table_privilege(role_name, erp_relation.oid, 'INSERT')
+           OR has_table_privilege(role_name, erp_relation.oid, 'UPDATE')
+           OR has_table_privilege(role_name, erp_relation.oid, 'DELETE')
+           OR (
+               role_name = 'advisor_workload_writer'
+               AND has_table_privilege(role_name, erp_relation.oid, 'SELECT')
+           )
+    ) THEN
+        RAISE EXCEPTION 'ERP workload roles retain a forbidden privilege';
     END IF;
 
     IF has_table_privilege('advisor_workload_writer', 'events', 'UPDATE')

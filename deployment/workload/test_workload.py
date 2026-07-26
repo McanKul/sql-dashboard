@@ -100,7 +100,14 @@ class SqlTemplateTests(unittest.TestCase):
         for role, operations in workload.OPERATIONS_BY_ROLE.items():
             self.assertTrue(operations, role)
             for profile in workload.PROFILE_DEFAULTS:
-                self.assertTrue(all(op.weight(profile) > 0 for op in operations))
+                enabled = profile == "erp"
+                base_operations = [op for op in operations if op.category != "erp"]
+                self.assertTrue(
+                    all(
+                        op.weight(profile, erp_enabled=enabled) > 0
+                        for op in base_operations
+                    )
+                )
 
 
 class ConfigTests(unittest.TestCase):
@@ -112,11 +119,18 @@ class ConfigTests(unittest.TestCase):
         stress = workload.WorkloadConfig.from_env(
             config_env(WORKLOAD_PROFILE="stress")
         )
+        erp = workload.WorkloadConfig.from_env(config_env(WORKLOAD_PROFILE="erp"))
         self.assertLess(quick.duration_seconds, normal.duration_seconds)
         self.assertGreater(normal.duration_seconds, 0)
         self.assertGreater(stress.duration_seconds, 0)
         self.assertGreater(stress.workers, normal.workers)
         self.assertLessEqual(stress.interval_seconds, normal.interval_seconds)
+        self.assertEqual(quick.erp_table_count, 0)
+        self.assertEqual(normal.erp_table_count, 0)
+        self.assertEqual(stress.erp_table_count, 0)
+        self.assertEqual(erp.erp_table_count, 500)
+        self.assertEqual(erp.erp_rows_per_table, 2_000)
+        self.assertEqual(workload.erp_fingerprint_target(erp), 4_000)
 
     def test_documented_environment_overrides_are_applied(self) -> None:
         config = test_config(
@@ -137,6 +151,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.statement_timeout_ms, 7000)
         self.assertEqual(config.lock_timeout_ms, 900)
         self.assertEqual(config.lock_hold_ms, 30)
+        self.assertEqual(config.erp_table_count, 0)
 
     def test_invalid_configuration_fails_closed(self) -> None:
         invalid_values = (
@@ -144,6 +159,21 @@ class ConfigTests(unittest.TestCase):
             {"WORKLOAD_WORKERS": "2"},
             {"WORKLOAD_DURATION_SECONDS": "-1"},
             {"WORKLOAD_INTERVAL_SECONDS": "nan"},
+            {"WORKLOAD_ERP_TABLE_COUNT": "501"},
+            {"WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "9"},
+            {"WORKLOAD_ERP_ROWS_PER_TABLE": "5001"},
+            {"WORKLOAD_PROFILE": "erp", "WORKLOAD_DURATION_SECONDS": "0"},
+            {"WORKLOAD_PROFILE": "erp", "WORKLOAD_ERP_TABLE_COUNT": "499"},
+            {"WORKLOAD_PROFILE": "erp", "WORKLOAD_ERP_ROWS_PER_TABLE": "1999"},
+            {"WORKLOAD_PROFILE": "normal", "WORKLOAD_ERP_TABLE_COUNT": "1"},
+            {
+                "WORKLOAD_PROFILE": "erp",
+                "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "4",
+            },
+            {
+                "WORKLOAD_PROFILE": "erp",
+                "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "7",
+            },
             {"PGPASSWORD": ""},
             {"PGPASSWORD": "advisor_dev_workload"},
             {"PGPASSWORD": "change-me-workload"},
@@ -183,6 +213,88 @@ class SeedSecurityTests(unittest.TestCase):
         self.assertIn("<> 'advisor_dev_workload'", SEED_SQL)
         self.assertIn("NOT LIKE 'change-me-%'", SEED_SQL)
         self.assertIn("VALID UNTIL ''infinity''", SEED_SQL)
+
+    def test_erp_seed_is_bounded_idempotent_and_packaged(self) -> None:
+        self.assertIn("target_erp_tables must be between 0 and 500", SEED_SQL)
+        self.assertIn("erp_rows_per_table must be between 1 and 5000", SEED_SQL)
+        self.assertIn("ERP profile requires exactly 2000 rows per table", SEED_SQL)
+        self.assertIn("ERP tables require the explicit ERP seed profile", SEED_SQL)
+        self.assertIn("FOR v_erp_table_number IN 1..v_target_erp_tables", SEED_SQL)
+        self.assertIn("CREATE TABLE IF NOT EXISTS %I.%I", SEED_SQL)
+        self.assertIn("ON CONFLICT (id) DO NOTHING", SEED_SQL)
+        self.assertIn("IF mod(v_erp_table_number, 25) = 0", SEED_SQL)
+        self.assertIn("expected exactly %", SEED_SQL)
+        self.assertIn("NOT index_record.indisvalid", SEED_SQL)
+        self.assertIn("NOT index_record.indisready", SEED_SQL)
+        self.assertIn("NOT index_record.indislive", SEED_SQL)
+        self.assertIn("index_record.indoption::text <> '0 0 3'", SEED_SQL)
+        self.assertIn("pg_get_indexdef(index_record.indexrelid, 3, true)", SEED_SQL)
+        self.assertIn("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA advisor_erp", SEED_SQL)
+
+    def test_event_retention_has_a_validated_partial_cleanup_index(self) -> None:
+        self.assertIn("idx_events_advisor_realistic_id_desc", SEED_SQL)
+        self.assertIn("ON events (id DESC)", SEED_SQL)
+        self.assertIn(
+            "WHERE metadata ->> 'source' = 'advisor-realistic'", SEED_SQL
+        )
+        self.assertIn("index_record.indoption::text <> '3'", SEED_SQL)
+        self.assertIn("pg_get_expr(index_record.indpred", SEED_SQL)
+
+
+class ErpScaleTests(unittest.TestCase):
+    def test_default_erp_profile_has_four_thousand_bounded_fingerprints(self) -> None:
+        config = workload.WorkloadConfig.from_env(
+            config_env(WORKLOAD_PROFILE="erp")
+        )
+        self.assertEqual(config.erp_table_count, workload.MAX_ERP_TABLES)
+        self.assertEqual(len(workload.ERP_QUERY_FAMILIES), 8)
+        self.assertEqual(workload.erp_fingerprint_target(config), 4_000)
+
+    def test_every_erp_family_uses_allowlisted_quoted_relations_and_read_only_sql(self) -> None:
+        rendered: set[str] = set()
+        for variant in range(len(workload.ERP_QUERY_FAMILIES)):
+            statement = workload.build_erp_query(17, variant, 500).as_string()
+            self.assertIn('"advisor_erp"."erp_entity_0017"', statement)
+            self.assertNotRegex(
+                statement.upper(),
+                r"\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE)\b",
+            )
+            rendered.add(statement)
+        self.assertEqual(len(rendered), len(workload.ERP_QUERY_FAMILIES))
+
+        join_statement = workload.build_erp_query(500, 6, 500).as_string()
+        self.assertIn("WITH left_scope AS", join_statement)
+        self.assertIn('"advisor_erp"."erp_entity_0001"', join_statement)
+
+    def test_erp_identifiers_and_variants_fail_closed(self) -> None:
+        for args in ((0, 0, 500), (501, 0, 500), (1, 8, 500), (2, 0, 1)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                workload.build_erp_query(*args)
+
+    def test_deterministic_scheduler_visits_each_fingerprint_before_wrap(self) -> None:
+        metrics = workload.WorkloadMetrics(seed=1)
+        target = 2_500
+        ordinals = [metrics.reserve_erp_fingerprint(target) for _ in range(target)]
+        self.assertEqual(ordinals, list(range(target)))
+        self.assertEqual(metrics.reserve_erp_fingerprint(target), 0)
+        for ordinal in ordinals:
+            metrics.record_erp_fingerprint(ordinal)
+        self.assertEqual(metrics.erp_coverage(target), (target, 100.0))
+
+    def test_erp_operation_executes_the_reserved_relation_and_family(self) -> None:
+        cursor = FakeCursor()
+        config = workload.WorkloadConfig.from_env(
+            config_env(WORKLOAD_PROFILE="erp")
+        )
+        ordinal = 16 * config.erp_query_variants_per_table + 6
+        returned = workload.execute_erp_query(
+            cursor, random.Random(7), config, BOUNDS, 3, ordinal
+        )
+        self.assertEqual(returned, ordinal)
+        statement = cursor.calls[0][0].as_string()
+        self.assertIn('"advisor_erp"."erp_entity_0017"', statement)
+        self.assertIn('"advisor_erp"."erp_entity_0018"', statement)
+        self.assertIn("JOIN", statement)
 
 class RoleAndRandomnessTests(unittest.TestCase):
     def test_role_allocation_is_reproducible_and_covers_every_role(self) -> None:
@@ -281,6 +393,44 @@ class OperationTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
+    def test_erp_run_fails_closed_when_fingerprint_sweep_is_incomplete(self) -> None:
+        emitted: list[dict[str, object]] = []
+        config = workload.WorkloadConfig.from_env(
+            config_env(WORKLOAD_PROFILE="erp")
+        )
+
+        def successful_worker(
+            _worker_id: int,
+            role: str,
+            _config: workload.WorkloadConfig,
+            _bounds: workload.DataBounds,
+            metrics: workload.WorkloadMetrics,
+            _stop_event: threading.Event,
+            _deadline: float,
+        ) -> None:
+            operation = next(
+                item
+                for item in workload.OPERATIONS_BY_ROLE[role]
+                if item.category != "erp"
+            )
+            metrics.record_operation(operation, 1.0, True)
+
+        with (
+            mock.patch.object(workload, "preflight", return_value=BOUNDS),
+            mock.patch.object(workload, "capture_database_stats", return_value={}),
+            mock.patch.object(workload, "run_worker", side_effect=successful_worker),
+            mock.patch.object(workload, "_emit", side_effect=emitted.append),
+        ):
+            final, exit_code = workload.run(config)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(
+            final["failureReason"], "erp-fingerprint-coverage-incomplete"
+        )
+        self.assertEqual(final["erpFingerprintTarget"], 4_000)
+        self.assertEqual(final["erpVisitedFingerprintCount"], 0)
+
     def test_operation_disconnect_is_counted_as_connection_error(self) -> None:
         stop_event = threading.Event()
 

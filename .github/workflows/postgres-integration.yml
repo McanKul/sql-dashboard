@@ -49,6 +49,13 @@ jobs:
           '
           docker compose run --rm repository-migrate
           bash scripts/verify-temporal-reliability.sh
+          docker compose exec -T repository-db \
+            psql -X --set=ON_ERROR_STOP=1 --username postgres \
+              --port 5433 --dbname powa_repository --file=- \
+            < sql/tests/join_duplicate_aggregation_integration.sql
+          docker compose exec -T source-db \
+            psql -X --set=ON_ERROR_STOP=1 --username postgres --dbname powa --file=- \
+            < sql/tests/join_outbox_guardrail_integration.sql
 
       - name: Verify real role drift reconciliation
         run: |

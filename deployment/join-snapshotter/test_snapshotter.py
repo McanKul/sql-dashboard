@@ -82,18 +82,56 @@ class SequencedFakeConnection(FakeConnection):
 
     def execute(self, _query: str, _params: tuple[Any, ...] = ()) -> FakeResult:
         self.events.append(f"{self.name}:execute")
+        self.queries.append((_query, _params))
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
         return result
 
 
-def batch() -> Any:
-    return snapshotter.Batch(
+def chunk() -> Any:
+    return snapshotter.Chunk(
         batch_id=7,
         captured_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+        total_row_count=1,
+        row_offset=0,
+        is_last=True,
+        payload_bytes=512,
         rows=[{"queryid": -42, "isJoin": True}],
     )
+
+
+def chunk_record(
+    *,
+    batch_id: int = 7,
+    total_row_count: int = 1,
+    row_offset: int = 0,
+    rows: list[dict[str, Any]] | None = None,
+    is_last: bool = True,
+) -> dict[str, Any]:
+    payload = [{"queryid": -42, "isJoin": True}] if rows is None else rows
+    return {
+        "batch_id": batch_id,
+        "captured_at": datetime(2026, 7, 25, tzinfo=timezone.utc),
+        "total_row_count": total_row_count,
+        "row_offset": row_offset,
+        "row_count": len(payload),
+        "is_last": is_last,
+        "payload_bytes": 512,
+        "rows": payload,
+    }
+
+
+def header_record(
+    *,
+    batch_id: int = 7,
+    total_row_count: int = 1,
+) -> dict[str, Any]:
+    return {
+        "batch_id": batch_id,
+        "captured_at": datetime(2026, 7, 25, tzinfo=timezone.utc),
+        "total_row_count": total_row_count,
+    }
 
 
 def settings() -> Any:
@@ -200,52 +238,252 @@ class SnapshotterTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     snapshotter.Settings.from_environment()
 
-    def test_ack_happens_only_after_repository_commit(self) -> None:
+    def test_ack_happens_only_after_repository_finalize_commit(self) -> None:
         events: list[str] = []
-        repository = FakeConnection(events, "repository", FakeResult(one={"inserted": True}))
-        source = FakeConnection(events, "source", FakeResult(one={"acknowledged": True}))
-
-        result = snapshotter.transfer_batch(
-            source, repository, source_alias="test-source", batch=batch()
+        configured = settings()
+        source = SequencedFakeConnection(
+            events,
+            "source",
+            [
+                FakeResult(all_rows=[header_record()]),
+                FakeResult(one=chunk_record()),
+                FakeResult(one={"acknowledged": True}),
+            ],
+        )
+        repository = SequencedFakeConnection(
+            events,
+            "repository",
+            [
+                FakeResult(one={"ready": 1}),
+                FakeResult(one={"inserted": True}),
+                FakeResult(one={"finalized": True}),
+            ],
         )
 
-        self.assertEqual(result, (True, True))
-        self.assertLess(events.index("repository:commit"), events.index("source:execute"))
+        def connector(database_url: str, _settings: Any) -> FakeConnection:
+            return source if database_url == configured.source_database_url else repository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            processed = snapshotter.run_cycle(
+                configured,
+                connector=connector,
+                health_marker_path=Path(temp_dir) / "health",
+            )
+
+        self.assertEqual(processed, 1)
+        repository_commits = [
+            index for index, event in enumerate(events) if event == "repository:commit"
+        ]
+        source_executes = [
+            index for index, event in enumerate(events) if event == "source:execute"
+        ]
+        self.assertGreaterEqual(len(repository_commits), 3)
+        self.assertGreaterEqual(len(source_executes), 3)
+        self.assertLess(repository_commits[-1], source_executes[2])
 
     def test_repository_failure_leaves_source_batch_unacknowledged(self) -> None:
         events: list[str] = []
-        repository = FakeConnection(events, "repository", RuntimeError("do not expose me"))
-        source = FakeConnection(events, "source", FakeResult(one={"acknowledged": True}))
-
-        with self.assertRaises(RuntimeError):
-            snapshotter.transfer_batch(
-                source, repository, source_alias="test-source", batch=batch()
-            )
-
-        self.assertNotIn("source:execute", events)
-        self.assertIn("repository:rollback", events)
-
-    def test_duplicate_repository_batch_is_still_acknowledged(self) -> None:
-        events: list[str] = []
-        repository = FakeConnection(events, "repository", FakeResult(one={"inserted": False}))
-        source = FakeConnection(events, "source", FakeResult(one={"acknowledged": True}))
-
-        result = snapshotter.transfer_batch(
-            source, repository, source_alias="test-source", batch=batch()
+        configured = settings()
+        source = SequencedFakeConnection(
+            events,
+            "source",
+            [
+                FakeResult(all_rows=[header_record()]),
+                FakeResult(one=chunk_record()),
+            ],
+        )
+        repository = SequencedFakeConnection(
+            events,
+            "repository",
+            [FakeResult(one={"ready": 1}), RuntimeError("do not expose me")],
         )
 
-        self.assertEqual(result, (False, True))
+        def connector(database_url: str, _settings: Any) -> FakeConnection:
+            return source if database_url == configured.source_database_url else repository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(RuntimeError):
+                snapshotter.run_cycle(
+                    configured,
+                    connector=connector,
+                    health_marker_path=Path(temp_dir) / "health",
+                )
+
+        self.assertEqual(events.count("source:execute"), 2)
+        self.assertFalse(any("ack_batch" in query for query, _ in source.queries))
+        self.assertIn("repository:rollback", events)
+
+    def test_duplicate_repository_chunks_are_still_finalized_and_acknowledged(self) -> None:
+        events: list[str] = []
+        configured = settings()
+        source = SequencedFakeConnection(
+            events,
+            "source",
+            [
+                FakeResult(all_rows=[header_record()]),
+                FakeResult(one=chunk_record()),
+                FakeResult(one={"acknowledged": True}),
+            ],
+        )
+        repository = SequencedFakeConnection(
+            events,
+            "repository",
+            [
+                FakeResult(one={"ready": 1}),
+                FakeResult(one={"inserted": False}),
+                FakeResult(one={"finalized": False}),
+            ],
+        )
+
+        def connector(database_url: str, _settings: Any) -> FakeConnection:
+            return source if database_url == configured.source_database_url else repository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            processed = snapshotter.run_cycle(
+                configured,
+                connector=connector,
+                health_marker_path=Path(temp_dir) / "health",
+            )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(events.count("source:execute"), 3)
+
+    def test_multi_chunk_batch_is_streamed_and_finalized_once(self) -> None:
+        events: list[str] = []
+        configured = settings()
+        first = chunk_record(
+            total_row_count=2,
+            row_offset=0,
+            rows=[{"queryid": -41, "isJoin": True}],
+            is_last=False,
+        )
+        second = chunk_record(
+            total_row_count=2,
+            row_offset=1,
+            rows=[{"queryid": -42, "isJoin": True}],
+            is_last=True,
+        )
+        source = SequencedFakeConnection(
+            events,
+            "source",
+            [
+                FakeResult(all_rows=[header_record(total_row_count=2)]),
+                FakeResult(one=first),
+                FakeResult(one=second),
+                FakeResult(one={"acknowledged": True}),
+            ],
+        )
+        repository = SequencedFakeConnection(
+            events,
+            "repository",
+            [
+                FakeResult(one={"ready": 1}),
+                FakeResult(one={"inserted": True}),
+                FakeResult(one={"inserted": True}),
+                FakeResult(one={"finalized": True}),
+            ],
+        )
+
+        def connector(database_url: str, _settings: Any) -> FakeConnection:
+            return source if database_url == configured.source_database_url else repository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            processed = snapshotter.run_cycle(
+                configured,
+                connector=connector,
+                health_marker_path=Path(temp_dir) / "health",
+            )
+
+        self.assertEqual(processed, 1)
+        ingest_queries = [
+            params
+            for query, params in repository.queries
+            if "ingest_join_chunk" in query
+        ]
+        self.assertEqual([params[4] for params in ingest_queries], [1, 2])
+        self.assertEqual([params[5] for params in ingest_queries], [0, 1])
+        self.assertEqual(
+            sum("finalize_join_batch" in query for query, _params in repository.queries),
+            1,
+        )
+
+    def test_failed_head_batch_does_not_block_later_batch(self) -> None:
+        events: list[str] = []
+        configured = settings()
+        source = SequencedFakeConnection(
+            events,
+            "source",
+            [
+                FakeResult(
+                    all_rows=[header_record(batch_id=7), header_record(batch_id=8)]
+                ),
+                FakeResult(one=chunk_record(batch_id=7)),
+                FakeResult(one=chunk_record(batch_id=8)),
+                FakeResult(one={"acknowledged": True}),
+            ],
+        )
+        repository = SequencedFakeConnection(
+            events,
+            "repository",
+            [
+                FakeResult(one={"ready": 1}),
+                RuntimeError("poison batch"),
+                FakeResult(one={"inserted": True}),
+                FakeResult(one={"finalized": True}),
+            ],
+        )
+
+        def connector(database_url: str, _settings: Any) -> FakeConnection:
+            return source if database_url == configured.source_database_url else repository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker_path = Path(temp_dir) / "health"
+            with self.assertRaisesRegex(RuntimeError, "RuntimeError"):
+                snapshotter.run_cycle(
+                    configured,
+                    connector=connector,
+                    health_marker_path=marker_path,
+                )
+            self.assertFalse(marker_path.exists())
+
+        ack_params = [
+            params
+            for query, params in source.queries
+            if "ack_batch" in query
+        ]
+        self.assertEqual(ack_params, [(8,)])
 
     def test_batch_shape_mismatch_fails_before_ingest(self) -> None:
         with self.assertRaisesRegex(ValueError, "payload shape"):
-            snapshotter.Batch.from_record(
+            snapshotter.Chunk.from_record(
                 {
                     "batch_id": 8,
                     "captured_at": datetime.now(timezone.utc),
+                    "total_row_count": 2,
+                    "row_offset": 0,
                     "row_count": 2,
+                    "is_last": True,
+                    "payload_bytes": 512,
                     "rows": [{"queryid": 1}],
                 }
             )
+
+    def test_chunk_limits_and_ranges_fail_closed(self) -> None:
+        oversized = chunk_record(
+            total_row_count=snapshotter.MAX_CHUNK_ROWS + 1,
+            rows=[{}] * (snapshotter.MAX_CHUNK_ROWS + 1),
+        )
+        with self.assertRaisesRegex(ValueError, "payload shape"):
+            snapshotter.Chunk.from_record(oversized)
+
+        non_contiguous = chunk_record(
+            total_row_count=3,
+            row_offset=1,
+            rows=[{}],
+            is_last=False,
+        )
+        parsed = snapshotter.Chunk.from_record(non_contiguous)
+        self.assertEqual(parsed.row_offset, 1)
 
     def test_retention_purge_is_scoped_to_configured_source(self) -> None:
         events: list[str] = []
@@ -272,10 +510,18 @@ class SnapshotterTests(unittest.TestCase):
         self.assertNotIn("secret", summary)
         self.assertNotIn("payload", summary)
 
+        transported = snapshotter.SanitizedCycleError(
+            "OperationalError sqlstate=54000"
+        )
+        self.assertEqual(
+            snapshotter._error_summary(transported),
+            "OperationalError sqlstate=54000",
+        )
+
     def test_idle_cycle_checks_both_databases_before_marking_success(self) -> None:
         events: list[str] = []
         configured = settings()
-        source = FakeConnection(events, "source", FakeResult(all_rows=[]))
+        source = FakeConnection(events, "source", FakeResult(one=None))
         repository = FakeConnection(
             events, "repository", FakeResult(one={"ready": 1})
         )
@@ -294,13 +540,13 @@ class SnapshotterTests(unittest.TestCase):
 
             self.assertEqual(processed, 0)
             self.assertEqual(marker_path.read_text(encoding="ascii"), "123456789\n")
-        self.assertLess(events.index("source:execute"), events.index("repository:execute"))
+        self.assertLess(events.index("repository:execute"), events.index("source:execute"))
         self.assertLess(events.index("repository:close"), events.index("source:close"))
 
     def test_failed_repository_cycle_does_not_refresh_marker(self) -> None:
         events: list[str] = []
         configured = settings()
-        source = FakeConnection(events, "source", FakeResult(all_rows=[]))
+        source = FakeConnection(events, "source", FakeResult(one=None))
         repository = FakeConnection(events, "repository", RuntimeError("unavailable"))
 
         def connector(database_url: str, _settings: Any) -> FakeConnection:
@@ -320,23 +566,15 @@ class SnapshotterTests(unittest.TestCase):
 
             self.assertEqual(marker_path.read_text(encoding="ascii"), "41\n")
 
-    def test_rejected_source_acknowledgement_does_not_mark_success(self) -> None:
+    def test_already_acknowledged_source_batch_is_idempotent_success(self) -> None:
         events: list[str] = []
         configured = settings()
         source = SequencedFakeConnection(
             events,
             "source",
             [
-                FakeResult(
-                    all_rows=[
-                        {
-                            "batch_id": 7,
-                            "captured_at": datetime(2026, 7, 25, tzinfo=timezone.utc),
-                            "row_count": 1,
-                            "rows": [{"queryid": -42, "isJoin": True}],
-                        }
-                    ]
-                ),
+                FakeResult(all_rows=[header_record()]),
+                FakeResult(one=chunk_record()),
                 FakeResult(one={"acknowledged": False}),
             ],
         )
@@ -346,6 +584,7 @@ class SnapshotterTests(unittest.TestCase):
             [
                 FakeResult(one={"ready": 1}),
                 FakeResult(one={"inserted": True}),
+                FakeResult(one={"finalized": True}),
             ],
         )
 
@@ -354,15 +593,15 @@ class SnapshotterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             marker_path = Path(temp_dir) / "health"
-            with self.assertRaisesRegex(RuntimeError, "acknowledgement"):
-                snapshotter.run_cycle(
-                    configured,
-                    connector=connector,
-                    health_marker_path=marker_path,
-                    monotonic_ns=lambda: 99,
-                )
+            processed = snapshotter.run_cycle(
+                configured,
+                connector=connector,
+                health_marker_path=marker_path,
+                monotonic_ns=lambda: 99,
+            )
 
-            self.assertFalse(marker_path.exists())
+            self.assertEqual(processed, 1)
+            self.assertEqual(marker_path.read_text(encoding="ascii"), "99\n")
 
     def test_health_marker_rejects_missing_stale_future_and_malformed_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

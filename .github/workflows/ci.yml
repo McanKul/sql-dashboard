@@ -89,6 +89,7 @@ jobs:
           python -m unittest deployment/join-snapshotter/test_snapshotter.py -v
           (cd deployment/workload && python -m unittest test_workload.py -v)
           python -m unittest deployment/postgres/test_reconcile_roles.py -v
+          python -m unittest scripts/test_erp_stack_benchmark.py -v
 
       - name: Validate shell syntax
         shell: bash

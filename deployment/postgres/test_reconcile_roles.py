@@ -115,6 +115,8 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
         self.assertIn("'rolvaliduntil', auth.rolvaliduntil", capture_after_first)
         self.assertIn("\\getenv api_password ADVISOR_API_PASSWORD", capture_after_first)
         self.assertIn("-c pg_stat_statements.track=none", capture_after_first)
+        self.assertIn('policy_revision="3"', SCRIPT.read_text())
+        self.assertIn("advisor-role-reconciler-policy-v${policy_revision}", SCRIPT.read_text())
         self.assertIn("app=advisor-role-reconciler", capture_after_first)
         self.assertIn("SET LOCAL log_statement = 'none'", capture_after_first)
         self.assertIn("SET LOCAL log_min_error_statement = 'panic'", capture_after_first)
@@ -262,6 +264,39 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
             capture,
         )
         self.assertIn("ALTER ROLE advisor_workload_login RESET ALL", capture)
+        self.assertGreaterEqual(
+            capture.count(
+                "ALTER ROLE powa_collector SET pg_stat_statements.track = 'none'"
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            capture.count("ALTER ROLE powa_collector SET pg_stat_kcache.track = 'none'"),
+            2,
+        )
+        self.assertGreaterEqual(
+            capture.count("ALTER ROLE powa_collector SET pg_qualstats.enabled = off"),
+            2,
+        )
+        for observer_role in ("advisor_evaluator", "advisor_join_reader"):
+            self.assertGreaterEqual(
+                capture.count(
+                    f"ALTER ROLE {observer_role} SET pg_stat_statements.track = 'none'"
+                ),
+                2,
+            )
+            self.assertGreaterEqual(
+                capture.count(
+                    f"ALTER ROLE {observer_role} SET pg_stat_kcache.track = 'none'"
+                ),
+                2,
+            )
+            self.assertGreaterEqual(
+                capture.count(
+                    f"ALTER ROLE {observer_role} SET pg_qualstats.enabled = off"
+                ),
+                2,
+            )
         self.assertIn(
             "ALTER ROLE clone_runner LOGIN NOINHERIT NOSUPERUSER NOCREATEDB "
             "NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4",

@@ -144,6 +144,32 @@ def test_api_repository_may_use_standard_postgres_port() -> None:
     assert connection["dbname"] == "appdb"
 
 
+def test_query_list_cache_defaults_match_collector_cadence_and_are_bounded() -> None:
+    settings = Settings()
+
+    assert settings.query_list_cache_fresh_seconds == 60
+    assert settings.query_list_cache_stale_seconds == 300
+    assert settings.query_list_cache_max_entries == 4
+    assert settings.query_list_cache_max_rows == 100_000
+    assert settings.query_list_cache_max_bytes == 64 * 1024 * 1024
+
+
+def test_query_list_cache_rejects_an_unbounded_or_inverted_window() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            query_list_cache_fresh_seconds=301,
+            query_list_cache_stale_seconds=300,
+        )
+    with pytest.raises(ValidationError):
+        Settings(query_list_cache_max_entries=5)
+    with pytest.raises(ValidationError):
+        Settings(query_list_cache_max_entries=0)
+    with pytest.raises(ValidationError):
+        Settings(query_list_cache_max_rows=1_000_001)
+    with pytest.raises(ValidationError):
+        Settings(query_list_cache_max_bytes=1024 * 1024 - 1)
+
+
 def test_evaluator_builds_safe_conninfo_from_separate_fields() -> None:
     settings = EvaluatorSettings(
         evaluator_database_url=None,

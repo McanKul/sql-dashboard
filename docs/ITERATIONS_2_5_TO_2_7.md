@@ -20,23 +20,61 @@ PoWA remote snapshot transaction
        3. aynı transaction içinde pg_qualstats_reset() çağrılır
 
 join-snapshotter
-  -> source advisor_join.fetch_batches()
-  -> repository advisor_ingest.ingest_join_batch()
-  -> repository commit başarılıysa source advisor_join.ack_batch()
+  -> source advisor_join.list_batch_headers() (bounded, payload içermez)
+  -> source advisor_join.fetch_batch_chunk() (tek seferde <=10.000 satır / <=8 MiB)
+  -> repository advisor_ingest.ingest_join_chunk() (idempotent staging)
+  -> bütün parçalar tam ve bitişikse advisor_ingest.finalize_join_batch()
+  -> repository finalize commit başarılıysa source advisor_join.ack_batch()
 ```
 
-Repository hatasında source batch silinmez. Repository commitinden sonra process çökerse aynı batch tekrar gelir; `(server_id, batch_id)` anahtarı duplicate ingest'i etkisiz yapar ve batch daha sonra ack edilir. Outbox terk edilirse source tarafında yedi günlük üst sınır, repository tarafında varsayılan 30 günlük retention uygulanır.
+Capture/reset hâlâ tek atomik source transaction'ıdır; transport parçalama bu
+sınırı değiştirmez. Repository hatasında source batch silinmez. Her parça
+`server_id + batch_id + chunk_no` ve SHA-256 payload kimliğiyle idempotenttir.
+Kısmi parçalar public evidence tablolarında görünmez. Finalize sonrasında process
+çökerse parçalar tekrar no-op teslim edilir ve source batch daha sonra ack edilir.
+Bir snapshot ne kadar büyük olursa olsun snapshotter belleğinde aynı anda yalnız
+bir parça tutulur. Header listesi içindeki her batch ayrı hata sınırıdır: bozuk
+veya geçici olarak başarısız bir batch ack edilmeden source'da kalırken aynı
+bounded cycle'daki sonraki batch'ler ilerleyebilir. Source hiçbir ack edilmemiş
+batch'i zamana bağlı olarak sessizce silmez; outbox yaşı/boyutu izlenmeli ve kök
+neden giderilmelidir. Repository'de finalize edilmiş tarihçe ve terk edilmiş
+private staging için varsayılan 30 günlük retention uygulanır.
+
+`pg_qualstats` tek reset sınırında final repository doğal anahtarı aynı olan
+birden çok ham kayıt döndürebilir. Bu kayıtlar staging'de ham
+`chunk_no + row_in_chunk` konumlarıyla ayrı tutulur; transport completeness ve
+batch `row_count` hesabı bu ham sayı üzerinden yapılır. Yalnız atomik finalize
+aşamasında aynı doğal anahtar bir satıra indirilir, üç sayaç toplanır ve diğer
+metadata alanları kararlı minimum/boolean birleşimiyle seçilir. Sayısal taşma
+veya final insert cardinality farkı tüm finalize işlemini fail-closed geri alır;
+source batch ack edilmeden yeniden denenebilir kalır.
+
+Source'un güvenliği veri kaybını sessizce kabul etmeye bırakılmaz. Her
+`capture_and_reset()` çağrısının ilk adımı ack'siz outbox için üç strict decimal
+GUC'u doğrular ve ölçer: `advisor_join.max_outbox_rows` (varsayılan `1000000`),
+`advisor_join.max_outbox_bytes` (varsayılan `1073741824`) ve
+`advisor_join.max_outbox_age_seconds` (varsayılan `300`). Bir eşik dolduğunda
+fonksiyon SQLSTATE `54000` ile pending batch/satır/boyut/yaş ayrıntısını verir;
+o transaction yeni outbox satırı yazmaz ve `pg_qualstats_reset()` çağırmaz.
+Repository'deki collector errors alanı dolduğu için ürün health'i `DEGRADED`
+olur. Snapshotter mevcut batch'leri finalize edip source'da ack ettiğinde canlı
+kuyruk sıfırlanır ve sonraki collector turu ek bakım gerektirmeden ilerler.
 
 Roller birbirinden ayrıdır:
 
 | Rol | Erişim |
 |---|---|
 | `powa_collector` | `capture_and_reset()`; doğrudan reset yetkisi kaldırılır |
-| `advisor_join_reader` | Source `fetch_batches()` ve `ack_batch()` |
-| `advisor_join_ingest` | Yalnız bağlandığı source için repository ingest/status/source-retention wrapper'ları |
+| `advisor_join_reader` | Source header list/chunk fetch, eski istemci için `fetch_batches()` ve `ack_batch()` |
+| `advisor_join_ingest` | Yalnız bağlandığı source için chunk ingest/finalize, status ve source-retention wrapper'ları |
 | `advisor_api` | Yalnız public adapter fonksiyonları; private ingest şemasına erişemez |
 
 Local Compose iki farklı parola kullanır: `ADVISOR_JOIN_SOURCE_PASSWORD` ve `ADVISOR_JOIN_REPOSITORY_PASSWORD`. Repository login'i `JOIN_SOURCE_ALIAS` ile eşleşen tek `PoWA.powa_servers` kaydına `session_user` üzerinden bağlanır; request içindeki başka bir alias ingest, error ve purge çağrılarında fail-closed reddedilir. Global purge yalnız repository DBA bakım işidir. Her dış kaynak ayrı repository login/binding ve ayrı snapshotter deployment'ı kullanmalıdır. Üretimde parolaları collector/API/DBA parolalarıyla paylaşmayın. Snapshotter DSN'leri `_FILE` environment varyantlarıyla secret mounttan da okunabilir; DSN ve row payload loglanmaz.
+
+Chunk üst sınırları protokol sabitidir; iki uç farklı environment değerleriyle
+ayrışamaz. `JOIN_BATCH_LIMIT` aynı anda tutulan payload sayısı değil, tek cycle'da
+tamamlanacak source batch sayısıdır. Compose daemon için varsayılan 256 MiB memory
+envelope kullanır; her fetch yalnız bir en fazla 8 MiB JSONB parçayı materialize eder.
 
 ## 2.6 aday kuralları
 

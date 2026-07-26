@@ -29,6 +29,18 @@ else
   fatal "Workload JSON ve API yanitlarini dogrulamak icin Python 3 gerekli"
 fi
 
+# Keep the post-load database counter probe bounded even when the repository
+# host is temporarily CPU-starved.  This is a fail-closed execution guard, not
+# a relaxed metric threshold: PostgreSQL cancels the read-only statement and
+# the verifier fails if the probe cannot finish inside the configured window.
+database_metrics_timeout_seconds="${REALISTIC_DATABASE_METRICS_TIMEOUT_SECONDS:-30}"
+if ! [[ "$database_metrics_timeout_seconds" =~ ^[0-9]+$ ]] \
+   || ! (( database_metrics_timeout_seconds >= 5 \
+           && database_metrics_timeout_seconds <= 120 )); then
+  fatal "REALISTIC_DATABASE_METRICS_TIMEOUT_SECONDS 5-120 arasinda olmali"
+fi
+database_metrics_timeout_ms=$((database_metrics_timeout_seconds * 1000))
+
 command -v docker >/dev/null 2>&1 || fatal "docker bulunamadi"
 docker info >/dev/null 2>&1 || fatal "Docker daemon calismiyor"
 
@@ -107,6 +119,16 @@ repository_sql() {
       --command "$1"
 }
 
+repository_sql_bounded_database_metrics() {
+  local statement="$1"
+  docker exec \
+    --env "PGOPTIONS=-c statement_timeout=${database_metrics_timeout_ms}ms -c application_name=advisor-realistic-database-metric-verifier" \
+    "$repository_container" \
+    psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+      --dbname powa_repository --quiet --tuples-only --no-align --field-separator='|' \
+      --command "$statement"
+}
+
 source_alias="$(docker exec "$repository_container" printenv JOIN_SOURCE_ALIAS 2>/dev/null || true)"
 source_alias="${source_alias:-test-source}"
 [[ "$source_alias" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$ ]] \
@@ -129,7 +151,7 @@ if [[ -n "$workload_log" ]]; then
   [[ -f "$workload_log" && -r "$workload_log" ]] \
     || fatal "Workload log okunamiyor: ${workload_log}"
 
-  report_state="$($python_bin - "$workload_log" "${REALISTIC_MAX_ERROR_RATE:-0.01}" "${REALISTIC_MIN_ATTEMPTS:-100}" "${REALISTIC_MIN_OPERATIONS:-17}" <<'PY'
+  report_state="$($python_bin - "$workload_log" "${REALISTIC_MAX_ERROR_RATE:-0.01}" "${REALISTIC_MIN_ATTEMPTS:-100}" "${REALISTIC_MIN_OPERATIONS:-17}" "${REALISTIC_MAX_OPERATION_ERROR_RATE:-0.05}" <<'PY'
 import json
 import datetime as dt
 import math
@@ -137,12 +159,15 @@ import pathlib
 import re
 import sys
 
-path, max_error_rate, min_attempts, min_operations = sys.argv[1:]
+path, max_error_rate, min_attempts, min_operations, max_operation_error_rate = sys.argv[1:]
 max_error_rate = float(max_error_rate)
 min_attempts = int(min_attempts)
 min_operations = int(min_operations)
+max_operation_error_rate = float(max_operation_error_rate)
 if not math.isfinite(max_error_rate) or not 0 <= max_error_rate <= 1:
     raise SystemExit("REALISTIC_MAX_ERROR_RATE 0..1 arasinda olmali")
+if not math.isfinite(max_operation_error_rate) or not 0 <= max_operation_error_rate <= 1:
+    raise SystemExit("REALISTIC_MAX_OPERATION_ERROR_RATE 0..1 arasinda olmali")
 
 final = None
 with open(path, encoding="utf-8", errors="replace") as handle:
@@ -162,7 +187,7 @@ if final is None:
 if final.get("status") != "completed":
     raise SystemExit(f"workload status completed degil: {final.get('status')!r}")
 profile = final.get("profile")
-if profile not in {"quick", "normal", "stress"}:
+if profile not in {"quick", "normal", "stress", "erp"}:
     raise SystemExit(f"gecersiz workload profile: {profile!r}")
 
 totals = final.get("totals")
@@ -190,6 +215,22 @@ if error_rate > max_error_rate:
 connection_errors = totals.get("connectionErrors")
 if not isinstance(connection_errors, int) or connection_errors != 0:
     raise SystemExit(f"connectionErrors sifir degil: {connection_errors!r}")
+errors_by_sqlstate = totals.get("errorsBySqlstate")
+if not isinstance(errors_by_sqlstate, dict):
+    raise SystemExit("errorsBySqlstate nesnesi yok")
+if any(
+    not isinstance(key, str)
+    or re.fullmatch(r"(?:[0-9A-Z]{5}|UNKNOWN)", key) is None
+    or not isinstance(value, int)
+    or isinstance(value, bool)
+    or value < 1
+    for key, value in errors_by_sqlstate.items()
+):
+    raise SystemExit(f"errorsBySqlstate gecersiz: {errors_by_sqlstate!r}")
+if sum(errors_by_sqlstate.values()) != failed:
+    raise SystemExit(
+        f"errorsBySqlstate toplami failed ile tutarsiz: {errors_by_sqlstate!r}"
+    )
 
 duration = final.get("durationSeconds")
 elapsed = final.get("elapsedSeconds")
@@ -235,7 +276,7 @@ else:
     # elapsedSeconds. Arbitrary filenames fail closed instead of silently
     # falling back to a rolling repository window.
     match = re.fullmatch(
-        r"(\d{8}T\d{6}Z)-(quick|normal|stress)\.log",
+        r"(\d{8}T\d{6}Z)-(quick|normal|stress|erp)\.log",
         pathlib.Path(path).name,
     )
     if match is None or match.group(2) != profile:
@@ -276,6 +317,8 @@ if (
 
 categories = final.get("categories")
 required_categories = {"read", "join", "cpu", "temp", "write", "lock"}
+if profile == "erp":
+    required_categories.add("erp")
 if not isinstance(categories, dict) or not required_categories.issubset(categories):
     raise SystemExit(f"workload kategori karmasi eksik: {sorted(categories) if isinstance(categories, dict) else []}")
 category_totals = {"attempted": 0, "succeeded": 0, "failed": 0}
@@ -317,12 +360,14 @@ required_operations = {
     "write-event",
     "write-mutation",
 }
+if profile == "erp":
+    required_operations.update({"erp-query-reader", "erp-query-reporter"})
 missing_operations = sorted(required_operations.difference(operations))
 if missing_operations:
     raise SystemExit(f"beklenen workload operasyonlari eksik: {missing_operations}")
 sql_template_count = final.get("sqlTemplateCount")
-if not isinstance(sql_template_count, int) or isinstance(sql_template_count, bool) or sql_template_count < 27:
-    raise SystemExit(f"SQL template kapsami yetersiz: {sql_template_count!r}, minimum=27")
+if not isinstance(sql_template_count, int) or isinstance(sql_template_count, bool) or sql_template_count < 28:
+    raise SystemExit(f"SQL template kapsami yetersiz: {sql_template_count!r}, minimum=28")
 fingerprints = []
 operation_totals = {"attempted": 0, "succeeded": 0, "failed": 0}
 for operation_name, operation in operations.items():
@@ -335,6 +380,12 @@ for operation_name, operation in operations.items():
         raise SystemExit(f"operation calismadi: {operation_name}")
     if operation_counts[0] != operation_counts[1] + operation_counts[2]:
         raise SystemExit(f"operation sayaclari tutarsiz: {operation_name}")
+    operation_error_rate = operation_counts[2] / operation_counts[0]
+    if operation_error_rate > max_operation_error_rate:
+        raise SystemExit(
+            f"operation errorRate siniri asti: {operation_name}="
+            f"{operation_error_rate:.6f}, maksimum={max_operation_error_rate:.6f}"
+        )
     for key in operation_totals:
         operation_totals[key] += int(operation[key])
     operation_fingerprints = operation.get("fingerprints")
@@ -358,6 +409,44 @@ if len(unique_fingerprints) < min_operations:
 if operation_totals != {"attempted": attempted, "succeeded": succeeded, "failed": failed}:
     raise SystemExit(f"operation toplamlari totals ile tutarsiz: {operation_totals}")
 
+erp_table_count = final.get("erpTableCount", 0)
+erp_rows_per_table = final.get("erpRowsPerTable", 0)
+erp_variants = final.get("erpQueryVariantsPerTable", 0)
+erp_target = final.get("erpFingerprintTarget", 0)
+erp_visited = final.get("erpVisitedFingerprintCount", 0)
+erp_coverage = final.get("erpFingerprintCoveragePercent", 0.0)
+erp_integer_fields = (
+    erp_table_count,
+    erp_rows_per_table,
+    erp_variants,
+    erp_target,
+    erp_visited,
+)
+if not all(isinstance(value, int) and not isinstance(value, bool) for value in erp_integer_fields):
+    raise SystemExit("ERP final JSON sayaclari tam sayi degil")
+if not isinstance(erp_coverage, (int, float)) or isinstance(erp_coverage, bool) or not math.isfinite(float(erp_coverage)):
+    raise SystemExit("ERP fingerprint coverage sonlu bir sayi degil")
+if profile == "erp":
+    if (erp_table_count, erp_rows_per_table, erp_variants) != (500, 2000, 8):
+        raise SystemExit(
+            "ERP profil kontrati gecersiz: "
+            f"tables={erp_table_count}, rows={erp_rows_per_table}, variants={erp_variants}"
+        )
+    if erp_target != erp_table_count * erp_variants or erp_target != 4000:
+        raise SystemExit(f"ERP fingerprint target gecersiz: {erp_target}")
+    if erp_visited != erp_target:
+        raise SystemExit(
+            f"ERP fingerprint sweep tamamlanmadi: visited={erp_visited}, target={erp_target}"
+        )
+    calculated_coverage = erp_visited * 100.0 / erp_target
+    if not math.isclose(float(erp_coverage), calculated_coverage, rel_tol=1e-6, abs_tol=0.001):
+        raise SystemExit(
+            f"ERP fingerprint coverage tutarsiz: json={erp_coverage}, hesap={calculated_coverage}"
+        )
+else:
+    if erp_table_count != 0 or erp_target != 0 or erp_visited != 0 or float(erp_coverage) != 0.0:
+        raise SystemExit("ERP olmayan profil beklenmeyen ERP kapsami raporladi")
+
 database_delta = final.get("databaseDelta")
 if not isinstance(database_delta, dict):
     raise SystemExit("databaseDelta nesnesi yok")
@@ -376,19 +465,25 @@ print(
     f"{profile}|{attempted}|{succeeded}|{failed}|{error_rate:.8f}|"
     f"{len(unique_fingerprints)}|{int(database_delta.get('tempBytes') or 0)}|"
     f"{int(database_delta.get('walBytes') or 0)}|{started_at_text}|"
-    f"{finished_at_text}|{window_source}"
+    f"{finished_at_text}|{window_source}|{erp_table_count}|{erp_rows_per_table}|"
+    f"{erp_variants}|{erp_target}|{erp_visited}|{float(erp_coverage):.6f}"
 )
 PY
 )" || fatal "Workload final JSON kabul edilmedi: ${report_state:-ayrinti yukarida}"
 
   IFS='|' read -r accepted_profile report_attempted report_succeeded report_failed \
     report_error_rate report_fingerprint_count report_temp_bytes report_wal_bytes \
-    run_started_at run_finished_at run_window_source \
+    run_started_at run_finished_at run_window_source report_erp_tables \
+    report_erp_rows_per_table report_erp_variants report_erp_target \
+    report_erp_visited report_erp_coverage \
     <<<"$report_state"
   report_profile="$accepted_profile"
   pass "Final JSON: profile=${accepted_profile}, attempted=${report_attempted}, succeeded=${report_succeeded}, failed=${report_failed}, errorRate=${report_error_rate}, fingerprints=${report_fingerprint_count}"
   pass "Final JSON DB deltasi: temp=${report_temp_bytes} byte, WAL=${report_wal_bytes} byte, deadlock=0, stats-reset=false"
   pass "Current-run UTC penceresi: ${run_started_at} .. ${run_finished_at} (${run_window_source})"
+  if [[ "$accepted_profile" == "erp" ]]; then
+    pass "ERP final JSON: tables=${report_erp_tables}, rowsPerTable=${report_erp_rows_per_table}, variants=${report_erp_variants}, target=${report_erp_target}, visited=${report_erp_visited}, coverage=${report_erp_coverage}%"
+  fi
 else
   fatal "Current-run telemetry kabulunde workload log zorunlu"
 fi
@@ -430,8 +525,61 @@ done
   || fatal "Workload bitisinden sonraki ilk tagged repository snapshot'i bulunamadi"
 pass "Current-run telemetry snapshot siniri: ${telemetry_finished_at} (maxLag=${telemetry_max_lag}s)"
 
+# powa_take_snapshot() uses the repository transaction timestamp, while the
+# source-side pg_qualstats query_cleanup records its JOIN captured_at a little
+# later in the same collector snapshot.  Select that exact batch separately;
+# using telemetry_finished_at directly used to exclude a legitimate +120ms
+# capture.  The matcher accepts one batch only inside a window that ends before
+# either a scheduled successor or PoWA's next allowed forced snapshot.  A
+# missing/ambiguous match therefore fails closed instead of admitting a random
+# future batch.
+join_boundary_status="WAIT"
+join_finished_batch_id=""
+join_telemetry_finished_at=""
+join_boundary_skew=""
+join_match_window=""
+for join_boundary_attempt in $(seq 1 20); do
+  join_boundary_rows="$(repository_sql "
+SELECT
+  batch_id,
+  to_char(captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+FROM advisor_ingest.join_snapshot_batches
+WHERE server_id=${server_id}
+  AND captured_at >= '${telemetry_finished_at}'::timestamptz
+ORDER BY captured_at, batch_id
+LIMIT 2;")"
+  if ! join_boundary_selection="$(
+    printf '%s\n' "$join_boundary_rows" \
+      | "$python_bin" scripts/realistic_join_boundary.py \
+          "$telemetry_finished_at" "$source_frequency"
+  )"; then
+    fatal "JOIN telemetry batch eslestiricisi calismadi"
+  fi
+  IFS='|' read -r join_boundary_status join_finished_batch_id \
+    join_telemetry_finished_at join_boundary_skew join_match_window \
+    <<<"$join_boundary_selection"
+  case "$join_boundary_status" in
+    MATCH) break ;;
+    AMBIGUOUS)
+      fatal "Ayni forced snapshot icin birden fazla JOIN batch adayi bulundu (window=${join_match_window}s)"
+      ;;
+    WAIT)
+      (( join_boundary_attempt == 20 )) || sleep 2
+      ;;
+    *) fatal "JOIN telemetry batch eslestiricisi gecersiz durum dondurdu" ;;
+  esac
+done
+[[ "$join_boundary_status" == "MATCH" \
+   && "$join_finished_batch_id" =~ ^[1-9][0-9]*$ \
+   && "$join_telemetry_finished_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$ \
+   && "$join_boundary_skew" =~ ^[0-9]+([.][0-9]+)?$ \
+   && "$join_match_window" =~ ^[1-9][0-9]*$ ]] \
+  || fatal "Forced snapshot ile eslesen JOIN telemetry batch'i bulunamadi"
+pass "Current-run JOIN telemetry siniri: batch=${join_finished_batch_id}, capturedAt=${join_telemetry_finished_at}, skew=${join_boundary_skew}s, matchWindow=${join_match_window}s"
+
 manifest_state="$(source_sql "
 SELECT
+  schema_version,
   status,
   profile,
   NOT EXISTS (
@@ -456,6 +604,8 @@ SELECT
   target_counts ->> 'workload_payments',
   target_counts ->> 'workload_jobs',
   target_counts ->> 'advisor_workload_hotspots',
+  target_counts ->> 'advisor_erp_tables',
+  target_counts ->> 'advisor_erp_rows',
   actual_counts ->> 'customers',
   actual_counts ->> 'orders',
   actual_counts ->> 'order_items',
@@ -466,15 +616,21 @@ SELECT
   actual_counts ->> 'workload_inventory',
   actual_counts ->> 'workload_payments',
   actual_counts ->> 'workload_jobs',
-  actual_counts ->> 'advisor_workload_hotspots'
+  actual_counts ->> 'advisor_workload_hotspots',
+  actual_counts ->> 'advisor_erp_tables',
+  actual_counts ->> 'advisor_erp_rows'
 FROM public.advisor_workload_seed_manifest
 WHERE seed_key='active';")" || fatal "Seeder manifest'i okunamadi; once prepare-realistic-workload calistirin"
-IFS='|' read -r manifest_status manifest_profile manifest_counts_ready \
+IFS='|' read -r manifest_schema_version manifest_status manifest_profile manifest_counts_ready \
   manifest_customers manifest_orders manifest_items manifest_events manifest_tenants \
   manifest_customer_tenants manifest_products manifest_inventory manifest_payments \
-  manifest_jobs manifest_hotspots customers_count orders_count items_count events_count \
+  manifest_jobs manifest_hotspots manifest_erp_tables manifest_erp_rows \
+  customers_count orders_count items_count events_count \
   tenants_count customer_tenants_count products_count inventory_count payments_count \
-  jobs_count hotspots_count <<<"$manifest_state"
+  jobs_count hotspots_count erp_tables_count erp_rows_count <<<"$manifest_state"
+if ! [[ "$manifest_schema_version" =~ ^[0-9]+$ && "$manifest_schema_version" -ge 2 ]]; then
+  fatal "Seeder manifest schema version ERP icin guncel degil: ${manifest_schema_version:-yok}"
+fi
 if [[ "$manifest_status" != "READY" || "$manifest_counts_ready" != "t" ]]; then
   fatal "Seeder manifest READY/target-complete degil: status=${manifest_status:-yok}, countsReady=${manifest_counts_ready:-yok}"
 fi
@@ -513,6 +669,22 @@ case "$accepted_profile" in
     default_hotspots=64
     default_database_bytes=$((256 * 1024 * 1024))
     ;;
+  erp)
+    default_customers=100000
+    default_orders=1000000
+    default_items=4000000
+    default_events=6000000
+    default_tenants=1000
+    default_customer_tenants=$default_customers
+    default_products=100000
+    default_inventory=200000
+    default_payments=800000
+    default_jobs=100000
+    default_hotspots=64
+    default_erp_tables=500
+    default_erp_rows=1000000
+    default_database_bytes=$((512 * 1024 * 1024))
+    ;;
   stress)
     default_customers=250000
     default_orders=3000000
@@ -530,6 +702,11 @@ case "$accepted_profile" in
   *) fatal "Gecersiz realistic profile: ${accepted_profile}" ;;
 esac
 
+if [[ "$accepted_profile" != "erp" ]]; then
+  default_erp_tables=0
+  default_erp_rows=0
+fi
+
 min_customers="${REALISTIC_MIN_CUSTOMERS:-${manifest_customers:-$default_customers}}"
 min_orders="${REALISTIC_MIN_ORDERS:-${manifest_orders:-$default_orders}}"
 min_items="${REALISTIC_MIN_ORDER_ITEMS:-${manifest_items:-$default_items}}"
@@ -541,6 +718,8 @@ min_inventory="${REALISTIC_MIN_INVENTORY:-${manifest_inventory:-$default_invento
 min_payments="${REALISTIC_MIN_PAYMENTS:-${manifest_payments:-$default_payments}}"
 min_jobs="${REALISTIC_MIN_JOBS:-${manifest_jobs:-$default_jobs}}"
 min_hotspots="${REALISTIC_MIN_HOTSPOTS:-${manifest_hotspots:-$default_hotspots}}"
+min_erp_tables="${REALISTIC_MIN_ERP_TABLES:-${manifest_erp_tables:-$default_erp_tables}}"
+min_erp_rows="${REALISTIC_MIN_ERP_ROWS:-${manifest_erp_rows:-$default_erp_rows}}"
 min_database_bytes="${REALISTIC_MIN_DATABASE_BYTES:-$default_database_bytes}"
 
 database_bytes="$(source_sql "SELECT pg_database_size(current_database());")" \
@@ -557,6 +736,18 @@ check_minimum() {
   fi
 }
 
+check_exact() {
+  local label="$1"
+  local actual="$2"
+  local expected="$3"
+  if [[ "$actual" =~ ^[0-9]+$ && "$expected" =~ ^[0-9]+$ ]] \
+     && (( actual == expected )); then
+    pass "${label}: ${actual} (tam hedef ${expected})"
+  else
+    reject "${label} uyusmuyor: ${actual:-okunamadi} (tam hedef ${expected})"
+  fi
+}
+
 check_minimum customers "$customers_count" "$min_customers"
 check_minimum orders "$orders_count" "$min_orders"
 check_minimum order_items "$items_count" "$min_items"
@@ -568,7 +759,37 @@ check_minimum workload_inventory "$inventory_count" "$min_inventory"
 check_minimum workload_payments "$payments_count" "$min_payments"
 check_minimum workload_jobs "$jobs_count" "$min_jobs"
 check_minimum advisor_workload_hotspots "$hotspots_count" "$min_hotspots"
+check_minimum advisor_erp_tables "$erp_tables_count" "$min_erp_tables"
+check_minimum advisor_erp_rows "$erp_rows_count" "$min_erp_rows"
 check_minimum "appdb byte hacmi" "$database_bytes" "$min_database_bytes"
+
+event_cleanup_index_count="$(source_sql "
+SELECT count(*)
+FROM pg_class AS index_relation
+JOIN pg_namespace AS namespace ON namespace.oid=index_relation.relnamespace
+JOIN pg_index AS index_record ON index_record.indexrelid=index_relation.oid
+JOIN pg_am AS access_method ON access_method.oid=index_relation.relam
+WHERE namespace.nspname='public'
+  AND index_relation.relname='idx_events_advisor_realistic_id_desc'
+  AND index_record.indrelid='public.events'::regclass
+  AND index_record.indisvalid
+  AND index_record.indisready
+  AND index_record.indislive
+  AND NOT index_record.indisunique
+  AND NOT index_record.indisprimary
+  AND NOT index_record.indisexclusion
+  AND access_method.amname='btree'
+  AND index_record.indnkeyatts=1
+  AND index_record.indnatts=1
+  AND pg_get_indexdef(index_record.indexrelid, 1, true)='id'
+  AND index_record.indoption::text='3'
+  AND pg_get_expr(index_record.indpred, index_record.indrelid, true)
+        = '(metadata ->> ''source''::text) = ''advisor-realistic''::text';")"
+if [[ "$event_cleanup_index_count" == "1" ]]; then
+  pass "Event retention cleanup exact partial DESC indeksini kullaniyor"
+else
+  reject "Event retention cleanup indeksi eksik veya tanimi bozuk"
+fi
 
 role_and_stats_state="$(source_sql "
 WITH expected_roles(role_name) AS (
@@ -602,6 +823,7 @@ SELECT
     LEFT JOIN pg_stat_user_tables stats
       ON stats.schemaname='public' AND stats.relname=target.table_name
     WHERE manifest.seed_key='active'
+      AND target.table_name NOT IN ('advisor_erp_tables', 'advisor_erp_rows')
       AND (stats.relname IS NULL OR stats.n_live_tup < target.target_count::bigint * 0.95)
   );")"
 IFS='|' read -r role_count nologin_count settable_count login_secure stats_access \
@@ -625,6 +847,133 @@ if [[ "$invalid_fk_count" == "0" ]]; then
   pass "Public foreign key constraint'lerinin tamami validated"
 else
   reject "Validated olmayan foreign key bulundu: ${invalid_fk_count}"
+fi
+
+if [[ "$accepted_profile" == "erp" ]]; then
+  # Catalog estimates are a cheap health signal, but the ERP fixture is an
+  # exact scale contract. Count every managed table directly so stale ANALYZE
+  # estimates or cached manifest values cannot make a partial seed look ready.
+  erp_exact_rows_state="$(source_sql "
+CREATE TEMP TABLE advisor_erp_exact_counts (
+  table_name text PRIMARY KEY,
+  row_count bigint NOT NULL
+) ON COMMIT DROP;
+DO \$verify\$
+DECLARE
+  managed_table record;
+BEGIN
+  FOR managed_table IN
+    SELECT relation.relname
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+    WHERE namespace.nspname='advisor_erp'
+      AND relation.relkind='r'
+      AND relation.relname ~ '^erp_entity_[0-9]{4}$'
+    ORDER BY relation.relname
+  LOOP
+    EXECUTE format(
+      'INSERT INTO pg_temp.advisor_erp_exact_counts (table_name, row_count) '
+      'SELECT %L, count(*) FROM %I.%I',
+      managed_table.relname, 'advisor_erp', managed_table.relname
+    );
+  END LOOP;
+END
+\$verify\$;
+SELECT
+  count(*),
+  coalesce(sum(row_count), 0),
+  count(*) FILTER (WHERE row_count <> 2000)
+FROM pg_temp.advisor_erp_exact_counts;")"
+  IFS='|' read -r erp_exact_tables erp_exact_rows erp_row_mismatches \
+    <<<"$erp_exact_rows_state"
+  if [[ "$erp_exact_tables|$erp_exact_rows|$erp_row_mismatches" == "500|1000000|0" ]]; then
+    pass "ERP exact fiziksel veri kapsami: 500 tablo x 2000 satir = 1000000"
+  else
+    reject "ERP exact satir kapsami bozuk: tables=${erp_exact_tables}, rows=${erp_exact_rows}, mismatches=${erp_row_mismatches}"
+  fi
+
+  erp_catalog_state="$(source_sql "
+WITH managed_tables AS (
+  SELECT relation.oid, relation.relname
+  FROM pg_class AS relation
+  JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+  WHERE namespace.nspname='advisor_erp'
+    AND relation.relkind='r'
+    AND relation.relname ~ '^erp_entity_[0-9]{4}$'
+)
+SELECT
+  (SELECT count(*) FROM managed_tables),
+  (SELECT count(*) FROM pg_index AS index_record JOIN managed_tables ON managed_tables.oid=index_record.indrelid),
+  (SELECT count(*) FROM pg_index AS index_record JOIN managed_tables ON managed_tables.oid=index_record.indrelid
+    WHERE index_record.indisvalid AND index_record.indisready AND index_record.indislive),
+  (SELECT count(*)
+   FROM managed_tables
+   JOIN pg_class AS index_relation
+     ON index_relation.relnamespace='advisor_erp'::regnamespace
+    AND index_relation.relname='idx_' || managed_tables.relname || '_tenant_state_time'
+   JOIN pg_index AS index_record
+     ON index_record.indexrelid=index_relation.oid
+    AND index_record.indrelid=managed_tables.oid
+   JOIN pg_am AS access_method ON access_method.oid=index_relation.relam
+   WHERE index_record.indisvalid
+     AND index_record.indisready
+     AND index_record.indislive
+     AND NOT index_record.indisunique
+     AND NOT index_record.indisprimary
+     AND NOT index_record.indisexclusion
+     AND access_method.amname='btree'
+     AND index_record.indnkeyatts=3
+     AND index_record.indnatts=3
+     AND index_record.indpred IS NULL
+     AND pg_get_indexdef(index_record.indexrelid, 1, true)='tenant_id'
+     AND pg_get_indexdef(index_record.indexrelid, 2, true)='status_code'
+     AND pg_get_indexdef(index_record.indexrelid, 3, true)='updated_at'
+     AND index_record.indoption::text='0 0 3'),
+  (SELECT count(*)
+   FROM pg_index AS index_record
+   JOIN managed_tables ON managed_tables.oid=index_record.indrelid
+   WHERE index_record.indisprimary
+     AND index_record.indisunique
+     AND index_record.indisvalid
+     AND index_record.indisready
+     AND index_record.indislive
+     AND index_record.indnkeyatts=1
+     AND index_record.indnatts=1
+     AND index_record.indpred IS NULL
+     AND pg_get_indexdef(index_record.indexrelid, 1, true)='id'),
+  (SELECT count(*) FROM pg_stat_user_tables AS stats JOIN managed_tables ON managed_tables.oid=stats.relid
+    WHERE stats.n_live_tup >= 1900 AND coalesce(stats.last_analyze, stats.last_autoanalyze) IS NOT NULL),
+  has_schema_privilege('advisor_workload_reader', 'advisor_erp', 'USAGE'),
+  has_schema_privilege('advisor_workload_reporter', 'advisor_erp', 'USAGE'),
+  has_schema_privilege('advisor_workload_writer', 'advisor_erp', 'USAGE'),
+  coalesce((SELECT bool_and(has_table_privilege('advisor_workload_reader', oid, 'SELECT')) FROM managed_tables), false),
+  coalesce((SELECT bool_and(has_table_privilege('advisor_workload_reporter', oid, 'SELECT')) FROM managed_tables), false),
+  coalesce((SELECT bool_or(has_table_privilege('advisor_workload_reader', oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
+  coalesce((SELECT bool_or(has_table_privilege('advisor_workload_reporter', oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
+  coalesce((SELECT bool_or(has_table_privilege('advisor_workload_writer', oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
+  EXISTS (
+    SELECT 1
+    FROM managed_tables
+    JOIN pg_class AS relation ON relation.oid=managed_tables.oid
+    CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS acl
+    WHERE acl.grantee=0
+      AND acl.privilege_type IN ('SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')
+  );")"
+  IFS='|' read -r erp_catalog_tables erp_catalog_indexes erp_valid_indexes \
+    erp_expected_composite_indexes erp_expected_primary_indexes erp_analyzed_tables \
+    erp_reader_usage erp_reporter_usage erp_writer_usage erp_reader_select \
+    erp_reporter_select erp_reader_write_acl erp_reporter_write_acl \
+    erp_writer_any_acl erp_public_any_acl <<<"$erp_catalog_state"
+  if [[ "$erp_catalog_tables|$erp_catalog_indexes|$erp_valid_indexes|$erp_expected_composite_indexes|$erp_expected_primary_indexes|$erp_analyzed_tables" == "500|1000|1000|500|500|500" ]]; then
+    pass "ERP fiziksel kapsami: 500 tablo, 500 exact composite + 500 primary indeks ve 500 ANALYZE istatistigi"
+  else
+    reject "ERP fiziksel kapsami eksik: tables=${erp_catalog_tables}, indexes=${erp_catalog_indexes}, validIndexes=${erp_valid_indexes}, expectedComposite=${erp_expected_composite_indexes}, expectedPrimary=${erp_expected_primary_indexes}, analyzed=${erp_analyzed_tables}"
+  fi
+  if [[ "$erp_reader_usage|$erp_reporter_usage|$erp_writer_usage|$erp_reader_select|$erp_reporter_select|$erp_reader_write_acl|$erp_reporter_write_acl|$erp_writer_any_acl|$erp_public_any_acl" == "t|t|f|t|t|f|f|f|f" ]]; then
+    pass "ERP ACL zarfi salt-okunur reader/reporter ve yetkisiz writer/PUBLIC olarak dogrulandi"
+  else
+    reject "ERP ACL zarfi bozuk: readerUsage=${erp_reader_usage}, reporterUsage=${erp_reporter_usage}, writerUsage=${erp_writer_usage}, readerSelect=${erp_reader_select}, reporterSelect=${erp_reporter_select}, readerWrite=${erp_reader_write_acl}, reporterWrite=${erp_reporter_write_acl}, writerAny=${erp_writer_any_acl}, publicAny=${erp_public_any_acl}"
+  fi
 fi
 
 orphan_state="$(source_sql "
@@ -691,6 +1040,63 @@ if [[ "$source_fingerprint_count" =~ ^[0-9]+$ && "$source_fingerprint_count" -ge
   pass "Source lifetime diagnostic: fingerprints=${source_fingerprint_count}, calls=${source_fingerprint_calls}"
 else
   warn "Source lifetime diagnostic dusuk; hard gate current-run repository deltalaridir"
+fi
+
+if [[ "$accepted_profile" == "erp" ]]; then
+  erp_source_state="$(source_monitor_sql "
+SELECT
+  count(DISTINCT substring(
+    query FROM 'advisor-erp:erp_entity_[0-9]{4}:[a-z0-9-]+'
+  )),
+  count(DISTINCT queryid),
+  coalesce(sum(calls), 0)::bigint
+FROM pg_stat_statements
+WHERE dbid=(SELECT oid FROM pg_database WHERE datname='appdb')
+  AND query LIKE '%advisor-erp:%';")"
+  IFS='|' read -r erp_source_templates erp_source_queryids erp_source_calls \
+    <<<"$erp_source_state"
+  check_exact "Source ERP deterministic template" "$erp_source_templates" "$report_erp_target"
+  # PostgreSQL queryid can legitimately differ for the same relation/query
+  # template under reader and reporter SET ROLE permission contexts.  The
+  # bounded tag is the exact 4,000 contract; actual queryids must cover at
+  # least that many without being falsely forced to equal it.
+  check_minimum "Source ERP queryid" "$erp_source_queryids" "$report_erp_target"
+  check_minimum "Source ERP query call" "$erp_source_calls" "$report_erp_visited"
+
+  erp_repository_state="$(repository_sql "
+WITH current_run_erp AS (
+  SELECT
+    delta.query_id,
+    substring(
+      statement.query FROM 'advisor-erp:erp_entity_[0-9]{4}:[a-z0-9-]+'
+    ) AS template_tag,
+    sum(delta.calls)::bigint AS calls
+  FROM advisor.query_deltas('${run_started_at}'::timestamptz) AS delta
+  JOIN \"PoWA\".powa_statements AS statement
+    ON statement.srvid=delta.server_id
+   AND statement.dbid=delta.database_id
+   AND statement.queryid=delta.query_id
+   AND statement.userid=delta.user_id
+  WHERE delta.server_id=${server_id}
+    AND delta.toplevel
+    AND delta.sample_at >= '${run_started_at}'::timestamptz
+    AND delta.sample_at <= '${telemetry_finished_at}'::timestamptz
+    AND statement.query LIKE '%advisor-erp:%'
+  GROUP BY delta.query_id, template_tag
+  HAVING sum(delta.calls) > 0
+)
+SELECT
+  count(DISTINCT template_tag),
+  count(DISTINCT query_id),
+  coalesce(sum(calls),0)::bigint
+FROM current_run_erp;")"
+  IFS='|' read -r erp_repository_templates erp_repository_queryids \
+    erp_repository_calls <<<"$erp_repository_state"
+  check_exact "Current-run repository ERP deterministic template" \
+    "$erp_repository_templates" "$report_erp_target"
+  check_minimum "Current-run repository ERP queryid" \
+    "$erp_repository_queryids" "$report_erp_target"
+  check_minimum "Current-run repository ERP call" "$erp_repository_calls" "$report_erp_visited"
 fi
 
 canonical_join_state="$(repository_sql "
@@ -895,7 +1301,9 @@ fi
 predicate_state="$(repository_sql "
 WITH bounds AS (
   SELECT '${run_started_at}'::timestamptz AS started_at,
-         '${telemetry_finished_at}'::timestamptz AS finished_at
+         '${telemetry_finished_at}'::timestamptz AS metric_finished_at,
+         '${join_telemetry_finished_at}'::timestamptz AS join_finished_at,
+         ${join_finished_batch_id}::bigint AS join_finished_batch_id
 ), all_filters AS (
   SELECT metric.*
   FROM bounds
@@ -907,7 +1315,7 @@ WITH bounds AS (
   FROM bounds
   CROSS JOIN LATERAL advisor.predicate_metrics(
     greatest(
-      statement_timestamp() - (bounds.finished_at + interval '1 microsecond'),
+      statement_timestamp() - (bounds.metric_finished_at + interval '1 microsecond'),
       interval '0 seconds'
     ),
     ${server_id}, NULL, NULL
@@ -934,7 +1342,7 @@ WITH bounds AS (
   FROM bounds
   CROSS JOIN LATERAL advisor.join_predicate_metrics(
     greatest(
-      statement_timestamp() - (bounds.finished_at + interval '1 microsecond'),
+      statement_timestamp() - (bounds.join_finished_at + interval '1 microsecond'),
       interval '0 seconds'
     ),
     ${server_id}, NULL, NULL
@@ -966,12 +1374,15 @@ WITH bounds AS (
   FROM bounds
   CROSS JOIN advisor.index_candidates AS candidate
   JOIN advisor.index_candidate_evidence AS evidence USING (candidate_id)
+  JOIN advisor_ingest.join_snapshot_batches AS evidence_batch
+    ON evidence_batch.server_id=evidence.server_id
+   AND evidence_batch.batch_id=evidence.batch_id
   WHERE candidate.server_id=${server_id}
     AND candidate.schema_name='public'
     AND candidate.table_name='orders'
     AND candidate.key_column_names=ARRAY['status','customer_id']::text[]
-    AND evidence.captured_at >= bounds.started_at
-    AND evidence.captured_at < bounds.finished_at
+    AND evidence_batch.captured_at >= bounds.started_at
+    AND evidence_batch.batch_id <= bounds.join_finished_batch_id
   GROUP BY candidate.candidate_id
 ), candidates AS (
   SELECT candidate.*,
@@ -1063,11 +1474,11 @@ SELECT
   (SELECT count(*) FROM advisor_ingest.join_snapshot_batches
     WHERE server_id=${server_id}
       AND captured_at >= '${run_started_at}'::timestamptz
-      AND captured_at <= '${telemetry_finished_at}'::timestamptz),
+      AND batch_id <= ${join_finished_batch_id}),
   (SELECT count(*) FROM advisor_ingest.join_snapshot_batches
     WHERE server_id=${server_id}
       AND captured_at >= '${run_started_at}'::timestamptz
-      AND captured_at <= '${telemetry_finished_at}'::timestamptz
+      AND batch_id <= ${join_finished_batch_id}
       AND row_count > 0);")"
 IFS='|' read -r collector_status collector_lag collector_errors source_frequency \
   join_status join_lag join_error_clear join_delivery_lag recent_batches recent_nonempty_batches \
@@ -1116,7 +1527,8 @@ fi
 check_minimum "Current-run JOIN batch" "$recent_batches" "3"
 check_minimum "Current-run non-empty JOIN batch" "$recent_nonempty_batches" "3"
 
-database_metric_state="$(repository_sql "
+if ! database_metric_state="$(repository_sql_bounded_database_metrics "
+/* advisor-realistic:database-metric-state */
 WITH bounds AS (
   SELECT '${run_started_at}'::timestamptz AS started_at,
          '${telemetry_finished_at}'::timestamptz AS finished_at
@@ -1147,7 +1559,9 @@ SELECT
   greatest(current_metric.tuples_updated - coalesce(post_metric.tuples_updated,0),0),
   greatest(current_metric.tuples_deleted - coalesce(post_metric.tuples_deleted,0),0)
 FROM all_metrics AS current_metric
-LEFT JOIN post_metrics AS post_metric USING (server_id, database_id);")"
+LEFT JOIN post_metrics AS post_metric USING (server_id, database_id);")"; then
+  fatal "Database I/O metric sorgusu tamamlanamadi (server-side limit=${database_metrics_timeout_seconds}s, application_name=advisor-realistic-database-metric-verifier)"
+fi
 IFS='|' read -r committed temp_files temp_bytes deadlocks tuples_inserted tuples_updated tuples_deleted \
   <<<"$database_metric_state"
 check_minimum "Committed transaction" "$committed" "1"
@@ -1164,6 +1578,8 @@ check_minimum "Deleted tuple" "$tuples_deleted" "1"
 
 api_state="$(docker exec -i \
   -e REALISTIC_API_SAMPLES="${REALISTIC_API_SAMPLES:-20}" \
+  -e REALISTIC_API_WINDOW="${REALISTIC_API_WINDOW:-24h}" \
+  -e REALISTIC_API_WARMUP_TIMEOUT_SECONDS="${REALISTIC_API_WARMUP_TIMEOUT_SECONDS:-45}" \
   -e REALISTIC_SERVER_ID="$server_id" \
   "$api_container" python - <<'PY'
 import json
@@ -1174,40 +1590,66 @@ import urllib.request
 
 samples = int(os.environ["REALISTIC_API_SAMPLES"])
 server_id = int(os.environ["REALISTIC_SERVER_ID"])
+window = os.environ["REALISTIC_API_WINDOW"]
+warmup_timeout = float(os.environ["REALISTIC_API_WARMUP_TIMEOUT_SECONDS"])
 if not 20 <= samples <= 100:
     raise SystemExit("REALISTIC_API_SAMPLES must be 20..100")
 if server_id < 1:
     raise SystemExit("REALISTIC_SERVER_ID must be positive")
+if window not in {"1h", "24h", "7d", "30d"}:
+    raise SystemExit("REALISTIC_API_WINDOW must be 1h, 24h, 7d, or 30d")
+if not math.isfinite(warmup_timeout) or not 5 <= warmup_timeout <= 120:
+    raise SystemExit("REALISTIC_API_WARMUP_TIMEOUT_SECONDS must be 5..120")
 
-with urllib.request.urlopen("http://127.0.0.1:8000/api/v1/health", timeout=5) as response:
-    health = json.load(response)
+def load_json(request, *, timeout, label):
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except Exception as exc:
+        raise SystemExit(
+            f"{label} failed after {timeout:g}s ({type(exc).__name__}): {exc}"
+        ) from exc
+
+health = load_json(
+    "http://127.0.0.1:8000/api/v1/health",
+    timeout=5,
+    label="API health request",
+)
 if health.get("repository") != "healthy":
     raise SystemExit(f"API health repository unhealthy: {health}")
 
 query_url = (
     "http://127.0.0.1:8000/api/v1/queries"
-    f"?window=1h&pageSize=50&serverId={server_id}"
+    f"?window={window}&pageSize=50&serverId={server_id}"
 )
 request = urllib.request.Request(
     query_url,
     headers={"X-Advisor-Role": "analyst"},
 )
-# Exclude connection-pool/query-cache warm-up from the timed distribution.
-with urllib.request.urlopen(request, timeout=5) as response:
-    warmup = json.load(response)
+# Exclude connection-pool/query-cache warm-up from the timed distribution. A
+# standalone verifier can encounter a real cold cache, so only this untimed
+# request gets the larger timeout. Timed samples retain the strict 5s timeout.
+warmup = load_json(
+    request,
+    timeout=warmup_timeout,
+    label=f"API {window} query-list warm-up",
+)
 if not warmup.get("items"):
     raise SystemExit("target source API warm-up returned no query items")
 
 times = []
 total_items = 0
-for _ in range(samples):
+for sample_index in range(samples):
     request = urllib.request.Request(
         query_url,
         headers={"X-Advisor-Role": "analyst"},
     )
     started = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=5) as response:
-        payload = json.load(response)
+    payload = load_json(
+        request,
+        timeout=5,
+        label=f"API {window} timed query-list sample {sample_index + 1}",
+    )
     times.append(time.perf_counter() - started)
     total_items += len(payload.get("items") or [])
 

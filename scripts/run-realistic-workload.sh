@@ -11,6 +11,12 @@ cd "$project_dir"
 profile="${1:-normal}"
 duration="${2:-}"
 workers="${3:-}"
+skip_prepare="${REALISTIC_SKIP_PREPARE:-false}"
+
+case "$skip_prepare" in
+  true|false) ;;
+  *) fail "REALISTIC_SKIP_PREPARE yalniz true veya false olabilir" ;;
+esac
 
 case "$profile" in
   quick)
@@ -25,10 +31,32 @@ case "$profile" in
     duration="${duration:-1800}"
     workers="${workers:-48}"
     ;;
+  erp)
+    duration="${duration:-600}"
+    workers="${workers:-32}"
+    ;;
   *)
-    fail "Kullanim: $0 [quick|normal|stress] [sure-saniye] [worker]"
+    fail "Kullanim: $0 [quick|normal|stress|erp] [sure-saniye] [worker]"
     ;;
 esac
+
+if [[ "$profile" == "erp" ]]; then
+  erp_table_count=500
+  erp_query_variants_per_table=8
+  erp_rows_per_table=2000
+  default_interval_seconds=0.005
+  default_statement_timeout_ms=30000
+  default_lock_timeout_ms=1000
+  default_lock_hold_ms=30
+else
+  erp_table_count=0
+  erp_query_variants_per_table=8
+  erp_rows_per_table=64
+  default_interval_seconds=0.02
+  default_statement_timeout_ms=15000
+  default_lock_timeout_ms=5000
+  default_lock_hold_ms=75
+fi
 
 if ! [[ "$duration" =~ ^[0-9]+$ ]] \
    || (( duration < 30 || duration > 7200 )); then
@@ -47,6 +75,20 @@ elif command -v python >/dev/null 2>&1; then
 else
   fail "Workload run zamanini guvenli JSON'a eklemek icin Python 3 gerekli"
 fi
+
+benchmark_boundary() {
+  local phase="$1"
+  local sync_dir="${REALISTIC_BENCHMARK_SYNC_DIR:-}"
+  local sync_timeout="${REALISTIC_BENCHMARK_SYNC_TIMEOUT_SECONDS:-300}"
+  [[ -n "$sync_dir" ]] || return 0
+  if ! [[ "$sync_timeout" =~ ^[0-9]+$ ]] \
+     || ! (( sync_timeout >= 1 && sync_timeout <= 3600 )); then
+    fail "REALISTIC_BENCHMARK_SYNC_TIMEOUT_SECONDS 1-3600 arasinda olmali"
+  fi
+  "$python_bin" scripts/erp_stack_benchmark.py \
+    sync-boundary "$sync_dir" "$phase" "$sync_timeout" \
+    || fail "Benchmark ${phase} sinir el sikismasi basarisiz"
+}
 
 # Reuse the one already-running advisor project instead of accidentally
 # addressing Compose's default project name. Explicit caller settings always
@@ -100,7 +142,33 @@ for service in "${required_services[@]}"; do
 done
 pass "Kaynak, repository, collector, snapshotter, API ve evaluator healthy"
 
-bash scripts/prepare-realistic-workload.sh "$profile" --yes
+if [[ "$skip_prepare" == "false" ]]; then
+  bash scripts/prepare-realistic-workload.sh "$profile" --yes
+else
+  manifest_state="$(docker compose exec -T source-db \
+    psql -X -U postgres -d appdb -AtF '|' -v ON_ERROR_STOP=1 -c \
+    "SELECT schema_version,
+            profile,
+            status,
+            target_counts ->> 'advisor_erp_tables',
+            target_counts ->> 'advisor_erp_rows'
+     FROM public.advisor_workload_seed_manifest
+     WHERE seed_key = 'active'")" \
+    || fail "REALISTIC_SKIP_PREPARE manifest dogrulamasi calistirilamadi"
+  IFS='|' read -r manifest_schema_version manifest_profile manifest_status \
+    manifest_erp_tables manifest_erp_rows <<<"$manifest_state"
+  expected_erp_rows=$((erp_table_count * erp_rows_per_table))
+  [[ "$manifest_schema_version" =~ ^[0-9]+$ && "$manifest_schema_version" -ge 2 ]] \
+    || fail "REALISTIC_SKIP_PREPARE guncel manifest gerektirir"
+  [[ "$manifest_profile" == "$profile" ]] \
+    || fail "REALISTIC_SKIP_PREPARE profil uyusmazligi: manifest=${manifest_profile:-yok}, istenen=${profile}"
+  [[ "$manifest_status" == "READY" ]] \
+    || fail "REALISTIC_SKIP_PREPARE manifest READY degil: ${manifest_status:-yok}"
+  [[ "$manifest_erp_tables" == "$erp_table_count" \
+     && "$manifest_erp_rows" == "$expected_erp_rows" ]] \
+    || fail "REALISTIC_SKIP_PREPARE ERP hedefi uyusmuyor: tables=${manifest_erp_tables:-yok}, rows=${manifest_erp_rows:-yok}"
+  pass "Seed atlandi; READY ${profile} manifesti ve ERP hedefi fail-closed dogrulandi"
+fi
 
 if [[ "${REALISTIC_SKIP_BUILD:-false}" != "true" ]]; then
   docker compose --profile realistic-load build workload
@@ -124,18 +192,26 @@ started_at="$(date -u +%Y%m%dT%H%M%SZ)"
 fallback_started_at="${started_at:0:4}-${started_at:4:2}-${started_at:6:2}T${started_at:9:2}:${started_at:11:2}:${started_at:13:2}Z"
 report_file="runtime/load-reports/${started_at}-${profile}.log"
 
+# Benchmark etkinse wrapper preflight'i olcum disinda kalir. Harness baseline'i
+# aldiktan sonra continue marker'i yayinlar; normal wrapper kosularinda no-op'tur.
+benchmark_boundary start
+
 printf 'Realistic workload basliyor: profile=%s duration=%ss workers=%s\n' \
   "$profile" "$duration" "$workers"
-docker compose --profile realistic-load run --rm --no-deps \
+workload_pipeline_status=0
+if docker compose --profile realistic-load run --rm --no-deps \
   -e WORKLOAD_PROFILE="$profile" \
   -e WORKLOAD_DURATION_SECONDS="$duration" \
   -e WORKLOAD_WORKERS="$workers" \
-  -e WORKLOAD_INTERVAL_SECONDS="${WORKLOAD_INTERVAL_SECONDS:-0.02}" \
+  -e WORKLOAD_INTERVAL_SECONDS="${WORKLOAD_INTERVAL_SECONDS:-$default_interval_seconds}" \
   -e WORKLOAD_REPORT_INTERVAL_SECONDS="${WORKLOAD_REPORT_INTERVAL_SECONDS:-10}" \
   -e WORKLOAD_RANDOM_SEED="${WORKLOAD_RANDOM_SEED:-20260725}" \
-  -e WORKLOAD_STATEMENT_TIMEOUT_MS="${WORKLOAD_STATEMENT_TIMEOUT_MS:-15000}" \
-  -e WORKLOAD_LOCK_TIMEOUT_MS="${WORKLOAD_LOCK_TIMEOUT_MS:-5000}" \
-  -e WORKLOAD_LOCK_HOLD_MS="${WORKLOAD_LOCK_HOLD_MS:-75}" \
+  -e WORKLOAD_STATEMENT_TIMEOUT_MS="${WORKLOAD_STATEMENT_TIMEOUT_MS:-$default_statement_timeout_ms}" \
+  -e WORKLOAD_LOCK_TIMEOUT_MS="${WORKLOAD_LOCK_TIMEOUT_MS:-$default_lock_timeout_ms}" \
+  -e WORKLOAD_LOCK_HOLD_MS="${WORKLOAD_LOCK_HOLD_MS:-$default_lock_hold_ms}" \
+  -e WORKLOAD_ERP_TABLE_COUNT="$erp_table_count" \
+  -e WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE="$erp_query_variants_per_table" \
+  -e WORKLOAD_ERP_ROWS_PER_TABLE="$erp_rows_per_table" \
   workload \
   | "$python_bin" -u -c '
 import datetime as dt
@@ -165,7 +241,23 @@ for raw_line in sys.stdin:
         rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     print(rendered, flush=True)
 ' "$fallback_started_at" \
-  | tee "$report_file"
+  | tee "$report_file"; then
+  workload_pipeline_status=0
+else
+  # `set -e -o pipefail` must not skip the END handshake. Preserve the
+  # right-most non-zero pipeline status, let the harness capture its final
+  # counters, then return the original generator failure after that boundary.
+  workload_pipeline_status=$?
+fi
+
+# Generator pipeline'i bitti; harness after snapshot'i almadan FORCE snapshot
+# ve verifier postlude'una gecilmez. Boylece steady-state maliyet seyrelmez.
+benchmark_boundary end
+if (( workload_pipeline_status != 0 )); then
+  printf '[HATA] Realistic workload pipeline basarisiz (exit=%s); benchmark final snapshot alindi\n' \
+    "$workload_pipeline_status" >&2
+  exit "$workload_pipeline_status"
+fi
 pass "Karma workload hatasiz tamamlandi; ham rapor: ${report_file}"
 
 # Final JSON'daki generator zamanini snapshot kapisinin ayni run'a ait olmasi

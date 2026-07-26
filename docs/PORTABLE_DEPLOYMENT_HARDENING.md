@@ -76,3 +76,14 @@ the next probe.  Role memberships and object ACLs remain owned by the bootstrap
 and versioned migration paths.  If a required role is missing, health remains
 failed instead of silently creating a partially privileged role; repair the
 database bootstrap or restore first.
+
+## Moving an installation with repository data
+
+Do not treat a named-volume copy as the portable cross-host or cross-architecture
+path. Use the custom-format repository dump, restore it into a separate target
+Compose project first, compare history/audit counts, and only then perform the
+controlled cutover. The dump intentionally excludes cluster login passwords,
+collector pgpass files, TLS material, and the monitored source database; recreate
+those from the target secret manager. The complete same-major backup, rehearsal,
+restore, migration-ledger and source re-registration procedure is in the
+[installation runbook](INSTALLATION.md#repository-verisini-başka-hosta-taşıma-ve-restore).

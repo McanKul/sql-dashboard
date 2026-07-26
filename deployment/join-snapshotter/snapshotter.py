@@ -27,6 +27,9 @@ STOP_EVENT = threading.Event()
 SAFE_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 HEALTH_MARKER_PATH = Path("/tmp/join-snapshotter-health")
 DEFAULT_HEALTH_MAX_AGE_SECONDS = 60.0
+MAX_CHUNK_ROWS = 10_000
+MAX_CHUNK_BYTES = 8 * 1024 * 1024
+MAX_BATCH_ROWS = 1_000_000
 
 
 class QueryResult(Protocol):
@@ -101,26 +104,104 @@ class Settings:
 
 
 @dataclass(frozen=True)
-class Batch:
+class Chunk:
     batch_id: int
     captured_at: datetime
+    total_row_count: int
+    row_offset: int
+    is_last: bool
+    payload_bytes: int
     rows: list[dict[str, Any]]
 
     @classmethod
-    def from_record(cls, record: Mapping[str, Any]) -> Batch:
+    def from_record(cls, record: Mapping[str, Any]) -> Chunk:
         batch_id = int(record["batch_id"])
         captured_at = record["captured_at"]
+        total_row_count = int(record["total_row_count"])
+        row_offset = int(record["row_offset"])
         row_count = int(record["row_count"])
+        is_last = record["is_last"]
+        payload_bytes = int(record["payload_bytes"])
         rows = record["rows"]
         if isinstance(rows, str):
             rows = json.loads(rows)
         if batch_id < 1 or not isinstance(captured_at, datetime):
             raise ValueError("invalid JOIN outbox batch metadata")
-        if not isinstance(rows, list) or len(rows) != row_count or row_count > 50_000:
+        if (
+            total_row_count < 0
+            or total_row_count > MAX_BATCH_ROWS
+            or row_offset < 0
+            or not isinstance(is_last, bool)
+            or payload_bytes < 1
+            or payload_bytes > MAX_CHUNK_BYTES
+        ):
+            raise ValueError("invalid JOIN outbox chunk metadata")
+        if (
+            not isinstance(rows, list)
+            or len(rows) != row_count
+            or row_count > MAX_CHUNK_ROWS
+        ):
             raise ValueError("invalid JOIN outbox batch payload shape")
         if not all(isinstance(row, dict) for row in rows):
             raise ValueError("invalid JOIN outbox row shape")
-        return cls(batch_id=batch_id, captured_at=captured_at, rows=rows)
+        try:
+            wire_payload_bytes = len(_compact_json_dumps(rows).encode("utf-8"))
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError("invalid JOIN outbox JSON payload") from exc
+        if wire_payload_bytes > MAX_CHUNK_BYTES:
+            raise ValueError("JOIN outbox wire payload exceeds chunk limit")
+        if total_row_count == 0:
+            if row_offset != 0 or row_count != 0 or not is_last:
+                raise ValueError("invalid empty JOIN outbox chunk")
+        elif (
+            row_count < 1
+            or row_offset + row_count > total_row_count
+            or is_last != (row_offset + row_count == total_row_count)
+        ):
+            raise ValueError("invalid JOIN outbox chunk range")
+        return cls(
+            batch_id=batch_id,
+            captured_at=captured_at,
+            total_row_count=total_row_count,
+            row_offset=row_offset,
+            is_last=is_last,
+            payload_bytes=payload_bytes,
+            rows=rows,
+        )
+
+
+@dataclass(frozen=True)
+class BatchHeader:
+    batch_id: int
+    captured_at: datetime
+    total_row_count: int
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> BatchHeader:
+        batch_id = int(record["batch_id"])
+        captured_at = record["captured_at"]
+        total_row_count = int(record["total_row_count"])
+        if (
+            batch_id < 1
+            or not isinstance(captured_at, datetime)
+            or total_row_count < 0
+            or total_row_count > MAX_BATCH_ROWS
+        ):
+            raise ValueError("invalid JOIN outbox batch header")
+        return cls(
+            batch_id=batch_id,
+            captured_at=captured_at,
+            total_row_count=total_row_count,
+        )
+
+
+def _compact_json_dumps(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
 
 
 def _required_setting(name: str) -> str:
@@ -230,7 +311,17 @@ def _log(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
     LOGGER.log(level, json.dumps({"event": event, **fields}, ensure_ascii=True, default=str))
 
 
+class SanitizedCycleError(RuntimeError):
+    """Carry an already-sanitized failure summary across the outer retry loop."""
+
+    def __init__(self, summary: str) -> None:
+        super().__init__(summary)
+        self.summary = summary
+
+
 def _error_summary(error: BaseException) -> str:
+    if isinstance(error, SanitizedCycleError):
+        return error.summary
     sqlstate = getattr(error, "sqlstate", None)
     return f"{type(error).__name__}{f' sqlstate={sqlstate}' if sqlstate else ''}"
 
@@ -326,12 +417,29 @@ def healthcheck(
     )
 
 
-def fetch_batches(source: DatabaseConnection, batch_limit: int) -> list[Batch]:
+def fetch_batch_headers(
+    source: DatabaseConnection,
+    batch_limit: int,
+) -> list[Mapping[str, Any]]:
     with source.transaction():
-        records = source.execute(
-            "SELECT * FROM advisor_join.fetch_batches(%s::integer)", (batch_limit,)
+        return source.execute(
+            "SELECT * FROM advisor_join.list_batch_headers(%s::integer)",
+            (batch_limit,),
         ).fetchall()
-    return [Batch.from_record(record) for record in records]
+
+
+def fetch_chunk(
+    source: DatabaseConnection,
+    *,
+    batch_id: int,
+    row_offset: int,
+) -> Chunk | None:
+    with source.transaction():
+        record = source.execute(
+            "SELECT * FROM advisor_join.fetch_batch_chunk(%s::bigint, %s::integer)",
+            (batch_id, row_offset),
+        ).fetchone()
+    return Chunk.from_record(record) if record is not None else None
 
 
 def probe_repository(repository: DatabaseConnection) -> None:
@@ -341,27 +449,49 @@ def probe_repository(repository: DatabaseConnection) -> None:
             raise RuntimeError("repository health probe returned an invalid result")
 
 
-def ingest_batch(
+def ingest_chunk(
     repository: DatabaseConnection,
     *,
     source_alias: str,
-    batch: Batch,
+    chunk: Chunk,
+    chunk_no: int,
 ) -> bool:
-    # Exiting this transaction context is the durability boundary. The source
-    # acknowledgement is intentionally performed only after this returns.
     with repository.transaction():
         result = repository.execute(
-            "SELECT advisor_ingest.ingest_join_batch(%s, %s, %s, %s::jsonb) AS inserted",
+            "SELECT advisor_ingest.ingest_join_chunk("
+            "%s, %s, %s, %s, %s, %s, %s, %s::jsonb) AS inserted",
             (
                 source_alias,
-                batch.batch_id,
-                batch.captured_at,
-                Jsonb(batch.rows),
+                chunk.batch_id,
+                chunk.captured_at,
+                chunk.total_row_count,
+                chunk_no,
+                chunk.row_offset,
+                chunk.is_last,
+                Jsonb(chunk.rows, dumps=_compact_json_dumps),
             ),
         ).fetchone()
         if result is None:
-            raise RuntimeError("repository ingest returned no result")
+            raise RuntimeError("repository chunk ingest returned no result")
         return bool(result["inserted"])
+
+
+def finalize_batch(
+    repository: DatabaseConnection,
+    *,
+    source_alias: str,
+    batch_id: int,
+) -> bool:
+    # Exiting this transaction context is the repository durability boundary.
+    # The source acknowledgement is intentionally performed only afterwards.
+    with repository.transaction():
+        result = repository.execute(
+            "SELECT advisor_ingest.finalize_join_batch(%s, %s) AS finalized",
+            (source_alias, batch_id),
+        ).fetchone()
+        if result is None:
+            raise RuntimeError("repository batch finalization returned no result")
+        return bool(result["finalized"])
 
 
 def acknowledge_batch(source: DatabaseConnection, batch_id: int) -> bool:
@@ -372,18 +502,6 @@ def acknowledge_batch(source: DatabaseConnection, batch_id: int) -> bool:
         if result is None:
             raise RuntimeError("source acknowledgement returned no result")
         return bool(result["acknowledged"])
-
-
-def transfer_batch(
-    source: DatabaseConnection,
-    repository: DatabaseConnection,
-    *,
-    source_alias: str,
-    batch: Batch,
-) -> tuple[bool, bool]:
-    inserted = ingest_batch(repository, source_alias=source_alias, batch=batch)
-    acknowledged = acknowledge_batch(source, batch.batch_id)
-    return inserted, acknowledged
 
 
 def record_error(repository_url: str, settings: Settings, summary: str) -> None:
@@ -428,30 +546,122 @@ def run_cycle(
 ) -> int:
     processed = 0
     with connector(settings.source_database_url, settings) as source:
-        batches = fetch_batches(source, settings.batch_limit)
         with connector(settings.repository_database_url, settings) as repository:
             # An idle source is still a complete cycle only after a repository
             # round-trip. This prevents repository outages from looking healthy
             # merely because there was no outbox work to ingest.
             probe_repository(repository)
-            for batch in batches:
-                inserted, acknowledged = transfer_batch(
-                    source,
-                    repository,
-                    source_alias=settings.source_alias,
-                    batch=batch,
-                )
-                if not acknowledged:
-                    raise RuntimeError("source acknowledgement was not accepted")
-                processed += 1
-                _log(
-                    "batch_transferred",
-                    source=settings.source_alias,
-                    batch_id=batch.batch_id,
-                    row_count=len(batch.rows),
-                    inserted=inserted,
-                    acknowledged=acknowledged,
-                )
+            first_failure: str | None = None
+            header_records = fetch_batch_headers(source, settings.batch_limit)
+            for header_record in header_records:
+                batch_id: int | None = None
+                try:
+                    header = BatchHeader.from_record(header_record)
+                    batch_id = header.batch_id
+                    chunk = fetch_chunk(source, batch_id=batch_id, row_offset=0)
+                    if chunk is None:
+                        # Another compatible worker may have finalized and acked
+                        # a header listed at the start of this cycle.
+                        _log(
+                            "batch_already_acknowledged",
+                            source=settings.source_alias,
+                            batch_id=batch_id,
+                        )
+                        continue
+
+                    expected_offset = 0
+                    chunk_no = 1
+                    inserted_chunks = 0
+                    while True:
+                        if (
+                            chunk.batch_id != batch_id
+                            or chunk.captured_at != header.captured_at
+                            or chunk.total_row_count != header.total_row_count
+                            or chunk.row_offset != expected_offset
+                        ):
+                            raise RuntimeError(
+                                "source returned a non-contiguous JOIN chunk"
+                            )
+
+                        inserted = ingest_chunk(
+                            repository,
+                            source_alias=settings.source_alias,
+                            chunk=chunk,
+                            chunk_no=chunk_no,
+                        )
+                        inserted_chunks += int(inserted)
+                        _log(
+                            "chunk_transferred",
+                            source=settings.source_alias,
+                            batch_id=batch_id,
+                            chunk_no=chunk_no,
+                            row_offset=chunk.row_offset,
+                            row_count=len(chunk.rows),
+                            payload_bytes=chunk.payload_bytes,
+                            inserted=inserted,
+                        )
+
+                        expected_offset += len(chunk.rows)
+                        if chunk.is_last:
+                            break
+                        if expected_offset <= chunk.row_offset:
+                            raise RuntimeError("source JOIN chunk did not advance")
+                        chunk_no += 1
+                        if chunk_no > MAX_BATCH_ROWS:
+                            raise RuntimeError("source JOIN batch has too many chunks")
+                        next_chunk = fetch_chunk(
+                            source,
+                            batch_id=batch_id,
+                            row_offset=expected_offset,
+                        )
+                        if next_chunk is None:
+                            raise RuntimeError(
+                                "source JOIN batch disappeared before completion"
+                            )
+                        chunk = next_chunk
+
+                    finalized = finalize_batch(
+                        repository,
+                        source_alias=settings.source_alias,
+                        batch_id=batch_id,
+                    )
+                    acknowledged = acknowledge_batch(source, batch_id)
+                    # DELETE acknowledgement is idempotent. A false result
+                    # means another compatible worker (or an earlier commit
+                    # whose response was lost) already removed the finalized
+                    # source batch; repository durability is still proven.
+                    processed += 1
+                    _log(
+                        "batch_transferred",
+                        source=settings.source_alias,
+                        batch_id=batch_id,
+                        row_count=header.total_row_count,
+                        chunk_count=chunk_no,
+                        inserted_chunks=inserted_chunks,
+                        finalized=finalized,
+                        acknowledged=acknowledged,
+                        already_acknowledged=not acknowledged,
+                    )
+                except Exception as error:  # noqa: BLE001 - isolate poison batches
+                    summary = _error_summary(error)
+                    if first_failure is None:
+                        # Never retain exception tracebacks here: ingest frames
+                        # reference the decoded chunk payload and a 20-header
+                        # failure cycle must still hold at most one chunk.
+                        first_failure = summary
+                    _log(
+                        "batch_failed",
+                        level=logging.ERROR,
+                        source=settings.source_alias,
+                        batch_id=batch_id,
+                        error=summary,
+                    )
+                    chunk = None
+                    # The failed batch stays unacknowledged, but a later header
+                    # gets an independent chance in this bounded cycle.
+                    continue
+            if first_failure is not None:
+                raise SanitizedCycleError(first_failure)
     # Both connections have exited successfully, including every repository
     # commit and subsequent source acknowledgement.
     _write_health_marker(health_marker_path, completed_at_ns=monotonic_ns())

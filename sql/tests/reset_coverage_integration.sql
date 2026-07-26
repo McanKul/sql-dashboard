@@ -1163,4 +1163,142 @@ BEGIN
 END
 $performance_parity$;
 
+-- The API-specific trend helper must remain numerically equivalent to the
+-- reset/gap-aware query_deltas adapter.  Exercise both overloads: overview
+-- uses the global form, while query detail supplies the complete identity.
+DO $trend_parity$
+DECLARE
+    selected_start timestamptz := now() - interval '1 hour';
+    selected_bucket interval := interval '5 minutes';
+    selected_query_id bigint;
+    difference_count bigint;
+BEGIN
+    WITH legacy AS (
+        SELECT
+            date_bin(
+                selected_bucket,
+                delta.sample_at,
+                timestamptz '2000-01-01'
+            ) AS bucket_at,
+            sum(delta.total_exec_time_ms)::double precision
+                AS total_exec_time_ms,
+            sum(delta.calls)::bigint AS calls
+        FROM advisor.query_deltas(selected_start) AS delta
+        JOIN "PoWA".powa_databases AS database
+          ON database.srvid = delta.server_id
+         AND database.oid = delta.database_id
+        WHERE database.datname <> 'powa'
+          AND delta.sample_at >= selected_start
+          AND delta.toplevel
+          AND delta.predecessor_available
+          AND NOT (
+              delta.gap_detected
+              AND delta.previous_sample_at < selected_start
+          )
+        GROUP BY 1
+    ), optimized AS (
+        SELECT *
+        FROM advisor.query_trend(selected_start, selected_bucket)
+    )
+    SELECT count(*)
+      INTO difference_count
+      FROM legacy
+      FULL JOIN optimized USING (bucket_at)
+     WHERE legacy.bucket_at IS NULL
+        OR optimized.bucket_at IS NULL
+        OR legacy.calls IS DISTINCT FROM optimized.calls
+        OR abs(
+            legacy.total_exec_time_ms - optimized.total_exec_time_ms
+        ) > 1e-6;
+
+    IF difference_count <> 0 THEN
+        RAISE EXCEPTION 'global query_trend parity failed: % buckets',
+            difference_count;
+    END IF;
+
+    FOREACH selected_query_id IN ARRAY ARRAY[
+        9001::bigint,
+        9002::bigint,
+        9003::bigint,
+        9004::bigint,
+        9005::bigint,
+        9006::bigint
+    ] LOOP
+        WITH legacy AS (
+            SELECT
+                date_bin(
+                    selected_bucket,
+                    delta.sample_at,
+                    timestamptz '2000-01-01'
+                ) AS bucket_at,
+                sum(delta.total_exec_time_ms)::double precision
+                    AS total_exec_time_ms,
+                sum(delta.calls)::bigint AS calls
+            FROM advisor.query_deltas(selected_start) AS delta
+            WHERE delta.server_id = 2147483000
+              AND delta.database_id = 2147483000::oid
+              AND delta.query_id = selected_query_id
+              AND delta.sample_at >= selected_start
+              AND delta.toplevel
+              AND delta.predecessor_available
+              AND NOT (
+                  delta.gap_detected
+                  AND delta.previous_sample_at < selected_start
+              )
+            GROUP BY 1
+        ), optimized AS (
+            SELECT *
+            FROM advisor.query_trend(
+                selected_start,
+                selected_bucket,
+                2147483000,
+                2147483000::oid,
+                selected_query_id
+            )
+        )
+        SELECT count(*)
+          INTO difference_count
+          FROM legacy
+          FULL JOIN optimized USING (bucket_at)
+         WHERE legacy.bucket_at IS NULL
+            OR optimized.bucket_at IS NULL
+            OR legacy.calls IS DISTINCT FROM optimized.calls
+            OR abs(
+                legacy.total_exec_time_ms - optimized.total_exec_time_ms
+            ) > 1e-6;
+
+        IF difference_count <> 0 THEN
+            RAISE EXCEPTION
+                'scoped query_trend parity failed for query %: % buckets',
+                selected_query_id,
+                difference_count;
+        END IF;
+    END LOOP;
+
+    IF has_function_privilege(
+        'public',
+        'advisor.query_trend(timestamptz,interval)',
+        'EXECUTE'
+    ) OR has_function_privilege(
+        'public',
+        'advisor.query_trend(timestamptz,interval,integer,oid,bigint)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'query_trend overloads leaked EXECUTE to PUBLIC';
+    END IF;
+
+    IF NOT has_function_privilege(
+        'advisor_api',
+        'advisor.query_trend(timestamptz,interval)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'advisor_api',
+        'advisor.query_trend(timestamptz,interval,integer,oid,bigint)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'advisor_api cannot execute query_trend overloads';
+    END IF;
+END
+$trend_parity$;
+
 ROLLBACK;

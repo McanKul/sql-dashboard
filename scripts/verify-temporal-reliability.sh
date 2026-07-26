@@ -15,4 +15,4 @@ docker compose exec -T repository-db \
   --username postgres --port 5433 --dbname powa_repository \
   --file /opt/advisor/sql/tests/reset_coverage_integration.sql >/dev/null
 
-pass "Query, pg_stat_kcache ve wait reset deltalari ile gap/coverage semantigi dogrulandi"
+pass "Query, trend, pg_stat_kcache ve wait reset deltalari ile gap/coverage semantigi dogrulandi"

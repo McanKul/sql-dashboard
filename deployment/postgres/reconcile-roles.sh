@@ -11,6 +11,10 @@ profile="${1:-}"
 psql_bin="${ADVISOR_RECONCILE_PSQL_BIN:-psql}"
 socket_dir="${ADVISOR_RECONCILE_SOCKET_DIR:-/var/run/postgresql}"
 port="${PGPORT:-5432}"
+# Bump when the desired role policy changes even if the secret set and marker
+# file format do not. Existing volumes must run the new reconciliation once
+# instead of accepting a state produced by an older image.
+policy_revision="3"
 
 fail() {
   printf 'Role reconciliation error: %s\n' "$1" >&2
@@ -126,7 +130,8 @@ if [[ "$marker_version" != 1 \
 fi
 
 desired_fingerprint="$({
-  printf '%s\0' 'advisor-role-reconciler-v1' "$marker_salt" "$profile" "$POSTGRES_USER"
+  printf '%s\0' "advisor-role-reconciler-policy-v${policy_revision}" \
+    "$marker_salt" "$profile" "$POSTGRES_USER"
   for password_variable in "${password_variables[@]}"; do
     printf '%s\0' "$password_variable" "${!password_variable}"
   done
@@ -243,6 +248,20 @@ WHERE EXISTS (
     SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'advisor_workload_login'
 )
 \gexec
+-- Internal observers emit COPY/EXPLAIN/outbox utility text. Some of those
+-- statements contain literals that pg_stat_statements cannot normalize, so
+-- tracking the observers eventually evicts the application statements they
+-- are meant to preserve. These defaults affect only new observer sessions and
+-- remain part of the drift-reconciled role state.
+ALTER ROLE powa_collector SET pg_stat_statements.track = 'none';
+ALTER ROLE powa_collector SET pg_stat_kcache.track = 'none';
+ALTER ROLE powa_collector SET pg_qualstats.enabled = off;
+ALTER ROLE advisor_evaluator SET pg_stat_statements.track = 'none';
+ALTER ROLE advisor_evaluator SET pg_stat_kcache.track = 'none';
+ALTER ROLE advisor_evaluator SET pg_qualstats.enabled = off;
+ALTER ROLE advisor_join_reader SET pg_stat_statements.track = 'none';
+ALTER ROLE advisor_join_reader SET pg_stat_kcache.track = 'none';
+ALTER ROLE advisor_join_reader SET pg_qualstats.enabled = off;
 ALTER ROLE advisor_evaluator SET default_transaction_read_only = on;
 ALTER ROLE advisor_evaluator SET statement_timeout = '2s';
 ALTER ROLE advisor_evaluator SET lock_timeout = '250ms';
@@ -331,6 +350,15 @@ ALTER ROLE powa_collector RESET ALL;
 ALTER ROLE advisor_evaluator RESET ALL;
 ALTER ROLE advisor_join_reader RESET ALL;
 ALTER ROLE clone_runner RESET ALL;
+ALTER ROLE powa_collector SET pg_stat_statements.track = 'none';
+ALTER ROLE powa_collector SET pg_stat_kcache.track = 'none';
+ALTER ROLE powa_collector SET pg_qualstats.enabled = off;
+ALTER ROLE advisor_evaluator SET pg_stat_statements.track = 'none';
+ALTER ROLE advisor_evaluator SET pg_stat_kcache.track = 'none';
+ALTER ROLE advisor_evaluator SET pg_qualstats.enabled = off;
+ALTER ROLE advisor_join_reader SET pg_stat_statements.track = 'none';
+ALTER ROLE advisor_join_reader SET pg_stat_kcache.track = 'none';
+ALTER ROLE advisor_join_reader SET pg_qualstats.enabled = off;
 ALTER ROLE advisor_evaluator SET default_transaction_read_only = on;
 ALTER ROLE advisor_evaluator SET statement_timeout = '2s';
 ALTER ROLE advisor_evaluator SET lock_timeout = '250ms';

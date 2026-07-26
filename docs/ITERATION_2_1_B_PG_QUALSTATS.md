@@ -2,11 +2,11 @@
 
 ## Durum
 
-Altyapı ve ilk ürün adımı tamamlandı. PostgreSQL 18.4 kaynağı predicate verisini üretir, PoWA 5.2 hattı desteklediği WHERE/filter kayıtlarını repository'de saklar ve sorgu detayı bunları açıklanabilir index-adayı gözlemleri olarak gösterir. Bu özellik otomatik index DDL'i üretmez veya çalıştırmaz.
+Altyapı ve ilk ürün adımı tamamlandı. PostgreSQL 18.x kaynağı predicate verisini üretir, PoWA 5.2 hattı desteklediği WHERE/filter kayıtlarını repository'de saklar ve sorgu detayı bunları açıklanabilir index-adayı gözlemleri olarak gösterir. Bu özellik otomatik index DDL'i üretmez veya çalıştırmaz. Bu iterasyonun kabul ortamında PostgreSQL 18.4 kullanılmıştır; floating `postgres:18-trixie` base image sonraki build'lerde daha yeni bir 18.x patch'i alabilir.
 
 Tamamlananlar:
 
-- PostgreSQL 18.4 image'ına `pg_qualstats 2.1.4` sabit sürüm ve SHA-256 doğrulamasıyla eklenir.
+- PostgreSQL 18.x image'ına `pg_qualstats 2.1.4` sabit sürüm ve SHA-256 doğrulamasıyla eklenir.
 - Kaynak `shared_preload_libraries=pg_stat_statements,pg_qualstats` ile başlar.
 - Dedicated `powa` database içinde extension oluşturulur ve local PoWA datasource etkinleştirilir.
 - Yeni demo remote server kaydı `extensions => ARRAY['pg_qualstats']` ile açılır. Etkin durum PoWA 5.2'de `PoWA.powa_extension_config` tablosunda tutulur.

@@ -23,6 +23,26 @@ else
   fail "Python 3.10+ bulunamadi"
 fi
 
+# The full verifier may be the first 24h query-list reader after an API rebuild.
+# Bound that cold-cache fill separately; only the immediately following warm
+# request is part of the strict latency gate.
+verify_api_warmup_timeout_seconds="${VERIFY_API_WARMUP_TIMEOUT_SECONDS:-45}"
+if ! [[ "$verify_api_warmup_timeout_seconds" =~ ^[0-9]+$ ]] \
+   || ! (( verify_api_warmup_timeout_seconds >= 5 \
+           && verify_api_warmup_timeout_seconds <= 120 )); then
+  fail "VERIFY_API_WARMUP_TIMEOUT_SECONDS 5-120 arasinda olmali"
+fi
+
+# FORCE_SNAPSHOT is cadence-limited by the registered PoWA source. The actual
+# frequency is resolved below; this configurable grace only covers collector
+# scheduling/processing jitter and never changes the asserted snapshot state.
+verify_snapshot_grace_seconds="${VERIFY_SNAPSHOT_GRACE_SECONDS:-30}"
+if ! [[ "$verify_snapshot_grace_seconds" =~ ^[0-9]+$ ]] \
+   || ! (( verify_snapshot_grace_seconds >= 5 \
+           && verify_snapshot_grace_seconds <= 300 )); then
+  fail "VERIFY_SNAPSHOT_GRACE_SECONDS 5-300 arasinda olmali"
+fi
+
 docker compose config --quiet
 pass "Compose yapilandirmasi gecerli"
 
@@ -118,6 +138,18 @@ docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
   >"${verify_tmp_dir}/authenticated-actor-integration.log"
 pass "Annotation/export DB wrapper ACL, actor spoof ve rollback fixture'i dogru"
 
+docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --port 5433 --dbname powa_repository --file=- \
+  < sql/tests/join_duplicate_aggregation_integration.sql \
+  >"${verify_tmp_dir}/join-duplicate-aggregation-integration.log"
+pass "JOIN ham konumlari, duplicate toplamasi, overflow ve 25.001 satirli chunk transportu dogru"
+
+docker compose exec -T source-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --dbname powa --file=- \
+  < sql/tests/join_outbox_guardrail_integration.sql \
+  >"${verify_tmp_dir}/join-outbox-guardrail-integration.log"
+pass "JOIN outbox satir/boyut/yas circuit-breaker'i fail-closed ve drain sonrasi toparlanabilir"
+
 source_hypopg_version="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'")"
 repository_hypopg_installed="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
@@ -193,15 +225,38 @@ join_source_acl="$(docker compose exec -T source-db psql -U postgres -d powa -At
       NOT has_function_privilege('powa_collector', format('%I.pg_qualstats_reset()', n.nspname), 'EXECUTE'),
       has_function_privilege('powa_collector', 'advisor_join.capture_and_reset()', 'EXECUTE'),
       has_function_privilege('advisor_join_reader', 'advisor_join.fetch_batches(integer)', 'EXECUTE'),
+      has_function_privilege('advisor_join_reader', 'advisor_join.list_batch_headers(integer)', 'EXECUTE'),
+      has_function_privilege('advisor_join_reader', 'advisor_join.fetch_batch_chunk(bigint,integer)', 'EXECUTE'),
       has_function_privilege('advisor_join_reader', 'advisor_join.ack_batch(bigint)', 'EXECUTE'),
+      NOT has_function_privilege('powa_collector', 'advisor_join.assert_outbox_within_limits()', 'EXECUTE'),
+      NOT has_function_privilege('advisor_join_reader', 'advisor_join.assert_outbox_within_limits()', 'EXECUTE'),
       NOT has_function_privilege('advisor_join_reader', 'advisor_join.capture_and_reset()', 'EXECUTE'),
       NOT has_table_privilege('advisor_join_reader', 'advisor_join.outbox_batches', 'SELECT'),
       NOT has_table_privilege('advisor_join_reader', 'advisor_join.outbox_rows', 'SELECT')
      FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace
     WHERE e.extname='pg_qualstats'")"
-[[ "$join_source_acl" == "t|t|t|t|t|t|t" ]] \
+[[ "$join_source_acl" == "t|t|t|t|t|t|t|t|t|t|t" ]] \
   || fail "Kaynak JOIN/reset least-privilege ACL'leri beklenmiyor: ${join_source_acl:-bos}"
 pass "Collector direct reset'ten mahrum; atomik capture wrapper ve JOIN reader ACL'leri dogru"
+
+join_outbox_limit_settings="$(docker compose exec -T source-db psql -U postgres -d powa -AtF '|' -qc \
+  "WITH configured AS (
+     SELECT
+       current_setting('advisor_join.max_outbox_rows', true) AS max_rows,
+       current_setting('advisor_join.max_outbox_bytes', true) AS max_bytes,
+       current_setting('advisor_join.max_outbox_age_seconds', true) AS max_age
+   )
+   SELECT
+     CASE WHEN max_rows ~ '^[0-9]{1,19}$'
+       THEN max_rows::numeric BETWEEN 1 AND 1000000000 ELSE false END,
+     CASE WHEN max_bytes ~ '^[0-9]{1,19}$'
+       THEN max_bytes::numeric BETWEEN 1 AND 1099511627776 ELSE false END,
+     CASE WHEN max_age ~ '^[0-9]{1,19}$'
+       THEN max_age::numeric BETWEEN 1 AND 604800 ELSE false END
+   FROM configured")"
+[[ "$join_outbox_limit_settings" == "t|t|t" ]] \
+  || fail "JOIN outbox circuit-breaker GUC'leri gecersiz: ${join_outbox_limit_settings:-bos}"
+pass "JOIN outbox satir/boyut/yas limitleri strict ve desteklenen aralikta"
 
 ignored_users="$(docker compose exec -T source-db psql -U postgres -d appdb -Atqc \
   "SHOW powa.ignored_users")"
@@ -212,9 +267,64 @@ ignored_users_compact="${ignored_users// /}"
   || fail "PoWA ignored_users collector/evaluator/JOIN reader rollerini kapsamiyor: ${ignored_users}"
 pass "Collector, evaluator ve JOIN reader sorgulari PoWA urun telemetrisinden dislaniyor"
 
-demo_server_id="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
-  "SELECT id FROM \"PoWA\".powa_servers WHERE alias = 'test-source' AND hostname = 'source-db' AND port = 5432")"
-[[ "$demo_server_id" =~ ^[0-9]+$ ]] || fail "test-source demo kaydi bulunamadi"
+demo_server_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
+  -d powa_repository -AtF '|' -qc \
+  "SELECT id, frequency FROM \"PoWA\".powa_servers
+    WHERE alias = 'test-source' AND hostname = 'source-db' AND port = 5432")"
+[[ "$demo_server_state" =~ ^([0-9]+)\|([0-9]+)$ ]] \
+  || fail "test-source demo kaydi/frekansi bulunamadi: ${demo_server_state:-bos}"
+demo_server_id="${BASH_REMATCH[1]}"
+demo_source_frequency="${BASH_REMATCH[2]}"
+(( demo_source_frequency >= 5 && demo_source_frequency <= 86400 )) \
+  || fail "test-source collector frekansi desteklenen 5-86400 araliginda degil: ${demo_source_frequency}"
+
+snapshot_poll_seconds=2
+snapshot_wait_timeout_seconds=$((demo_source_frequency + verify_snapshot_grace_seconds))
+# Never shorten the legacy 20 x 2s acceptance window for low-cadence fixtures.
+(( snapshot_wait_timeout_seconds >= 40 )) || snapshot_wait_timeout_seconds=40
+snapshot_wait_attempts=$((
+  (snapshot_wait_timeout_seconds + snapshot_poll_seconds - 1)
+  / snapshot_poll_seconds
+))
+
+repository_snapshot_probe() {
+  docker compose exec -T repository-db \
+    psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+      --dbname powa_repository --quiet --tuples-only --no-align \
+      --field-separator='|' --command "$1"
+}
+
+wait_for_forced_snapshot_state() {
+  local expected_state="$1"
+  local probe_sql="$2"
+  local state=""
+  local attempt
+
+  for ((attempt = 1; attempt <= snapshot_wait_attempts; attempt++)); do
+    if ! docker compose exec -T repository-db \
+      psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+        --dbname powa_repository --quiet \
+        --command "NOTIFY powa_collector, 'FORCE_SNAPSHOT - ${demo_server_id}'" \
+        >/dev/null; then
+      printf '%s' "$state"
+      return 2
+    fi
+    sleep "$snapshot_poll_seconds"
+    if ! state="$(repository_snapshot_probe "$probe_sql")"; then
+      printf '%s' "$state"
+      return 2
+    fi
+    if [[ "$state" == "$expected_state" ]]; then
+      printf '%s' "$state"
+      return 0
+    fi
+  done
+
+  printf '%s' "$state"
+  return 1
+}
+
+pass "Collector snapshot bekleme zarfi cadence-aware: frequency=${demo_source_frequency}s, timeout=${snapshot_wait_timeout_seconds}s"
 
 repository_evaluator_row_count() {
   docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
@@ -305,12 +415,17 @@ join_repository_acl="$(docker compose exec -T repository-db psql -U postgres -p 
            AND extension_function.query_cleanup = 'SELECT advisor_join.capture_and_reset()'
       ),
       has_function_privilege('advisor_join_ingest', 'advisor_ingest.ingest_join_batch(text,bigint,timestamptz,jsonb)', 'EXECUTE'),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.ingest_join_chunk(text,bigint,timestamptz,integer,integer,integer,boolean,jsonb)', 'EXECUTE'),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.finalize_join_batch(text,bigint)', 'EXECUTE'),
       has_function_privilege('advisor_join_ingest', 'advisor_ingest.record_join_error(text,text)', 'EXECUTE'),
       has_function_privilege('advisor_join_ingest', 'advisor_ingest.purge_join_source_history(text,interval)', 'EXECUTE'),
       NOT has_function_privilege('advisor_join_ingest', 'advisor_ingest.purge_join_history(interval)', 'EXECUTE'),
       NOT has_function_privilege('advisor_join_ingest', 'advisor_ingest.refresh_candidates(integer,bigint)', 'EXECUTE'),
       NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_snapshot_batches', 'SELECT'),
       NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_predicate_samples', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_batch_staging', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_chunk_receipts', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_predicate_staging', 'SELECT'),
       NOT has_table_privilege('advisor_join_ingest', 'advisor.index_candidates', 'SELECT'),
       EXISTS (
         SELECT 1
@@ -320,7 +435,7 @@ join_repository_acl="$(docker compose exec -T repository-db psql -U postgres -p 
       )
      FROM \"PoWA\".powa_servers AS server
     WHERE server.id = ${demo_server_id}")"
-[[ "$join_repository_acl" == "t|t|t|t|t|t|t|t|t|t" ]] \
+[[ "$join_repository_acl" == "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ]] \
   || fail "Repository JOIN ingest/query_cleanup least-privilege ACL'leri beklenmiyor: ${join_repository_acl:-bos}"
 pass "JOIN capture reset sinirina bagli; ingest rolu tek kaynaga ve source-scoped wrapper'lara kilitli"
 
@@ -350,13 +465,7 @@ pass "JOIN snapshotter yalniz iki internal DB aginda; ana API/evaluator aglarind
 # Yepyeni repository'de ilk snapshot bir delta degil, kaynak sayaclarinin
 # baseline'idir. Kontrollu workload'u bundan sonra calistirarak API metriklerinin
 # temiz kurulumda da ilk farktan uretilmesini garanti ederiz.
-baseline_state=""
-for attempt in $(seq 1 20); do
-  docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -qc \
-    "NOTIFY powa_collector, 'FORCE_SNAPSHOT - ${demo_server_id}'" >/dev/null
-  sleep 2
-  baseline_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
-    "SELECT
+baseline_probe_sql="SELECT
        isfinite(m.snapts),
        cardinality(coalesce(m.errors, ARRAY[]::text[])),
        EXISTS (
@@ -368,13 +477,12 @@ for attempt in $(seq 1 20); do
           WHERE h.srvid = m.srvid
        )
      FROM \"PoWA\".powa_snapshot_metas m
-    WHERE m.srvid = ${demo_server_id}")"
-  if [[ "$baseline_state" == "t|0|t|t" ]]; then
-    break
-  fi
-done
-[[ "$baseline_state" == "t|0|t|t" ]] \
-  || fail "Ilk collector baseline snapshot'i olusmadi: ${baseline_state:-bos}"
+    WHERE m.srvid = ${demo_server_id}"
+if ! baseline_state="$(
+  wait_for_forced_snapshot_state "t|0|t|t" "$baseline_probe_sql"
+)"; then
+  fail "Ilk collector baseline snapshot'i cadence-aware ${snapshot_wait_timeout_seconds}s zarfinda olusmadi: ${baseline_state:-bos}"
+fi
 pass "Collector baseline snapshot'i hazir"
 
 previous_snap="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
@@ -476,13 +584,7 @@ pass "INSERT/UPDATE/DELETE desenleri olculuyor ve test tablosu yeni satir birikt
 # Collector yeniden LISTEN durumuna gecmeden gonderilen tek bir NOTIFY kaybolabilir.
 # Bekleme boyunca istegi tekrar gonderip hem genel snapshot'i hem qualstats
 # tarihcesinin onceki kanittan ileri gittigini birlikte dogrulariz.
-qual_pipeline=""
-for attempt in $(seq 1 20); do
-  docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -qc \
-    "NOTIFY powa_collector, 'FORCE_SNAPSHOT - ${demo_server_id}'" >/dev/null
-  sleep 2
-  qual_pipeline="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
-    "SELECT
+qual_pipeline_probe_sql="SELECT
        coalesce((SELECT extract(epoch FROM snapts) > ${previous_snap}
                    FROM \"PoWA\".powa_snapshot_metas
                   WHERE srvid = ${demo_server_id}), false),
@@ -516,13 +618,13 @@ for attempt in $(seq 1 20); do
                   WHERE srvid = ${demo_server_id} AND extname = 'pg_stat_kcache'), false),
        coalesce((SELECT cardinality(coalesce(errors, ARRAY[]::text[]))
                    FROM \"PoWA\".powa_snapshot_metas
-                  WHERE srvid = ${demo_server_id}), -1)")"
-  if [[ "$qual_pipeline" == "t|t|t|2.1.4|t|2.3.2|t|0" ]]; then
-    break
-  fi
-done
-[[ "$qual_pipeline" == "t|t|t|2.1.4|t|2.3.2|t|0" ]] \
-  || fail "pg_qualstats/pg_stat_kcache snapshot ve tarihce akisi ilerlemedi: ${qual_pipeline:-bos}"
+                  WHERE srvid = ${demo_server_id}), -1)"
+if ! qual_pipeline="$(
+  wait_for_forced_snapshot_state \
+    "t|t|t|2.1.4|t|2.3.2|t|0" "$qual_pipeline_probe_sql"
+)"; then
+  fail "pg_qualstats/pg_stat_kcache snapshot ve tarihce akisi cadence-aware ${snapshot_wait_timeout_seconds}s zarfinda ilerlemedi: ${qual_pipeline:-bos}"
+fi
 
 repo_qualstats="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
   "SELECT
@@ -575,13 +677,7 @@ grep -q '"ok": true' "${verify_tmp_dir}/workload-second-result.txt" \
 run_join_wait_acceptance_workload
 docker compose up -d --force-recreate --no-deps collector >/dev/null
 collector_stopped=false
-api_delta_state=""
-for attempt in $(seq 1 20); do
-  docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -qc \
-    "NOTIFY powa_collector, 'FORCE_SNAPSHOT - ${demo_server_id}'" >/dev/null
-  sleep 2
-  api_delta_state="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -AtF '|' -qc \
-    "SELECT
+api_delta_probe_sql="SELECT
        extract(epoch FROM m.snapts) > ${api_baseline_snap},
        cardinality(coalesce(m.errors, ARRAY[]::text[])),
        EXISTS (
@@ -598,13 +694,12 @@ for attempt in $(seq 1 20); do
             )
        )
      FROM \"PoWA\".powa_snapshot_metas m
-    WHERE m.srvid = ${demo_server_id}")"
-  if [[ "$api_delta_state" == "t|0|t" ]]; then
-    break
-  fi
-done
-[[ "$api_delta_state" == "t|0|t" ]] \
-  || fail "Dashboard icin pozitif statement delta olusmadi: ${api_delta_state:-bos}"
+    WHERE m.srvid = ${demo_server_id}"
+if ! api_delta_state="$(
+  wait_for_forced_snapshot_state "t|0|t" "$api_delta_probe_sql"
+)"; then
+  fail "Dashboard icin pozitif statement delta cadence-aware ${snapshot_wait_timeout_seconds}s zarfinda olusmadi: ${api_delta_state:-bos}"
+fi
 pass "Dashboard API'si icin ikinci olcum deltasi hazir"
 
 # The two controlled reset boundaries above must arrive through the outbox as
@@ -838,7 +933,7 @@ SQL
 pass "JOIN staleness esigi source frequency*3 + 30 saniye grace ile olcekleniyor"
 
 wait_identity=""
-for attempt in $(seq 1 20); do
+for ((attempt = 1; attempt <= snapshot_wait_attempts; attempt++)); do
   wait_identity="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
     -d powa_repository -AtF '|' -qc \
     "SELECT query_id, database_id, wait_total_samples
@@ -849,7 +944,7 @@ for attempt in $(seq 1 20); do
       ORDER BY wait_total_samples DESC
       LIMIT 1")"
   [[ "$wait_identity" =~ ^-?[0-9]+\|[0-9]+\|[1-9][0-9]*$ ]] && break
-  sleep 1
+  sleep "$snapshot_poll_seconds"
 done
 IFS='|' read -r wait_query_id wait_database_id wait_sample_count <<< "$wait_identity"
 [[ "$wait_query_id" =~ ^-?[0-9]+$ && "$wait_database_id" =~ ^[0-9]+$ \
@@ -863,11 +958,11 @@ if [[ "$workload_stopped" == true ]]; then
 fi
 trap cleanup_verify_tmp EXIT
 
-for attempt in $(seq 1 12); do
+for ((attempt = 1; attempt <= snapshot_wait_attempts; attempt++)); do
   snapshots="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
     "SELECT count(DISTINCT (record).ts) FROM \"PoWA\".powa_statements_history_current WHERE srvid = ${demo_server_id}")"
   if (( snapshots >= 2 )); then break; fi
-  sleep 2
+  sleep "$snapshot_poll_seconds"
 done
 (( snapshots >= 2 )) || fail "Iki snapshot olusmadi (mevcut: ${snapshots})"
 pass "Collector en az iki snapshot yazdi"
@@ -1190,26 +1285,38 @@ indexes_after_evaluation="$(source_index_fingerprint)"
 
 evaluation_previous_snap="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
   "SELECT extract(epoch FROM snapts) FROM \"PoWA\".powa_snapshot_metas WHERE srvid = ${demo_server_id}")"
-evaluation_snapshot_advanced=false
-for attempt in $(seq 1 20); do
-  docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -qc \
-    "NOTIFY powa_collector, 'FORCE_SNAPSHOT - ${demo_server_id}'" >/dev/null
-  sleep 2
-  evaluation_snapshot_advanced="$(docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository -Atqc \
-    "SELECT extract(epoch FROM snapts) > ${evaluation_previous_snap}
-       FROM \"PoWA\".powa_snapshot_metas WHERE srvid = ${demo_server_id}")"
-  [[ "$evaluation_snapshot_advanced" == "t" ]] && break
-done
-[[ "$evaluation_snapshot_advanced" == "t" ]] \
-  || fail "Evaluator sonrasi collector snapshot'i ilerlemedi"
+evaluation_snapshot_probe_sql="SELECT extract(epoch FROM snapts) > ${evaluation_previous_snap}
+  FROM \"PoWA\".powa_snapshot_metas WHERE srvid = ${demo_server_id}"
+if ! evaluation_snapshot_advanced="$(
+  wait_for_forced_snapshot_state "t" "$evaluation_snapshot_probe_sql"
+)"; then
+  fail "Evaluator sonrasi collector snapshot'i cadence-aware ${snapshot_wait_timeout_seconds}s zarfinda ilerlemedi: ${evaluation_snapshot_advanced:-bos}"
+fi
 
 evaluator_repository_rows="$(repository_evaluator_row_count)"
 [[ "$evaluator_repository_rows" == "0" ]] \
   || fail "advisor_evaluator EXPLAIN telemetrisi repository'ye sizdi: ${evaluator_repository_rows} satir"
 pass "HypoPG gercek index/DDL olusturmadi ve evaluator sorgulari repository'ye sizmadi"
 
+performance_url="${api_url}/api/v1/queries?window=24h&pageSize=50"
+performance_warmup_file="${verify_tmp_dir}/performance-warmup.json"
+if ! curl -fsS --max-time "$verify_api_warmup_timeout_seconds" \
+  -o "$performance_warmup_file" \
+  -H 'X-Advisor-Role: analyst' "$performance_url"; then
+  fail "24 saat sorgu API cold-cache warmup'i tamamlanamadi (limit=${verify_api_warmup_timeout_seconds}s)"
+fi
+"$python_bin" - "$performance_warmup_file" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    payload = json.load(handle)
+assert isinstance(payload, dict), payload
+assert isinstance(payload.get('total'), int) and payload['total'] > 0, payload
+assert isinstance(payload.get('items'), list) and payload['items'], payload
+PY
+pass "24 saat sorgu API cold-cache warmup'i veri dondurdu (latency kapisi disinda)"
+
 http_seconds="$(curl -fsS -o "${verify_tmp_dir}/performance.json" -w '%{time_total}' \
-  -H 'X-Advisor-Role: analyst' "${api_url}/api/v1/queries?window=24h&pageSize=50")"
+  -H 'X-Advisor-Role: analyst' "$performance_url")"
 "$python_bin" - "$http_seconds" <<'PY'
 import sys
 elapsed = float(sys.argv[1])

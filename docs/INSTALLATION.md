@@ -4,10 +4,19 @@ Bu rehber PostgreSQL 18 üzerinde predicate, HypoPG, `pg_stat_kcache`, `pg_wait_
 
 ## 1. Kurulum modelini doğru okuyun
 
-Bu repo varsayılan olarak tek bir fiziksel/virtual host üzerinde iki PostgreSQL 18 container'ı açar; mevcut kabul ortamında her ikisi de PostgreSQL 18.4 olarak doğrulanmıştır:
+Bu repo varsayılan olarak tek bir fiziksel/virtual host üzerinde iki PostgreSQL
+`18.x` container'ı açar; mevcut kabul ortamında her ikisi de `18.4` olarak
+doğrulanmıştır:
 
 1. Kaynak PostgreSQL: host loopback `15432`, container `5432`
 2. Repository PostgreSQL: host loopback `15433`, container `5433`
+
+Base image `postgres:18-trixie` major-series etiketiyle izlenir; patch sürümü veya
+image digest'i sabitlenmiş değildir. Bu nedenle daha sonraki bir fresh build aynı
+extension sürümleri ve checksum'larıyla daha yeni bir PostgreSQL `18.x` patch'i
+alabilir. Kurumun birebir binary tekrarlanabilirlik şartı varsa kabul edilen image
+digest'ini deployment override'ında ayrıca sabitleyin ve yükseltmeyi önce staging'de
+doğrulayın.
 
 Bunlara collector, repository-only API, ayrı salt-okunur HypoPG evaluator ve web container'ları eklenir. Hacimli sentetik trafik üreten `workload` container'ı yalnız seed sonrasında ve isteğe bağlı `realistic-load` profiliyle açılır. Bu ayrım PDF'deki “tek test sunucusu, iki PostgreSQL instance” kararının çalıştırılabilir halidir.
 
@@ -18,7 +27,7 @@ sonlandıran reverse proxy sınırı kurulduktan sonra bilinçli opt-in'dir.
 
 ## 2. Ön koşullar
 
-Minimum geliştirme/test önerisi:
+Base stack ve `quick` geliştirme/test profili için minimum öneri:
 
 - 4 CPU
 - 8 GiB RAM
@@ -26,6 +35,23 @@ Minimum geliştirme/test önerisi:
 - Docker Engine + Compose v2 veya OrbStack
 - İlk build için GitHub, PyPI ve container registry erişimi
 - `bash`, `curl`, `python3`
+
+Bu `4 CPU / 8 GiB / 15 GiB` zarfı 500 tablolu, 32-worker ERP kapasite koşusunun
+minimumu değildir. 26 Temmuz 2026'daki tek başarılı referans koşu, 10 vCPU ve
+yaklaşık 11,7 GiB kullanılabilir Docker belleği sunan arm64 OrbStack ortamında
+`erp 600 32` ve `60s` collector cadence ile yapıldı. Kaynak PostgreSQL ortalama
+`8,55` core, repository ortalama `0,43` core kullandı; ölçüm penceresi bellek
+tepeleri sırasıyla `3,13 GiB` ve `1,37 GiB`, container ömür tepeleri toplamı
+`6,83 GiB` oldu. Bunlar yalnız iki PostgreSQL container'ının gözlemidir; API,
+collector, snapshotter, workload, image cache ve Docker/host payı ayrıca gerekir.
+
+Aynı profil için tekrarlanabilir kabul koşusuna başlangıç zarfı olarak en az
+`12 vCPU`, Docker'a ayrılmış `16 GiB` kullanılabilir bellek ve başlamadan önce
+`30 GiB` boş disk önerilir. Bu değerler sertifikalı alt sınır veya production
+kapasite garantisi değildir: hedef hostta en az üç izole koşunun medyanını alın,
+OOM/bellek baskısı olmadığını doğrulayın ve ortama özel CPU/bellek/I/O eşiklerini
+[ERP benchmark runbook'undaki](ERP_STACK_BENCHMARK.md) değişkenlerle hard gate
+olarak etkinleştirin.
 
 Kontrol:
 
@@ -346,7 +372,12 @@ docker compose exec -T evaluator python -c \
   "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3).read().decode())"
 ```
 
-İlk API yanıtında `repository: healthy`, `collector: healthy`, `postgresVersion: 18.4` ve `powaVersion: 5.2.0` beklenir. Evaluator yanıtında `database_name=appdb`, `role_name=advisor_evaluator`, `hypopg_version=1.4.3`, `default_read_only=on` ve `ddlExecuted=false` bulunmalıdır.
+İlk API yanıtında `repository: healthy`, `collector: healthy`, `postgresVersion`
+alanında `18.x` ve `powaVersion: 5.2.0` beklenir. Mevcut kabul image'ı `18.4`
+döndürür; `postgres:18-trixie` yeniden build edildiğinde patch sürümü ilerleyebilir.
+Evaluator yanıtında `database_name=appdb`, `role_name=advisor_evaluator`,
+`hypopg_version=1.4.3`, `default_read_only=on` ve `ddlExecuted=false`
+bulunmalıdır.
 
 Kimlik doğrulayan/TLS sonlandıran bir reverse proxy sınırı kurduktan sonra
 uzak web erişimini özellikle açmak isterseniz `.env` içinde
@@ -370,7 +401,7 @@ bash scripts/run-test-workload.sh 20
 {"ok": true, "iterations": 20, "statementsExecuted": 80, "durationMs": 123.45}
 ```
 
-Collector 5 saniyede bir snapshot alır. İki ölçüm farkı için yaklaşık 10 saniye bekleyin. Komut deterministik predicate kabulü için yalnız kendi oturumunda `pg_qualstats.sample_rate=1` kullanır; cluster varsayılanı `0.1` olarak kalır.
+Fresh demo collector varsayılan olarak 60 saniyede bir snapshot alır. Komut çalışan kaydın gerçek frekansını ve iki ölçüm farkı için yaklaşık bekleme süresini yazdırır. Yalnız hızlı yerel acceptance kurulumu için boş volume oluşturulmadan önce `DEMO_SOURCE_FREQUENCY=5` seçilebilir; ERP kapasite koşusunda en az 30 saniye gerekir. Komut deterministik predicate kabulü için yalnız kendi oturumunda `pg_qualstats.sample_rate=1` kullanır; cluster varsayılanı `0.1` olarak kalır.
 
 Bu komut tek seferlik kontrollü trafik üretir. Sürekli sentetik trafik varsayılan
 olarak kapalıdır. Hacimli ve süreli karma trafik için önce
@@ -390,6 +421,22 @@ API_URL=http://localhost:18000 WEB_URL=http://localhost:15173 bash scripts/verif
 ```
 
 Beklenen sonuç, bütün kontrollerin `[OK]` ile tamamlanması ve scriptin sıfır koduyla çıkmasıdır. Kabul artık temel stack'e ek olarak wait sampling, JOIN outbox/snapshotter ve composite aday hattını da doğrular; gerçek clone testi profil dışında ayrıca çalıştırılır.
+
+Full verifier, API rebuild'inden sonraki ilk `24h` query-list çağrısı olabileceği
+için önce sonuç verisini doğrulayan, latency kapısına katılmayan ve varsayılan
+`45s` ile sınırlı bir cold-cache warmup yapar. Hemen sonraki warm-cache çağrısı
+yine katı biçimde `2s` altında olmalıdır. Farklı donanımda yalnız warmup sınırını
+değiştirmek için host shell'inde `VERIFY_API_WARMUP_TIMEOUT_SECONDS` (`5..120`)
+export edilebilir; bu değişken ölçülen `2s` eşiğini değiştirmez.
+
+Verifier içindeki collector snapshot kapıları sabit bir `20 x 2s` döngüsüne
+bağlı değildir. `test-source` kaydının repository'deki gerçek `frequency`
+değerini okur ve her FORCE snapshot için `max(40s, frequency + 30s grace)`
+zarfını kullanır. Beklenen snapshot zamanı, sıfır collector hatası ve extension
+tarihçesi gibi kontroller aynen hard gate'tir. Yoğun fakat desteklenen bir hostta
+yalnız scheduling payı gerekirse host shell'inde
+`VERIFY_SNAPSHOT_GRACE_SECONDS` (`5..300`) export edilebilir; kaynak cadence'i
+ve kabul koşulları değiştirilmez.
 
 Test ayrıca iki database'in PostgreSQL 18 kullandığını, veri dizininin `/var/lib/postgresql/18/docker` olduğunu, gerçek predicate kayıtları üzerinden WHERE+JOIN capability sözleşmesini, CPU/wait history alanlarını, composite candidate eşiklerini ve HypoPG evaluator'ın gerçek index oluşturmadan aynı oturumda plan doğrulaması yaptığını kontrol eder.
 
@@ -718,7 +765,157 @@ ls -lh backups/
 
 Script custom-format `pg_dump` üretir. Yedeği aynı hostta bırakmak tek başına felaket kurtarma değildir; ayrı ve erişim kontrollü depoya kopyalayın, restore testini periyodik yapın.
 
-Örnek geri yükleme hedefi kurum prosedürüne göre hazırlanmalıdır. Mevcut çalışan repository üzerine doğrudan restore etmeyin; önce ayrı bir test veritabanında doğrulayın.
+Bu dump yalnız `powa_repository` veritabanını kapsar. Cluster login parolaları,
+`.env`, collector'ın `runtime/collector/sources/*.pgpass` dosyaları, TLS
+sertifikaları ve izlenen source veritabanının kendisi arşivde değildir. Bunları
+dump'a eklemeyin; hedefte secret manager'dan yeniden üretin. Dış source
+parolalarını taşımak yerine hedefte güvenli env dosyasıyla
+`scripts/register-source.sh` komutunu aynı alias için yeniden çalıştırın.
+
+### Repository verisini başka hosta taşıma ve restore
+
+Aşağıdaki akış aynı PostgreSQL major sürümündeki yeni ve ayrı bir Compose
+projesine taşımak içindir. Mevcut çalışan repository üzerine doğrudan restore
+etmeyin. Major sürüm değişiyorsa bu adımlar tek başına yeterli değildir; DBA
+kontrollü logical migration veya `pg_upgrade` planı gerekir.
+
+1. Kaynakta önce normal bir restore provası yapın. Nihai cutover anında
+   repository writer'larını durdurun, son dump'ı alın, dosyanın SHA-256 özetini
+   kaydedin ve dump ile özeti erişim kontrollü kanaldan hedefe aktarın:
+
+   ```bash
+   docker compose stop collector join-snapshotter api
+   bash scripts/backup-repository.sh
+   shasum -a 256 backups/powa_repository-YYYYMMDDTHHMMSSZ.dump
+   ```
+
+   Linux'ta `shasum` yoksa `sha256sum` kullanın. Kaynak servisleri cutover iptal
+   edilirse yeniden başlatılabilir; final dump'tan sonra eski ve yeni repository'ye
+   aynı anda writer çalıştırmayın.
+
+2. Hedef hostta aynı veya daha yeni repo sürümünü ayrı volume ve secret'larla
+   fresh başlatın. `REGISTER_DEMO_SOURCE=false` seçin. Bu ilk bootstrap, dump'ın
+   taşımadığı cluster rollerini ve hedef parolalarını üretir. Hedef PostgreSQL
+   major sürümünü ve dump checksum'unu doğrulayın:
+
+   ```bash
+   chmod 600 .env /secure/powa_repository.dump
+   docker compose up -d repository-db
+   docker compose exec -T repository-db \
+     psql -X -U postgres -p 5433 -d postgres -Atc \
+     "SHOW server_version;"
+   docker compose exec -T repository-db \
+     pg_restore --list < /secure/powa_repository.dump >/dev/null
+   shasum -a 256 /secure/powa_repository.dump
+   ```
+
+3. Önce disposable bir doğrulama veritabanına restore edin. `--no-owner`
+   ownership'i hedefteki bootstrap superuser'ına bırakır; ACL'ler korunur ve
+   hedefte önceden oluşturulan uygulama rollerine bağlanır:
+
+   ```bash
+   docker compose exec -T repository-db \
+     createdb -U postgres -p 5433 -T template0 powa_restore_verify
+   docker compose exec -T repository-db \
+     pg_restore -U postgres -p 5433 --exit-on-error --no-owner \
+     -d powa_restore_verify < /secure/powa_repository.dump
+   ```
+
+   Kaynak ve doğrulama hedefinde server, snapshot, annotation ve audit sayıları
+   ile en eski/en yeni snapshot zamanlarını karşılaştırın. Kuruma ait restore
+   testi tamamlandıktan sonra bu disposable veritabanını kontrollü biçimde
+   kaldırın; bu belge otomatik silme komutu çalıştırmaz.
+
+4. Yalnız doğrulama başarılıysa hedef uygulama writer'ları kapalıyken fresh
+   `powa_repository` veritabanını restore edin. Aşağıdaki `dropdb` hedefteki fresh
+   bootstrap verisini bilerek siler; container/project adını ve dump checksum'unu
+   ikinci kez doğrulamadan çalıştırmayın:
+
+   ```bash
+   docker compose stop collector join-snapshotter api web
+   docker compose exec -T repository-db \
+     dropdb -U postgres -p 5433 --force powa_repository
+   docker compose exec -T repository-db \
+     createdb -U postgres -p 5433 -T template0 powa_repository
+   docker compose exec -T repository-db \
+     pg_restore -U postgres -p 5433 --exit-on-error --no-owner \
+     -d powa_repository < /secure/powa_repository.dump
+   docker compose exec -T repository-db \
+     psql -X -U postgres -p 5433 -d postgres -v ON_ERROR_STOP=1 \
+     -c 'GRANT CONNECT ON DATABASE powa_repository TO powa_collector, advisor_api, advisor_join_ingest;'
+   bash scripts/migrate-repository.sh
+   ```
+
+5. Dış kaynakları aynı alias'larla yeniden kaydedin, collector secret'larının
+   `0600` olduğunu doğrulayın, sonra servisleri açın. API health, migration
+   ledger checksum'ları, source/server kimlikleri, collector cadence ve ilk yeni
+   snapshot ilerlemesini doğrulamadan trafik yönlendirmeyin:
+
+   ```bash
+   bash scripts/register-source.sh --env-file /secure/prod-source.env
+   docker compose up -d
+   docker compose ps
+   curl -fsS http://127.0.0.1:8000/api/v1/health
+   ```
+
+Source veritabanını da başka hosta taşıyacaksanız onu kendi yedekleme/PITR ve
+rol/extension prosedürüyle ayrıca taşıyın; bu repository dump'ı source verisini
+geri yüklemez. Source adresi değiştikten sonra aynı alias kaydını güncelleyin ve
+eski collector'ı kapatmadan yeni collector'ı başlatmayın.
+
+### Query metrics cache kapasitesi
+
+Sorgu listesi satırları, overview kartları ve query detail'in temel query-metrics
+satırı aynı tam pencere snapshot'ını paylaşır. Varsayılan `60s` fresh süresi
+bitince en fazla `300s` yaşındaki metrics snapshot hemen sunulur ve process
+genelinde her pencere için yalnız bir query-metrics refresh'i çalışır.
+
+Overview global trendi query-metrics'ten ayrı bir window snapshot cache'inde
+aynı fresh/stale sürelerini, `QUERY_LIST_CACHE_MAX_ENTRIES=4` LRU sınırını ve
+`QUERY_LIST_CACHE_MAX_ROWS=100000` satır kapısını kullanır. Stale global trend
+anında sunulur ve tek refresh arka planda devam eder; cold veya `300s` üstü istek
+ortak single-flight refresh'i bekler. Query-metrics ve global-trend refresh'leri
+repository genelinde aynı lock üzerinde serialize edilir; farklı pencere veya
+cache türü olsa da iki pahalı tarama eşzamanlı çalışmaz.
+
+ERP referansında 4.000 bounded template ve 4.000'den fazla gerçek queryid ile
+`300s` sınırını aşmış ilk `24h` query-list fill'i `22,12s` sürmüştür; warm/SWR
+p95'i `0,261s`'dir. Dolayısıyla genel `2s` hedefi cold-start değil warm kullanıcı
+yoluna aittir. API rebuild/rolling deployment sırasında trafiği bounded warmup
+başarılı olmadan açmayın; ingress/read timeout'unu ilk fill'in hedef hostta
+ölçülen üst zarfına göre ayarlayın. `scripts/verify.sh` bu ayrımı untimed warmup
+ve hemen ardından katı `<2s` çağrı olarak doğrular. Tamamen idle kalıp stale
+sınırını aşan cache yine synchronous refresh bekler; cold/expired istek için de
+`<2s` zorunluysa mevcut raw-history rollup optimize edilmeden deployment'ı
+production-ready saymayın.
+
+Scoped query-detail trendi (`serverId + databaseId + queryId`) ve
+collector-health cache'in parçası değildir; her HTTP isteğinde repository'den
+canlı okunur. Overview bu nedenle metrics, global-trend ve health için tek bir
+repository sorgusuna veya tek bir gözlem sınırına indirgenmez; detail'in temel
+satırı ile scoped trendi de farklı sınırlar taşıyabilir.
+
+Satır eksilterek devam edilmez: query-metrics veya global-trend penceresi
+`QUERY_LIST_CACHE_MAX_ROWS=100000` sınırını aşarsa istek fail-closed olur.
+Yalnız query-metrics için PostgreSQL payload hesabı
+`QUERY_LIST_CACHE_MAX_BYTES=67108864` (64 MiB) sınırını aşarsa da aynı şekilde
+durur. Metrics snapshot named/server-side cursor ile parça parça okunur ve
+libpq'nun bütün sonucu tek seferde bufferlaması engellenir; sınır içindeki tam
+snapshot API cache'inde tutulur. Query-metrics ve global trend cache'lerinin her
+biri en fazla `QUERY_LIST_CACHE_MAX_ENTRIES=4` pencere tutar; Python nesne ek
+yüküne karşı API container'ı ayrıca `API_MEMORY_LIMIT=1g` hard zarfındadır.
+
+Fresh süreyi izlenen kaynakların en sık collector cadence'inden daha kısa seçmek
+dashboard verisini daha taze yapmaz; metrics ve global-trend refresh CPU/I/O
+yükünü artırır. Çok kaynaklı kurulumda aktif fingerprint toplamı ve API process
+belleği ölçülerek satır/entry sınırları birlikte ayarlanmalıdır. `observedTo`
+alanı sunulan metrics snapshot'ın gerçek ölçüm zamanını gösterir; stale üst
+sınırı bu nedenle veri tazeliği SLO'sunun bilinçli parçasıdır. Birden fazla API
+replica/worker query-metrics ve global-trend cache'lerini process başına ayrı
+tutar; refresh yükü replica sayısıyla çarpılabilir. Annotation invalidation da
+process-local'dir ve aynı process'te iki cache'i birlikte temizler. Shared
+invalidation kurulmadan tek API replica kullanın. Aksi durumda başka bir replica
+eski annotation'ı en fazla bounded-stale süresi kadar sunabilir.
 
 ### Retention
 
@@ -730,7 +927,7 @@ override'ı vardır; fresh init, `enable-pg-wait-sampling.sh` ve
 sonradan tek başına değiştirmez. Retention değişikliği repository'de PoWA'nın
 yönetim fonksiyonlarıyla ve kapasite planıyla birlikte yapılmalıdır.
 
-### İterasyon 2.1-B–2.6 mevcut-volume geçişi
+### İterasyon 2.1-B ve sonrası mevcut-volume geçişi
 
 Named volume daha eski image ile oluşturulduysa init scriptleri kendiliğinden
 tekrar çalışmaz. `repository-migrate` bu nedenle her `docker compose up`
@@ -819,7 +1016,13 @@ Extension dosyası image/host üzerinde bulunmalı, preload listesinde yer almal
 
 ### Source startup shared-memory hatası
 
-`PG_QUALSTATS_MAX` yükseltildiyse `SOURCE_DB_SHM_SIZE` değerini de kapasite ölçümüne göre artırın. Varsayılan kombinasyon `10000` ve `256mb` olarak kabul testinden geçer. Sabit `2.1.4` image'ı ayrıca belgelenen shared-memory hesap düzeltmesini içerir.
+`PG_STAT_STATEMENTS_MAX` veya `PG_QUALSTATS_MAX` yükseltildiyse
+`SOURCE_DB_SHM_SIZE` değerini de kapasite ölçümüne göre artırın. ERP varsayılanı
+`50000 + 50000` ve `512mb`'dir; pinned extension setiyle PostgreSQL 18
+`shared_memory_size=249MB` ölçülmüştür. Aynı kapasiteyi 256 MiB `/dev/shm` ile
+başlatmak yalnız yaklaşık 7 MiB marj bıraktığı için desteklenen güvenli envelope
+değildir. Sabit `2.1.4` image'ı ayrıca belgelenen shared-memory hesap düzeltmesini
+içerir.
 
 ### HypoPG `UNAVAILABLE`, `UNSAFE` veya SQL göstermiyor
 
@@ -848,6 +1051,50 @@ docker compose exec -T repository-db psql -U postgres -p 5433 -d powa_repository
 ```
 
 Outbox doluyor fakat repository status ilerlemiyorsa source/repository DSN, ayrı parolalar ve internal `join_source`/`join_repository` ağlarını doğrulayın. Dış alias için referans Compose'un demo DSN'ini yeniden kullanmayın; kaynak başına ayrı snapshotter routing'i gerekir. `joinsAvailable=false` sorguda JOIN bulunmadığını kanıtlamaz.
+
+Yeni chunk transport mevcut volume'e iki aşamada uygulanır: önce
+`bash scripts/migrate-repository.sh`, sonra source wrapper/ACL için
+`bash scripts/enable-join-snapshotter.sh`; ardından `join-snapshotter` servisini
+yeniden build/recreate edin. Eski `fetch_batches()` ve `ingest_join_batch()`
+imzaları rolling upgrade için korunur. Yeni daemon her seferinde yalnız bir
+`<=10.000` satır / `<=8 MiB` parça taşır; tamamlanmamış parçalar
+`advisor_ingest.join_*_staging` tablolarında kalır ve public evidence'e sızmaz.
+Daemon metadata-only bounded header listesi kullanır; tek batch hatası sonraki
+batch'lerin aktarımını durdurmaz. Hatalı batch ack edilmeden source outbox'da
+kalır ve otomatik süre dolumu ile silinmez. Tekrarlayan `batch_failed` logunda
+batch kimliğiyle kök nedeni düzeltin; veri kaybına yol açacak manuel DELETE'i
+normal iyileştirme adımı olarak kullanmayın.
+
+Eski bir repository'de staging doğal anahtarından `23505` görülüyorsa source
+batch'ini silmeyin veya ack etmeyin. `bash scripts/migrate-repository.sh` ile
+`0011` migration'ını uygulayın. Yeni finalize ham satır konumlarını ve batch ham
+satır sayısını korurken aynı doğal anahtarın sayaçlarını toplar; daemon aynı
+batch'i güvenle yeniden gönderir. Toplam sayaç `bigint` sınırını aşarsa `22003`
+bilinçli fail-closed sonuçtur ve DBA incelemesi gerekir.
+
+Ack'siz source outbox'ın repository kesintisinde primary diski sınırsız
+büyütmemesi için capture tarafında üç circuit-breaker vardır:
+
+| Compose değişkeni | PostgreSQL GUC | Varsayılan | Desteklenen aralık |
+|---|---|---:|---:|
+| `JOIN_OUTBOX_MAX_ROWS` | `advisor_join.max_outbox_rows` | `1000000` | `1..1000000000` |
+| `JOIN_OUTBOX_MAX_BYTES` | `advisor_join.max_outbox_bytes` | `1073741824` | `1..1099511627776` |
+| `JOIN_OUTBOX_MAX_AGE_SECONDS` | `advisor_join.max_outbox_age_seconds` | `300` | `1..604800` |
+
+Değerler birimsiz base-10 tamsayı olmalıdır; `1GB`, boşluk, ondalık veya negatif
+değer fail-closed reddedilir. Boyut canlı batch varken outbox tablo, TOAST ve
+indekslerinin fiziksel allocation toplamıdır. Son canlı batch ack edildiğinde
+etkin backlog boyutu sıfır kabul edilir; daha önce ayrılmış boş sayfalar yüzünden
+`VACUUM FULL` gerektiren kalıcı bir kilit oluşmaz. Bir eşik dolduğunda collector
+errors alanında `JOIN outbox circuit breaker open` ve bütün backlog ölçüleri
+görünür, `advisor.v_collector_health` `DEGRADED` olur; o turda insert/reset yoktur.
+Önce repository/snapshotter yolunu düzeltin. Snapshotter son batch'i ack edince
+bir sonraki collector snapshot'ı otomatik olarak `HEALTHY` akışa döner.
+
+Compose dışındaki kaynaklarda aynı GUC'ları PostgreSQL başlangıç seçenekleriyle
+verin. Hiçbiri tanımlı değilse wrapper yukarıdaki güvenli varsayılanları kullanır.
+Eşikleri kaynak disk rezervi ve snapshot frekansına göre düşürebilirsiniz; source
+korumasını ölçmeden yükseltmeyin.
 
 ### Port kullanımda
 

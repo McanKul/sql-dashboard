@@ -33,6 +33,25 @@ TAG_PATTERN = re.compile(r"/\* advisor-realistic:([a-z0-9-]+) \*/")
 MAX_SQL_TEMPLATES = 32
 MAX_LATENCY_SAMPLES = 4_096
 
+# The ERP catalog is deliberately finite.  The default ERP shape yields
+# 500 physical business tables * 8 structurally different query families =
+# 4,000 possible pg_stat_statements fingerprints, while staying below the
+# reference source's expanded pg_stat_statements.max=50000 budget.
+ERP_SCHEMA_NAME = "advisor_erp"
+ERP_TABLE_PREFIX = "erp_entity_"
+MAX_ERP_TABLES = 500
+MAX_ERP_QUERY_VARIANTS_PER_TABLE = 8
+ERP_QUERY_FAMILIES = (
+    "point-read",
+    "tenant-state-rollup",
+    "recent-range",
+    "json-channel-filter",
+    "amount-range",
+    "state-tenant-group",
+    "adjacent-entity-join",
+    "cte-status-rollup",
+)
+
 
 # Keep this exact query shape: the JOIN snapshotter acceptance and the runtime
 # validation fixture both depend on its stable normalized query identity.
@@ -364,6 +383,18 @@ FROM pg_stat_wal
 /* advisor-realistic:wal-stats */
 """
 
+ERP_PREFLIGHT_SQL = """
+SELECT count(*) = %s
+FROM generate_series(1, %s) AS expected(table_number)
+JOIN pg_namespace AS namespace
+  ON namespace.nspname = 'advisor_erp'
+JOIN pg_class AS relation
+  ON relation.relnamespace = namespace.oid
+ AND relation.relname = 'erp_entity_' || lpad(expected.table_number::text, 4, '0')
+ AND relation.relkind IN ('r', 'p')
+/* advisor-realistic:erp-preflight */
+"""
+
 
 SQL_TEMPLATES: dict[str, str] = {
     "read-order-by-id": READ_ORDER_BY_ID_SQL,
@@ -394,6 +425,7 @@ SQL_TEMPLATES: dict[str, str] = {
     "set-role": SET_ROLE_SQL,
     "database-stats": DATABASE_STATS_SQL,
     "wal-stats": WAL_STATS_SQL,
+    "erp-preflight": ERP_PREFLIGHT_SQL,
 }
 
 
@@ -438,6 +470,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "WORKLOAD_STATEMENT_TIMEOUT_MS": "10000",
         "WORKLOAD_LOCK_TIMEOUT_MS": "500",
         "WORKLOAD_LOCK_HOLD_MS": "20",
+        "WORKLOAD_ERP_TABLE_COUNT": "0",
+        "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "8",
+        "WORKLOAD_ERP_ROWS_PER_TABLE": "64",
     },
     "normal": {
         "WORKLOAD_DURATION_SECONDS": "300",
@@ -447,6 +482,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "WORKLOAD_STATEMENT_TIMEOUT_MS": "10000",
         "WORKLOAD_LOCK_TIMEOUT_MS": "500",
         "WORKLOAD_LOCK_HOLD_MS": "20",
+        "WORKLOAD_ERP_TABLE_COUNT": "0",
+        "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "8",
+        "WORKLOAD_ERP_ROWS_PER_TABLE": "64",
     },
     "stress": {
         "WORKLOAD_DURATION_SECONDS": "180",
@@ -456,6 +494,21 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "WORKLOAD_STATEMENT_TIMEOUT_MS": "30000",
         "WORKLOAD_LOCK_TIMEOUT_MS": "1000",
         "WORKLOAD_LOCK_HOLD_MS": "40",
+        "WORKLOAD_ERP_TABLE_COUNT": "0",
+        "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "8",
+        "WORKLOAD_ERP_ROWS_PER_TABLE": "64",
+    },
+    "erp": {
+        "WORKLOAD_DURATION_SECONDS": "600",
+        "WORKLOAD_WORKERS": "32",
+        "WORKLOAD_INTERVAL_SECONDS": "0.005",
+        "WORKLOAD_REPORT_INTERVAL_SECONDS": "10",
+        "WORKLOAD_STATEMENT_TIMEOUT_MS": "30000",
+        "WORKLOAD_LOCK_TIMEOUT_MS": "1000",
+        "WORKLOAD_LOCK_HOLD_MS": "30",
+        "WORKLOAD_ERP_TABLE_COUNT": "500",
+        "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "8",
+        "WORKLOAD_ERP_ROWS_PER_TABLE": "2000",
     },
 }
 
@@ -515,6 +568,9 @@ class WorkloadConfig:
     max_event_rows: int
     event_cleanup_batch: int
     connect_timeout_seconds: int
+    erp_table_count: int
+    erp_query_variants_per_table: int
+    erp_rows_per_table: int
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> WorkloadConfig:
@@ -532,7 +588,7 @@ class WorkloadConfig:
 
         profile = values.get("WORKLOAD_PROFILE", "normal").strip().lower()
         if profile not in PROFILE_DEFAULTS:
-            raise ValueError("WORKLOAD_PROFILE must be quick, normal, or stress")
+            raise ValueError("WORKLOAD_PROFILE must be quick, normal, stress, or erp")
         defaults = PROFILE_DEFAULTS[profile]
 
         duration_seconds = _integer(
@@ -549,6 +605,8 @@ class WorkloadConfig:
             raise ValueError(
                 "WORKLOAD_REPORT_INTERVAL_SECONDS cannot exceed workload duration"
             )
+        if profile == "erp" and duration_seconds == 0:
+            raise ValueError("ERP workload duration must be bounded")
 
         random_seed = _integer(
             values,
@@ -606,6 +664,38 @@ class WorkloadConfig:
             1,
             30,
         )
+        erp_table_count = _integer(
+            values,
+            defaults,
+            "WORKLOAD_ERP_TABLE_COUNT",
+            0,
+            MAX_ERP_TABLES,
+        )
+        erp_query_variants_per_table = _integer(
+            values,
+            defaults,
+            "WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE",
+            1,
+            MAX_ERP_QUERY_VARIANTS_PER_TABLE,
+        )
+        erp_rows_per_table = _integer(
+            values,
+            defaults,
+            "WORKLOAD_ERP_ROWS_PER_TABLE",
+            1,
+            5_000,
+        )
+        if profile == "erp" and erp_table_count != MAX_ERP_TABLES:
+            raise ValueError(f"ERP profile requires exactly {MAX_ERP_TABLES} tables")
+        if profile == "erp" and erp_query_variants_per_table != MAX_ERP_QUERY_VARIANTS_PER_TABLE:
+            raise ValueError(
+                "ERP profile requires exactly "
+                f"{MAX_ERP_QUERY_VARIANTS_PER_TABLE} query variants per table"
+            )
+        if profile == "erp" and erp_rows_per_table != 2_000:
+            raise ValueError("ERP profile requires exactly 2000 rows per table")
+        if profile != "erp" and erp_table_count != 0:
+            raise ValueError("ERP tables require the bounded ERP profile")
 
         return cls(
             database_url=database_url,
@@ -623,6 +713,9 @@ class WorkloadConfig:
             max_event_rows=max_event_rows,
             event_cleanup_batch=event_cleanup_batch,
             connect_timeout_seconds=connect_timeout_seconds,
+            erp_table_count=erp_table_count,
+            erp_query_variants_per_table=erp_query_variants_per_table,
+            erp_rows_per_table=erp_rows_per_table,
         )
 
 
@@ -645,7 +738,7 @@ class DataBounds:
 
 
 CursorExecutor = Callable[
-    [psycopg.Cursor, random.Random, WorkloadConfig, DataBounds, int], None
+    [psycopg.Cursor, random.Random, WorkloadConfig, DataBounds, int], int | None
 ]
 
 
@@ -659,8 +752,119 @@ class Operation:
     fingerprints: tuple[str, ...]
     execute: CursorExecutor
 
-    def weight(self, profile: str) -> int:
-        return self.stress_weight if profile == "stress" else self.normal_weight
+    def weight(self, profile: str, *, erp_enabled: bool = False) -> int:
+        if self.category == "erp":
+            if not erp_enabled:
+                return 0
+            return self.stress_weight if profile in {"stress", "erp"} else self.normal_weight
+        return self.stress_weight if profile in {"stress", "erp"} else self.normal_weight
+
+
+def erp_fingerprint_target(config: WorkloadConfig) -> int:
+    return config.erp_table_count * config.erp_query_variants_per_table
+
+
+def erp_table_name(table_number: int) -> str:
+    if not 1 <= table_number <= MAX_ERP_TABLES:
+        raise ValueError(f"ERP table number must be between 1 and {MAX_ERP_TABLES}")
+    return f"{ERP_TABLE_PREFIX}{table_number:04d}"
+
+
+def build_erp_query(
+    table_number: int,
+    variant: int,
+    table_count: int,
+) -> sql.Composed:
+    """Build one bounded ERP query using identifiers derived only from integers."""
+
+    if not 1 <= table_count <= MAX_ERP_TABLES:
+        raise ValueError(f"ERP table count must be between 1 and {MAX_ERP_TABLES}")
+    if table_number > table_count:
+        raise ValueError("ERP table number cannot exceed configured table count")
+    if not 0 <= variant < len(ERP_QUERY_FAMILIES):
+        raise ValueError("ERP query variant is outside the allowlist")
+
+    table_name = erp_table_name(table_number)
+    relation = sql.Identifier(ERP_SCHEMA_NAME, table_name)
+    next_number = 1 if table_number == table_count else table_number + 1
+    next_relation = sql.Identifier(ERP_SCHEMA_NAME, erp_table_name(next_number))
+    tag = sql.SQL(
+        f" /* advisor-erp:{table_name}:{ERP_QUERY_FAMILIES[variant]} */"
+    )
+
+    statements: tuple[sql.Composed, ...] = (
+        sql.SQL(
+            "SELECT id, tenant_id, status_code, amount, updated_at "
+            "FROM {} WHERE id = %s"
+        ).format(relation),
+        sql.SQL(
+            "SELECT status_code, count(*) AS row_count, sum(amount) AS total_amount "
+            "FROM {} WHERE tenant_id = %s AND status_code = %s "
+            "GROUP BY status_code"
+        ).format(relation),
+        sql.SQL(
+            "SELECT id, amount, updated_at FROM {} "
+            "WHERE updated_at >= now() - (%s * interval '1 day') "
+            "ORDER BY updated_at DESC, id DESC LIMIT 20"
+        ).format(relation),
+        sql.SQL(
+            "SELECT count(*) FROM {} WHERE payload ->> 'channel' = %s"
+        ).format(relation),
+        sql.SQL(
+            "SELECT avg(amount), max(amount), min(amount) FROM {} "
+            "WHERE amount BETWEEN (%s::numeric / 100) AND (%s::numeric / 100)"
+        ).format(relation),
+        sql.SQL(
+            "SELECT tenant_id, count(*) AS row_count, sum(amount) AS total_amount "
+            "FROM {} WHERE status_code = %s GROUP BY tenant_id "
+            "ORDER BY row_count DESC, tenant_id LIMIT 10"
+        ).format(relation),
+        # PostgreSQL 18 deliberately assigns the plain two-relation JOIN the
+        # same queryid across this homogeneous 500-table fixture.  Keeping the
+        # left relation in a CTE preserves a realistic read-only JOIN while an
+        # empirical pg_stat_statements sweep distinguishes all 500 relations.
+        sql.SQL(
+            "WITH left_scope AS ("
+            "SELECT id, parent_id FROM {} WHERE tenant_id = %s"
+            ") SELECT count(*) FROM left_scope AS left_entity "
+            "JOIN {} AS right_entity ON right_entity.id = left_entity.parent_id "
+            "WHERE right_entity.status_code = %s"
+        ).format(relation, next_relation),
+        sql.SQL(
+            "WITH recent AS ("
+            "SELECT status_code, amount FROM {} "
+            "WHERE updated_at >= now() - (%s * interval '1 day')"
+            ") SELECT count(*), coalesce(sum(amount), 0) "
+            "FROM recent WHERE status_code <> %s"
+        ).format(relation),
+    )
+    return statements[variant] + tag
+
+
+def erp_query_parameters(
+    variant: int,
+    rng: random.Random,
+    config: WorkloadConfig,
+    bounds: DataBounds,
+) -> tuple[object, ...]:
+    if variant == 0:
+        return (rng.randint(1, config.erp_rows_per_table),)
+    if variant == 1:
+        return (rng.randint(1, bounds.max_tenant_id), rng.randrange(8))
+    if variant == 2:
+        return (rng.randint(1, 90),)
+    if variant == 3:
+        return (rng.choice(("web", "mobile", "store", "partner")),)
+    if variant == 4:
+        lower = rng.randint(100, 100_000)
+        return (lower, lower + rng.randint(1_000, 100_000))
+    if variant == 5:
+        return (rng.randrange(8),)
+    if variant == 6:
+        return (rng.randint(1, bounds.max_tenant_id), rng.randrange(8))
+    if variant == 7:
+        return (rng.randint(1, 90), rng.randrange(8))
+    raise ValueError("ERP query variant is outside the allowlist")
 
 
 def _consume_all(cursor: psycopg.Cursor) -> None:
@@ -795,6 +999,29 @@ def execute_temp_customer_rollup(
 ) -> None:
     cursor.execute(TEMP_CUSTOMER_ROLLUP_SQL)
     _consume_all(cursor)
+
+
+def execute_erp_query(
+    cursor: psycopg.Cursor,
+    rng: random.Random,
+    config: WorkloadConfig,
+    bounds: DataBounds,
+    _worker_id: int,
+    fingerprint_ordinal: int | None = None,
+) -> int:
+    target = erp_fingerprint_target(config)
+    if target < 1:
+        raise RuntimeError("ERP query selected without a configured ERP catalog")
+    ordinal = rng.randrange(target) if fingerprint_ordinal is None else fingerprint_ordinal
+    if not 0 <= ordinal < target:
+        raise ValueError("ERP fingerprint ordinal is outside the configured sweep")
+    table_number = (ordinal // config.erp_query_variants_per_table) + 1
+    variant = ordinal % config.erp_query_variants_per_table
+    statement = build_erp_query(table_number, variant, config.erp_table_count)
+    parameters = erp_query_parameters(variant, rng, config, bounds)
+    cursor.execute(statement, parameters)
+    _consume_all(cursor)
+    return ordinal
 
 
 def execute_write_mutation(
@@ -1016,6 +1243,24 @@ OPERATIONS: tuple[Operation, ...] = (
         execute_temp_customer_rollup,
     ),
     Operation(
+        "erp-query-reader",
+        "erp",
+        READER_ROLE,
+        250,
+        350,
+        ("advisor-erp-deterministic-sweep",),
+        execute_erp_query,
+    ),
+    Operation(
+        "erp-query-reporter",
+        "erp",
+        REPORTER_ROLE,
+        250,
+        350,
+        ("advisor-erp-deterministic-sweep",),
+        execute_erp_query,
+    ),
+    Operation(
         "write-mutation",
         "write",
         WRITER_ROLE,
@@ -1091,6 +1336,7 @@ ROLE_SHARES: dict[str, dict[str, float]] = {
     "quick": {READER_ROLE: 0.50, REPORTER_ROLE: 0.30, WRITER_ROLE: 0.20},
     "normal": {READER_ROLE: 0.50, REPORTER_ROLE: 0.30, WRITER_ROLE: 0.20},
     "stress": {READER_ROLE: 0.35, REPORTER_ROLE: 0.30, WRITER_ROLE: 0.35},
+    "erp": {READER_ROLE: 0.50, REPORTER_ROLE: 0.35, WRITER_ROLE: 0.15},
 }
 
 
@@ -1115,10 +1361,17 @@ def allocate_worker_roles(workers: int, profile: str, seed: int) -> tuple[str, .
 
 
 def choose_operation(
-    role: str, profile: str, rng: random.Random
+    role: str,
+    profile: str,
+    rng: random.Random,
+    *,
+    erp_enabled: bool = False,
 ) -> Operation:
     operations = OPERATIONS_BY_ROLE[role]
-    weights = [operation.weight(profile) for operation in operations]
+    weights = [
+        operation.weight(profile, erp_enabled=erp_enabled)
+        for operation in operations
+    ]
     return rng.choices(operations, weights=weights, k=1)[0]
 
 
@@ -1190,6 +1443,26 @@ class WorkloadMetrics:
         self._operations = {operation.name: OperationMetric() for operation in OPERATIONS}
         self._connection_errors = 0
         self._errors_by_sqlstate: Counter[str] = Counter()
+        self._erp_next_ordinal = 0
+        self._erp_visited: set[int] = set()
+
+    def reserve_erp_fingerprint(self, target: int) -> int:
+        if target < 1:
+            raise ValueError("ERP fingerprint target must be positive")
+        with self._lock:
+            ordinal = self._erp_next_ordinal % target
+            self._erp_next_ordinal += 1
+            return ordinal
+
+    def record_erp_fingerprint(self, ordinal: int) -> None:
+        with self._lock:
+            self._erp_visited.add(ordinal)
+
+    def erp_coverage(self, target: int) -> tuple[int, float]:
+        with self._lock:
+            visited = len(self._erp_visited)
+        coverage = 0.0 if target == 0 else min(100.0, 100 * visited / target)
+        return visited, round(coverage, 3)
 
     def record_operation(
         self,
@@ -1320,6 +1593,18 @@ def preflight(config: WorkloadConfig) -> DataBounds:
                     "DATABASE_URL login cannot SET ROLE to all dedicated workload roles"
                 )
 
+            if config.erp_table_count > 0:
+                cursor.execute(
+                    ERP_PREFLIGHT_SQL,
+                    (config.erp_table_count, config.erp_table_count),
+                )
+                erp_check = cursor.fetchone()
+                if erp_check is None or not bool(erp_check[0]):
+                    raise RuntimeError(
+                        "ERP workload catalog is incomplete; rerun the realistic "
+                        "workload preparation for the configured ERP table count"
+                    )
+
             cursor.execute(DATA_BOUNDS_SQL)
             raw_bounds = cursor.fetchone()
             if raw_bounds is None:
@@ -1430,11 +1715,30 @@ def run_worker(
                 reconnect_delay = 0.25
 
                 while not stop_event.is_set() and time.monotonic() < deadline:
-                    operation = choose_operation(role, config.profile, rng)
+                    operation = choose_operation(
+                        role,
+                        config.profile,
+                        rng,
+                        erp_enabled=config.erp_table_count > 0,
+                    )
+                    erp_ordinal: int | None = None
                     started_at = time.perf_counter()
                     try:
                         with connection.cursor() as cursor:
-                            operation.execute(cursor, rng, config, bounds, worker_id)
+                            if operation.category == "erp":
+                                erp_ordinal = metrics.reserve_erp_fingerprint(
+                                    erp_fingerprint_target(config)
+                                )
+                                execute_erp_query(
+                                    cursor,
+                                    rng,
+                                    config,
+                                    bounds,
+                                    worker_id,
+                                    erp_ordinal,
+                                )
+                            else:
+                                operation.execute(cursor, rng, config, bounds, worker_id)
                         connection.commit()
                     except psycopg.Error as exc:
                         latency_ms = (time.perf_counter() - started_at) * 1000
@@ -1466,6 +1770,8 @@ def run_worker(
                     else:
                         latency_ms = (time.perf_counter() - started_at) * 1000
                         metrics.record_operation(operation, latency_ms, True)
+                        if erp_ordinal is not None:
+                            metrics.record_erp_fingerprint(erp_ordinal)
 
                     remaining = deadline - time.monotonic()
                     if config.interval_seconds > 0 and remaining > 0:
@@ -1498,6 +1804,10 @@ def _heartbeat_payload(
     remaining_seconds: float,
 ) -> dict[str, object]:
     snapshot = metrics.snapshot(elapsed_seconds)
+    if config.erp_table_count == 0:
+        snapshot["categories"].pop("erp", None)  # type: ignore[union-attr]
+        snapshot["operations"].pop("erp-query-reader", None)  # type: ignore[union-attr]
+        snapshot["operations"].pop("erp-query-reporter", None)  # type: ignore[union-attr]
     return {
         "type": "advisor-realistic-heartbeat",
         "profile": config.profile,
@@ -1518,6 +1828,7 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
     roles = allocate_worker_roles(config.workers, config.profile, config.random_seed)
     role_workers = _role_counts(roles)
     metrics = WorkloadMetrics(config.random_seed)
+    erp_target = erp_fingerprint_target(config)
     stop_event = threading.Event()
     signal_received: dict[str, int | None] = {"value": None}
 
@@ -1553,6 +1864,10 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
             "randomSeed": config.random_seed,
             "dataBounds": bounds.__dict__,
             "sqlTemplateCount": len(SQL_TEMPLATES),
+            "erpTableCount": config.erp_table_count,
+            "erpRowsPerTable": config.erp_rows_per_table,
+            "erpQueryVariantsPerTable": config.erp_query_variants_per_table,
+            "erpFingerprintTarget": erp_target,
         }
     )
 
@@ -1613,6 +1928,11 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
     finished_at_utc = _utc_timestamp()
     after = capture_database_stats(config)
     snapshot = metrics.snapshot(elapsed_seconds)
+    if config.erp_table_count == 0:
+        snapshot["categories"].pop("erp", None)  # type: ignore[union-attr]
+        snapshot["operations"].pop("erp-query-reader", None)  # type: ignore[union-attr]
+        snapshot["operations"].pop("erp-query-reporter", None)  # type: ignore[union-attr]
+    erp_visited, erp_coverage_percent = metrics.erp_coverage(erp_target)
 
     if fatal_error is not None:
         status = "failed"
@@ -1621,6 +1941,9 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
         status = "interrupted"
         exit_code = 128 + int(signal_received["value"])
     elif int(snapshot["totals"]["succeeded"]) == 0:  # type: ignore[index]
+        status = "failed"
+        exit_code = 1
+    elif config.profile == "erp" and erp_visited < erp_target:
         status = "failed"
         exit_code = 1
     else:
@@ -1641,11 +1964,19 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
         "randomSeed": config.random_seed,
         "dataBounds": bounds.__dict__,
         "sqlTemplateCount": len(SQL_TEMPLATES),
+        "erpTableCount": config.erp_table_count,
+        "erpRowsPerTable": config.erp_rows_per_table,
+        "erpQueryVariantsPerTable": config.erp_query_variants_per_table,
+        "erpFingerprintTarget": erp_target,
+        "erpVisitedFingerprintCount": erp_visited,
+        "erpFingerprintCoveragePercent": erp_coverage_percent,
         "databaseDelta": database_delta(before, after),
         **snapshot,
     }
     if fatal_error is not None:
         final["fatalErrorType"] = type(fatal_error).__name__
+    if config.profile == "erp" and erp_visited < erp_target:
+        final["failureReason"] = "erp-fingerprint-coverage-incomplete"
     if signal_received["value"] is not None:
         final["signal"] = int(signal_received["value"])
     _emit(final)

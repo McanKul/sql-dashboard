@@ -12,6 +12,7 @@ from starlette.responses import Response
 from app.api.router import router
 from app.config import get_settings
 from app.db import close_pool, open_pool
+from app.repositories.powa import repository
 
 
 settings = get_settings()
@@ -30,6 +31,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await repository.close_query_rows_cache()
         await close_pool()
         logger.info("api_stopped")
 

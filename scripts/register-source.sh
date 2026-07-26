@@ -274,6 +274,10 @@ probe="$({ printf '%s\n' "$source_password"; } | docker compose exec -T reposito
             COALESCE(has_function_privilege(
               current_user, 'advisor_join.capture_and_reset()', 'EXECUTE'
             ), false),
+            to_regprocedure('advisor_join.assert_outbox_within_limits()') IS NOT NULL,
+            NOT COALESCE(has_function_privilege(
+              current_user, 'advisor_join.assert_outbox_within_limits()', 'EXECUTE'
+            ), false),
             NOT COALESCE((
               SELECT has_function_privilege(
                        current_user,
@@ -286,10 +290,10 @@ probe="$({ printf '%s\n' "$source_password"; } | docker compose exec -T reposito
             ), false);"
 ' _ "$source_host" "$source_port" "$monitoring_db" "$collector_user")" || fail "Collector roluyle kaynak preflight basarisiz. --prepare kullanin veya docs/INSTALLATION.md adimlarini uygulayin."
 
-IFS='|' read -r powa_version pgss_ready pgqs_version pgsk_version pgws_version read_stats snapshot_role pgss_callable pgqs_source_ready pgsk_source_ready pgws_source_ready wait_gucs_ready join_capture_ready direct_reset_revoked <<< "$probe"
+IFS='|' read -r powa_version pgss_ready pgqs_version pgsk_version pgws_version read_stats snapshot_role pgss_callable pgqs_source_ready pgsk_source_ready pgws_source_ready wait_gucs_ready join_capture_ready join_guard_ready join_guard_direct_revoked direct_reset_revoked <<< "$probe"
 [[ "$powa_version" =~ ^([4-9]|[1-9][0-9]+)\. ]] || fail "Kaynak PoWA 4+ olmali; bulunan: ${powa_version:-yok}"
-[[ "$pgss_ready" == t && "$pgqs_version" =~ ^2\.1\. && "$pgsk_version" =~ ^2\.3\. && "$pgws_version" == "1.1" && "$read_stats" == t && "$snapshot_role" == t && "$pgss_callable" == t && "$pgqs_source_ready" == t && "$pgsk_source_ready" == t && "$pgws_source_ready" == t && "$wait_gucs_ready" == t && "$join_capture_ready" == t && "$direct_reset_revoked" == t ]] \
-  || fail "Kaynak preflight eksik: pgss=${pgss_ready}, pg_qualstats=${pgqs_version:-yok}, pg_stat_kcache=${pgsk_version:-yok}, pg_wait_sampling=${pgws_version:-yok}, wait_gucs=${wait_gucs_ready}, read_stats=${read_stats}, powa_snapshot=${snapshot_role}, pgss_callable=${pgss_callable}, pgqs_source=${pgqs_source_ready}, kcache_source=${pgsk_source_ready}, waits_source=${pgws_source_ready}, join_capture=${join_capture_ready}, direct_reset_revoked=${direct_reset_revoked}"
+[[ "$pgss_ready" == t && "$pgqs_version" =~ ^2\.1\. && "$pgsk_version" =~ ^2\.3\. && "$pgws_version" == "1.1" && "$read_stats" == t && "$snapshot_role" == t && "$pgss_callable" == t && "$pgqs_source_ready" == t && "$pgsk_source_ready" == t && "$pgws_source_ready" == t && "$wait_gucs_ready" == t && "$join_capture_ready" == t && "$join_guard_ready" == t && "$join_guard_direct_revoked" == t && "$direct_reset_revoked" == t ]] \
+  || fail "Kaynak preflight eksik: pgss=${pgss_ready}, pg_qualstats=${pgqs_version:-yok}, pg_stat_kcache=${pgsk_version:-yok}, pg_wait_sampling=${pgws_version:-yok}, wait_gucs=${wait_gucs_ready}, read_stats=${read_stats}, powa_snapshot=${snapshot_role}, pgss_callable=${pgss_callable}, pgqs_source=${pgqs_source_ready}, kcache_source=${pgsk_source_ready}, waits_source=${pgws_source_ready}, join_capture=${join_capture_ready}, join_guard=${join_guard_ready}, join_guard_direct_revoked=${join_guard_direct_revoked}, direct_reset_revoked=${direct_reset_revoked}"
 info "Kaynak preflight gecti (PoWA ${powa_version}, pg_qualstats ${pgqs_version}, pg_stat_kcache ${pgsk_version}, pg_wait_sampling release 1.1.11/ext ${pgws_version})"
 
 repo_psql=(docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 --dbname powa_repository --tuples-only --no-align)

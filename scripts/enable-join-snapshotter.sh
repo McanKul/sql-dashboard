@@ -10,6 +10,11 @@ docker compose ps --services --status running | grep -qx source-db \
 docker compose ps --services --status running | grep -qx repository-db \
   || fail "repository-db calismiyor"
 
+join_source_alias="$(docker compose exec -T repository-db printenv JOIN_SOURCE_ALIAS 2>/dev/null || true)"
+join_source_alias="${join_source_alias:-test-source}"
+[[ "$join_source_alias" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$ ]] \
+  || fail "JOIN source alias guvenli degil: ${join_source_alias}"
+
 docker compose exec -T source-db test -r /opt/advisor/sql/003_join_snapshot_source.sql \
   || fail "Source container JOIN outbox SQL dosyasini tasimiyor; source-db'yi yeni compose ile yeniden olusturun"
 
@@ -82,7 +87,11 @@ source_acl="$(docker compose exec -T source-db psql -X --set=ON_ERROR_STOP=1 \
   --command "SELECT
       has_function_privilege('powa_collector', 'advisor_join.capture_and_reset()', 'EXECUTE'),
       has_function_privilege('advisor_join_reader', 'advisor_join.fetch_batches(integer)', 'EXECUTE'),
+      has_function_privilege('advisor_join_reader', 'advisor_join.list_batch_headers(integer)', 'EXECUTE'),
+      has_function_privilege('advisor_join_reader', 'advisor_join.fetch_batch_chunk(bigint,integer)', 'EXECUTE'),
       has_function_privilege('advisor_join_reader', 'advisor_join.ack_batch(bigint)', 'EXECUTE'),
+      NOT has_function_privilege('powa_collector', 'advisor_join.assert_outbox_within_limits()', 'EXECUTE'),
+      NOT has_function_privilege('advisor_join_reader', 'advisor_join.assert_outbox_within_limits()', 'EXECUTE'),
       NOT has_table_privilege('advisor_join_reader', 'advisor_join.outbox_batches', 'SELECT'),
       NOT COALESCE((
         SELECT has_function_privilege(
@@ -94,7 +103,7 @@ source_acl="$(docker compose exec -T source-db psql -X --set=ON_ERROR_STOP=1 \
           JOIN pg_namespace namespace ON namespace.oid = extension.extnamespace
          WHERE extension.extname = 'pg_qualstats'
       ), false)")"
-[[ "$source_acl" == "t|t|t|t|t" ]] \
+[[ "$source_acl" == "t|t|t|t|t|t|t|t|t" ]] \
   || fail "Source least-privilege kontrolu basarisiz: ${source_acl:-bos}"
 
 repository_acl="$(docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
@@ -102,11 +111,16 @@ repository_acl="$(docker compose exec -T repository-db psql -X --set=ON_ERROR_ST
   --tuples-only --no-align --field-separator='|' \
   --command "SELECT
       has_function_privilege('advisor_join_ingest', 'advisor_ingest.ingest_join_batch(text,bigint,timestamptz,jsonb)', 'EXECUTE'),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.ingest_join_chunk(text,bigint,timestamptz,integer,integer,integer,boolean,jsonb)', 'EXECUTE'),
+      has_function_privilege('advisor_join_ingest', 'advisor_ingest.finalize_join_batch(text,bigint)', 'EXECUTE'),
       has_function_privilege('advisor_join_ingest', 'advisor_ingest.record_join_error(text,text)', 'EXECUTE'),
       has_function_privilege('advisor_join_ingest', 'advisor_ingest.purge_join_source_history(text,interval)', 'EXECUTE'),
       NOT has_function_privilege('advisor_join_ingest', 'advisor_ingest.purge_join_history(interval)', 'EXECUTE'),
       NOT has_function_privilege('advisor_join_ingest', 'advisor_ingest.refresh_candidates(integer,bigint)', 'EXECUTE'),
       NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_snapshot_batches', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_batch_staging', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_chunk_receipts', 'SELECT'),
+      NOT has_table_privilege('advisor_join_ingest', 'advisor_ingest.join_predicate_staging', 'SELECT'),
       NOT has_schema_privilege('advisor_api', 'advisor_ingest', 'USAGE'),
       has_function_privilege('advisor_api', 'advisor.runtime_replay_fixture_status(uuid[],integer,oid,bigint,text)', 'EXECUTE'),
       has_function_privilege('advisor_api', 'advisor.runtime_replay_fixture(uuid,integer,oid,bigint,text)', 'EXECUTE'),
@@ -116,17 +130,17 @@ repository_acl="$(docker compose exec -T repository-db psql -X --set=ON_ERROR_ST
          FROM advisor_ingest.join_source_role_bindings AS binding
           JOIN \"PoWA\".powa_servers AS server ON server.id = binding.server_id
          WHERE binding.role_name = 'advisor_join_ingest'
-           AND server.alias = 'test-source'
+           AND server.alias = '${join_source_alias}'
       )")"
-[[ "$repository_acl" == "t|t|t|t|t|t|t|t|t|t|t" ]] \
+[[ "$repository_acl" == "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ]] \
   || fail "Repository least-privilege kontrolu basarisiz: ${repository_acl:-bos}"
 pass "JOIN ingest rolu tek kaynaga bagli ve yalniz source-scoped wrapper fonksiyonlarini cagirabiliyor"
 
 demo_server_id="$(docker compose exec -T repository-db psql -U postgres -p 5433 \
   -d powa_repository -Atqc \
-  "SELECT id FROM \"PoWA\".powa_servers WHERE alias='test-source'")"
+  "SELECT id FROM \"PoWA\".powa_servers WHERE alias='${join_source_alias}'")"
 [[ "$demo_server_id" =~ ^[0-9]+$ ]] \
-  || fail "Repository'de test-source kaydi bulunamadi"
+  || fail "Repository'de ${join_source_alias} kaydi bulunamadi"
 
 docker compose up -d --force-recreate --no-deps join-snapshotter >/dev/null
 
@@ -236,10 +250,11 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 
-[[ "$join_status" == "HEALTHY" && "$join_rows" =~ ^[0-9]+$ \
-   && "$candidate_rows" =~ ^[0-9]+$ ]] \
-   && ((join_rows > 0 && candidate_rows > 0)) \
-  || fail "JOIN/composite kabul kaniti olusmadi: ${candidate_state:-bos}"
+if [[ "$join_status" != "HEALTHY" || ! "$join_rows" =~ ^[0-9]+$ \
+   || ! "$candidate_rows" =~ ^[0-9]+$ ]] \
+   || ((join_rows <= 0 || candidate_rows <= 0)); then
+  fail "JOIN/composite kabul kaniti olusmadi: ${candidate_state:-bos}"
+fi
 
 trap - EXIT INT TERM
 pass "Iki JOIN snapshot'i, repository aktarimi ve persisted composite aday dogrulandi (${join_rows} JOIN, ${candidate_rows} aday)"

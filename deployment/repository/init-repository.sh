@@ -5,6 +5,11 @@ set -Eeuo pipefail
 : "${ADVISOR_API_PASSWORD:?ADVISOR_API_PASSWORD tanimli olmali}"
 : "${ADVISOR_JOIN_REPOSITORY_PASSWORD:?ADVISOR_JOIN_REPOSITORY_PASSWORD tanimli olmali}"
 : "${REGISTER_DEMO_SOURCE:=true}"
+: "${DEMO_SOURCE_FREQUENCY:=60}"
+
+[[ "$DEMO_SOURCE_FREQUENCY" =~ ^[0-9]+$ ]] \
+  && (( DEMO_SOURCE_FREQUENCY >= 5 && DEMO_SOURCE_FREQUENCY <= 86400 )) \
+  || { echo "DEMO_SOURCE_FREQUENCY 5-86400 arasinda olmali" >&2; exit 1; }
 
 psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   --set=collector_password="$POWA_COLLECTOR_PASSWORD" \
@@ -37,7 +42,8 @@ SQL
 
 case "$REGISTER_DEMO_SOURCE" in
   true|TRUE|1|yes|YES)
-    psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+    psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      --set=demo_source_frequency="$DEMO_SOURCE_FREQUENCY" <<'SQL'
 SELECT "PoWA".powa_register_server(
     hostname => 'source-db',
     port => 5432,
@@ -45,7 +51,7 @@ SELECT "PoWA".powa_register_server(
     username => 'powa_collector',
     password => NULL,
     dbname => 'powa',
-    frequency => 5,
+    frequency => :'demo_source_frequency'::integer,
     powa_coalesce => 100,
     retention => interval '90 days',
     allow_ui_connection => false,
