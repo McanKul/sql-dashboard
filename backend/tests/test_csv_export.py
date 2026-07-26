@@ -228,9 +228,19 @@ async def test_csv_export_streams_all_filtered_rows_and_audits_before_body(
         captured[f"{event}_actor"] = actor
         captured[f"{event}_details"] = details
 
+    async def resolve_scope(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs == {"server_id": 7, "database_id": 16_384}
+        return {
+            "server_id": 7,
+            "server_alias": "erp-source",
+            "database_id": 16_384,
+            "database_name": "appdb",
+        }
+
     monkeypatch.setattr(repository, "stream_query_rows", stream_query_rows)
     monkeypatch.setattr(repository, "query_rows", forbidden_query_rows)
     monkeypatch.setattr(repository, "record_query_export_audit", record_query_export_audit)
+    monkeypatch.setattr(repository, "resolve_scope", resolve_scope)
 
     response = await export_queries(
         principal=ADMIN_PRINCIPAL,

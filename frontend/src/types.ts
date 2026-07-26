@@ -1,6 +1,11 @@
-export type PageId = 'overview' | 'queries' | 'health' | 'operations'
+export type PageId = 'overview' | 'queries' | 'optimize' | 'health' | 'operations'
 
 export type TimeWindow = '1h' | '24h' | '7d' | '30d'
+
+export interface AnalysisScope {
+  serverId?: number
+  databaseId?: number
+}
 
 export type Severity = 'critical' | 'warning' | 'healthy'
 
@@ -31,6 +36,95 @@ export interface OverviewStats {
     averageMs: number
     loadPercent: number
   }>
+  topQueries: QuerySummary[]
+}
+
+export type CapabilityStatus = 'AVAILABLE' | 'WAITING_FOR_DATA' | 'DEGRADED' | 'NOT_CONFIGURED' | 'UNREACHABLE'
+
+export type SourceCapabilityKey =
+  | 'historicalMetrics'
+  | 'cpuMetrics'
+  | 'waitSampling'
+  | 'predicateMetrics'
+  | 'joinSnapshot'
+  | 'hypopg'
+  | 'sourceExplain'
+  | 'cloneValidation'
+
+export interface SourceCapability {
+  key: SourceCapabilityKey
+  label: string
+  status: CapabilityStatus
+  configured: boolean
+  healthy: boolean | null
+  dataAvailable: boolean | null
+  available: boolean
+  version?: string | null
+  reasonCode: string | null
+  reason: string | null
+}
+
+export interface SourceCapabilityRow {
+  serverId: number
+  serverAlias: string
+  databaseId: number
+  databaseName: string
+  capabilities: SourceCapability[]
+}
+
+export interface CapabilityMatrixData {
+  window: TimeWindow
+  items: SourceCapabilityRow[]
+}
+
+export interface DatabaseOptimizeItem {
+  groupId: string
+  serverId: number
+  serverAlias: string
+  databaseId: number
+  databaseName: string
+  relationId: number
+  schemaName: string
+  tableName: string
+  method: 'btree'
+  columns: string[]
+  confidence: 'LOW' | 'MEDIUM' | 'HIGH'
+  createIndexSql: string
+  representative: { candidateId: string; queryId: string }
+  affectedQueryCount: number
+  affectedQueryIds: string[]
+  affectedLoadMs: number
+  evidence: {
+    joinOccurrences: number
+    filterOccurrences: number
+    sampleCount: number
+    observedFrom: string
+    observedTo: string
+  }
+  existingIndex: { status: string; reason: string | null }
+  hypopg: { status: string; reason: string | null }
+  maintenanceCost: {
+    writeRows: number | null
+    writesPerHour: number | null
+    risk: string
+    walBytesEstimate: null
+    reason: string | null
+  }
+}
+
+export interface DatabaseOptimizeData {
+  window: TimeWindow
+  scope: AnalysisScope
+  summary: {
+    candidateGroups: number
+    affectedQueries: number
+    affectedLoadMs: number
+    validatedGroups: number
+  }
+  items: DatabaseOptimizeItem[]
+  page: number
+  pageSize: number
+  total: number
 }
 
 export interface QueryObservationReliability {
@@ -608,6 +702,16 @@ export interface ServerOperationTelemetryItem {
 }
 
 export interface OperationsData {
+  release: {
+    applicationVersion: string
+    migration: {
+      current: string | null
+      expected: string
+      appliedCount: number
+      latestAppliedAt: string | null
+      upToDate: boolean
+    }
+  }
   architecture: {
     host?: string
     dataFlow: string[]

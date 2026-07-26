@@ -2,6 +2,23 @@ name: PostgreSQL integration
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "backend/**"
+      - "deployment/**"
+      - "scripts/**"
+      - "sql/**"
+      - "compose.yaml"
+      - ".github/workflows/postgres-integration.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "deployment/**"
+      - "scripts/**"
+      - "sql/**"
+      - "compose.yaml"
+      - ".github/workflows/postgres-integration.yml"
   schedule:
     - cron: "17 3 * * 1"
 
@@ -93,9 +110,79 @@ jobs:
             psql -X --set=ON_ERROR_STOP=1 --username postgres \
               --port 5433 --dbname powa_repository --file=- \
             < sql/tests/join_duplicate_aggregation_integration.sql
+          docker compose exec -T repository-db \
+            psql -X --set=ON_ERROR_STOP=1 --username postgres \
+              --port 5433 --dbname powa_repository --file=- \
+            < sql/tests/product_scope_optimize_release_integration.sql
           docker compose exec -T source-db \
             psql -X --set=ON_ERROR_STOP=1 --username postgres --dbname powa --file=- \
             < sql/tests/join_outbox_guardrail_integration.sql
+
+      - name: Verify a persisted 0013 database upgrades to 0014
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          upgrade_database="advisor_upgrade_0013"
+          old_manifest="${RUNNER_TEMP}/repository-migrations-0013.manifest"
+          cleanup() {
+            docker compose exec -T repository-db \
+              psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+                --dbname postgres \
+                --command="DROP DATABASE IF EXISTS ${upgrade_database} WITH (FORCE)" \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker compose exec -T repository-db \
+            psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+              --dbname postgres \
+              --command="CREATE DATABASE ${upgrade_database} TEMPLATE template0"
+          docker compose exec -T repository-db \
+            psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+              --dbname "${upgrade_database}" <<'SQL'
+          CREATE EXTENSION pg_stat_statements;
+          CREATE EXTENSION btree_gist;
+          CREATE SCHEMA "PoWA";
+          CREATE EXTENSION powa WITH SCHEMA "PoWA";
+          SELECT "PoWA".setup_powa_roles(true);
+          SQL
+
+          head -n 14 sql/repository-migrations.manifest >"${old_manifest}"
+          docker compose run --rm \
+            --env PGDATABASE="${upgrade_database}" \
+            --env MIGRATIONS_MANIFEST=/tmp/repository-migrations-0013.manifest \
+            --volume "${old_manifest}:/tmp/repository-migrations-0013.manifest:ro" \
+            repository-migrate
+          version_before="$(docker compose exec -T repository-db \
+            psql -X --tuples-only --no-align --username postgres --port 5433 \
+              --dbname "${upgrade_database}" \
+              --command="SELECT max(version) || ':' || count(*) FROM advisor_migrations.schema_migrations")"
+          test "${version_before}" = "0013:13"
+
+          docker compose run --rm \
+            --env PGDATABASE="${upgrade_database}" \
+            repository-migrate
+          docker compose exec -T repository-db \
+            psql -X --set=ON_ERROR_STOP=1 --username postgres --port 5433 \
+              --dbname "${upgrade_database}" <<'SQL'
+          DO $upgrade_test$
+          DECLARE
+              release record;
+          BEGIN
+              SELECT * INTO STRICT release FROM advisor.release_info();
+              IF release.current_migration <> '0014' OR release.applied_count <> 14 THEN
+                  RAISE EXCEPTION 'unexpected upgraded release state: %', row_to_json(release);
+              END IF;
+              IF NOT has_function_privilege(
+                  'advisor_api',
+                  'advisor.query_trend(timestamp with time zone,interval,integer,oid)',
+                  'EXECUTE'
+              ) THEN
+                  RAISE EXCEPTION 'scoped query_trend grant missing after upgrade';
+              END IF;
+          END
+          $upgrade_test$;
+          SQL
 
       - name: Verify real role drift reconciliation
         run: |

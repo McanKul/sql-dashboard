@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     query_list_cache_fresh_seconds: float = Field(default=60.0, ge=0, le=3_600)
     query_list_cache_stale_seconds: float = Field(default=300.0, gt=0, le=86_400)
     query_list_cache_max_entries: int = Field(default=4, ge=1, le=4)
+    # Trend rows are tiny, but their key space is window x source x database.
+    # Keep this independent from the four full query-metrics snapshots so
+    # browsing several databases does not continually evict scoped trends.
+    global_trend_cache_max_entries: int = Field(default=64, ge=4, le=1_024)
     query_list_cache_max_rows: int = Field(default=100_000, ge=1, le=1_000_000)
     # PostgreSQL's composite-row size is a conservative, deterministic input
     # budget for each cached window.  The API container also has a hard memory
@@ -91,6 +95,8 @@ class Settings(BaseSettings):
     retention_days: int = 90
     log_level: str = "INFO"
     evaluator_url: str | None = None
+    evaluator_allowed_server_alias: str | None = "test-source"
+    evaluator_allowed_database: str | None = "appdb"
     evaluator_token: str = "advisor-dev-evaluator-token"
     evaluator_timeout_seconds: float = Field(default=4.0, gt=0, le=15)
     # Source EXPLAIN ANALYZE really executes the persisted SELECT.  It gets a
@@ -98,6 +104,8 @@ class Settings(BaseSettings):
     # endpoint so ERP-scale reads can complete without weakening that gate.
     source_explain_timeout_seconds: float = Field(default=130.0, gt=0, le=310)
     clone_evaluator_url: str | None = None
+    clone_source_alias: str | None = "test-source"
+    clone_template_database: str | None = "appdb"
     clone_evaluator_token: str = "advisor-dev-clone-evaluator-token"
     clone_evaluator_timeout_seconds: float = Field(default=90.0, gt=0, le=180)
     advisor_auth_principals: list[AuthPrincipalConfig] = Field(default_factory=list)

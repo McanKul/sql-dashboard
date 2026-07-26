@@ -18,6 +18,7 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.conninfo import resolve_conninfo
+from app.version import APPLICATION_VERSION
 from app.clone_evaluator import (
     CloneEvaluationStop,
     _assert_read_only_select,
@@ -899,7 +900,7 @@ def _evaluate_source_query(
 
 app = FastAPI(
     title="PostgreSQL Advisor Source Evaluator",
-    version="1.1.0-iteration-2.7",
+    version=APPLICATION_VERSION,
     description=(
         "Internal HypoPG planner and read-only source EXPLAIN ANALYZE evaluator."
     ),
@@ -959,6 +960,8 @@ async def health() -> dict[str, Any]:
         return {
             "status": "healthy",
             "busy": True,
+            "sourceAlias": settings.evaluator_allowed_server_alias,
+            "databaseName": settings.evaluator_allowed_database,
             "sourceReadOnlyExplain": True,
             "sourceDdlExecuted": False,
         }
@@ -979,7 +982,14 @@ async def health() -> dict[str, Any]:
         )
         if not healthy:
             raise RuntimeError("Evaluator capability mismatch")
-        return {"status": "healthy", **result, "ddlExecuted": False}
+        return {
+            "status": "healthy",
+            "busy": False,
+            "sourceAlias": settings.evaluator_allowed_server_alias,
+            **result,
+            "sourceReadOnlyExplain": True,
+            "ddlExecuted": False,
+        }
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Evaluator hazir degil.") from exc
 

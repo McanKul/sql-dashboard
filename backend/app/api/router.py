@@ -42,11 +42,64 @@ from app.security import (
 )
 from app.services.evaluator import evaluate_index_candidate, explain_query_on_source
 from app.services.clone_evaluator import validate_index_on_clone
+from app.services.capabilities import evaluator_health
+from app.version import APPLICATION_VERSION, EXPECTED_MIGRATION
 
 
 router = APIRouter(prefix="/api/v1")
 settings = get_settings()
 Window = Literal["1h", "24h", "7d", "30d"]
+
+
+async def _scope_payload(
+    *,
+    window: str | None,
+    server_id: int | None,
+    database_id: int | None,
+) -> dict[str, Any]:
+    if database_id is not None and server_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="databaseId kullanildiginda serverId zorunludur.",
+        )
+    if server_id is None:
+        return {
+            "serverId": None,
+            "serverAlias": None,
+            "databaseId": None,
+            "databaseName": None,
+            "window": window,
+        }
+    resolved = await repository.resolve_scope(
+        server_id=server_id,
+        database_id=database_id,
+    )
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Secilen PostgreSQL kaynak/veritabani kapsami bulunamadi.",
+        )
+    return {
+        "serverId": server_id,
+        "serverAlias": resolved.get("server_alias"),
+        "databaseId": database_id,
+        "databaseName": resolved.get("database_name") if database_id is not None else None,
+        "window": window,
+    }
+
+
+def _release_payload(row: dict[str, Any]) -> dict[str, Any]:
+    current = str(row.get("current_migration") or "")
+    return {
+        "applicationVersion": APPLICATION_VERSION,
+        "migration": {
+            "current": current or None,
+            "expected": EXPECTED_MIGRATION,
+            "appliedCount": int(row.get("applied_count") or 0),
+            "latestAppliedAt": row.get("latest_applied_at"),
+            "upToDate": current == EXPECTED_MIGRATION,
+        },
+    }
 
 QUERY_CSV_COLUMNS = (
     ("server_id", "server_id"),
@@ -386,6 +439,7 @@ async def health(response: Response) -> dict[str, Any]:
     try:
         database = await repository.ping()
         collectors = await repository.collector_health()
+        release = await repository.release_info()
     except Exception as exc:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {
@@ -410,6 +464,7 @@ async def health(response: Response) -> dict[str, Any]:
             "postgresVersion": database["postgres_version"],
             "powaVersion": database["powa_version"],
         },
+        "release": _release_payload(release),
         "responseTimeMs": round((time.perf_counter() - started) * 1000, 2),
     }
 
@@ -449,6 +504,289 @@ async def databases(server_id: int | None = Query(default=None, alias="serverId"
     }
 
 
+def _telemetry_capability(
+    *,
+    configured: bool,
+    healthy: bool,
+    data_available: bool,
+    version: str | None,
+    unavailable_reason: str,
+) -> dict[str, Any]:
+    if not configured:
+        status_value = "NOT_CONFIGURED"
+        reason_code = "NOT_CONFIGURED"
+        reason = unavailable_reason
+    elif not healthy:
+        status_value = "DEGRADED"
+        reason_code = "COLLECTOR_DEGRADED"
+        reason = "Kaynak collector telemetrisi saglikli degil."
+    elif not data_available:
+        status_value = "WAITING_FOR_DATA"
+        reason_code = "WAITING_FOR_DATA"
+        reason = "Yapilandirma hazir; secili pencere icin veri bekleniyor."
+    else:
+        status_value = "AVAILABLE"
+        reason_code = None
+        reason = None
+    return {
+        "status": status_value,
+        "configured": configured,
+        "healthy": healthy if configured else None,
+        "dataAvailable": data_available if configured else False,
+        "available": status_value == "AVAILABLE",
+        "version": version,
+        "reasonCode": reason_code,
+        "reason": reason,
+    }
+
+
+def _service_capability(
+    *,
+    configured: bool,
+    target_matches: bool,
+    health: dict[str, Any] | None,
+    version: str | None = None,
+) -> dict[str, Any]:
+    if not configured or not target_matches:
+        status_value = "NOT_CONFIGURED"
+        reason_code = "TARGET_NOT_CONFIGURED"
+        reason = "Bu kaynak ve veritabani icin evaluator yapilandirilmamis."
+        healthy: bool | None = None
+    elif health is None:
+        status_value = "UNREACHABLE"
+        reason_code = "EVALUATOR_UNREACHABLE"
+        reason = "Evaluator saglik bilgisi alinamadi."
+        healthy = False
+    else:
+        status_value = "AVAILABLE"
+        reason_code = None
+        reason = None
+        healthy = True
+    return {
+        "status": status_value,
+        "configured": configured and target_matches,
+        "healthy": healthy,
+        "dataAvailable": None,
+        "available": status_value == "AVAILABLE",
+        "version": version,
+        "reasonCode": reason_code,
+        "reason": reason,
+    }
+
+
+@router.get("/capabilities")
+async def capabilities(
+    window: Window = "24h",
+    server_id: Annotated[int | None, Query(alias="serverId")] = None,
+    database_id: Annotated[int | None, Query(alias="databaseId")] = None,
+) -> dict[str, Any]:
+    scope = await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
+    rows = await repository.capability_rows(
+        window=window, server_id=server_id, database_id=database_id
+    )
+    service_health = await evaluator_health()
+    evaluator = service_health.get("evaluator")
+    clone = service_health.get("clone")
+    evaluator_alias = (
+        (evaluator.get("sourceAlias") if evaluator else None)
+        or settings.evaluator_allowed_server_alias
+    )
+    evaluator_database = (
+        ((evaluator.get("databaseName") or evaluator.get("database_name")) if evaluator else None)
+        or settings.evaluator_allowed_database
+    )
+    clone_alias = (clone.get("sourceAlias") if clone else None) or settings.clone_source_alias
+    clone_database = (
+        (clone.get("sourceDatabaseName") if clone else None)
+        or settings.clone_template_database
+    )
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        collector_healthy = row.get("collector_status") in {"HEALTHY", "STARTING"}
+        evaluator_matches = (
+            row.get("server_alias") == evaluator_alias
+            and row.get("database_name") == evaluator_database
+        )
+        clone_matches = (
+            row.get("server_alias") == clone_alias
+            and row.get("database_name") == clone_database
+        )
+        join_configured = bool(row.get("join_configured"))
+        join_status = str(row.get("join_status") or "UNAVAILABLE")
+        join_healthy = join_status in {"HEALTHY", "STARTING"}
+        capability_values = {
+            "historicalMetrics": _telemetry_capability(
+                configured=True,
+                healthy=collector_healthy,
+                data_available=bool(row.get("historical_data_available")),
+                version=None,
+                unavailable_reason="Kaynak repository'de kayitli degil.",
+            ),
+            "cpuMetrics": _telemetry_capability(
+                configured=bool(row.get("kcache_configured")),
+                healthy=collector_healthy,
+                data_available=bool(row.get("cpu_data_available")),
+                version=row.get("kcache_version"),
+                unavailable_reason="pg_stat_kcache bu kaynakta yapilandirilmamis.",
+            ),
+            "waitSampling": _telemetry_capability(
+                configured=bool(row.get("wait_configured")),
+                healthy=collector_healthy,
+                data_available=bool(row.get("wait_data_available")),
+                version=row.get("wait_version"),
+                unavailable_reason="pg_wait_sampling bu kaynakta yapilandirilmamis.",
+            ),
+            "predicateMetrics": _telemetry_capability(
+                configured=bool(row.get("predicate_configured")),
+                healthy=collector_healthy,
+                data_available=bool(row.get("predicate_data_available")),
+                version=row.get("predicate_version"),
+                unavailable_reason="pg_qualstats bu kaynakta yapilandirilmamis.",
+            ),
+            "joinSnapshot": _telemetry_capability(
+                configured=join_configured,
+                healthy=join_healthy,
+                data_available=bool(row.get("join_data_available")),
+                version=None,
+                unavailable_reason=str(row.get("join_reason") or "JOIN snapshotter yapilandirilmamis."),
+            ),
+            "hypopg": _service_capability(
+                configured=bool(settings.evaluator_url),
+                target_matches=evaluator_matches,
+                health=evaluator,
+                version=(
+                    str(evaluator.get("hypopg_version"))
+                    if evaluator and evaluator.get("hypopg_version")
+                    else None
+                ),
+            ),
+            "sourceExplain": _service_capability(
+                configured=bool(settings.evaluator_url),
+                target_matches=evaluator_matches,
+                health=evaluator,
+            ),
+            "cloneValidation": _service_capability(
+                configured=bool(settings.clone_evaluator_url),
+                target_matches=clone_matches,
+                health=clone,
+            ),
+        }
+        capability_labels = {
+            "historicalMetrics": "Historical metrics",
+            "cpuMetrics": "CPU metrics",
+            "waitSampling": "Wait sampling",
+            "predicateMetrics": "Predicate metrics",
+            "joinSnapshot": "JOIN snapshot",
+            "hypopg": "HypoPG",
+            "sourceExplain": "Source EXPLAIN",
+            "cloneValidation": "Clone validation",
+        }
+        items.append({
+            "serverId": int(row["server_id"]),
+            "serverAlias": row.get("server_alias"),
+            "databaseId": int(row["database_id"]),
+            "databaseName": row.get("database_name"),
+            "capabilities": [
+                {"key": key, "label": capability_labels[key], **value}
+                for key, value in capability_values.items()
+            ],
+        })
+    return {"window": window, "scope": scope, "items": items}
+
+
+@router.get("/database-optimize")
+async def database_optimize(
+    window: Window = "24h",
+    server_id: Annotated[int | None, Query(alias="serverId")] = None,
+    database_id: Annotated[int | None, Query(alias="databaseId")] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
+    sort_by: Literal["affectedLoad", "affectedQueries", "evidence"] = Query(
+        default="affectedLoad", alias="sort"
+    ),
+) -> dict[str, Any]:
+    scope = await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
+    rows, total, summary = await repository.database_optimize_rows(
+        window=window,
+        server_id=server_id,
+        database_id=database_id,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+    )
+    return {
+        "window": window,
+        "scope": scope,
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "summary": {
+            "candidateGroups": int(summary.get("candidate_groups") or 0),
+            "validatedGroups": 0,
+            "affectedQueries": int(summary.get("affected_queries") or 0),
+            "affectedLoadMs": round(float(summary.get("affected_load_ms") or 0), 2),
+        },
+        "items": [
+            {
+                "groupId": row["group_id"],
+                "serverId": row["server_id"],
+                "serverAlias": row.get("server_alias"),
+                "databaseId": row["database_id"],
+                "databaseName": row.get("database_name"),
+                "relationId": row["relation_id"],
+                "schemaName": row["schema_name"],
+                "tableName": row["table_name"],
+                "method": row["method"],
+                "columns": row["columns"],
+                "orderingRules": row["ordering_rules"],
+                "confidence": row["confidence"],
+                "affectedQueryCount": row["affected_query_count"],
+                "affectedQueryIds": [str(value) for value in row["affected_query_ids"]],
+                "affectedLoadMs": round(float(row["affected_load_ms"]), 2),
+                "evidence": {
+                    "joinOccurrences": row["join_occurrences"],
+                    "filterOccurrences": row["filter_occurrences"],
+                    "sampleCount": row["sample_count"],
+                    "observedFrom": row["observed_from"],
+                    "observedTo": row["observed_to"],
+                },
+                "representative": {
+                    "queryId": str(row["representative_query_id"]),
+                    "candidateId": row["representative_candidate_id"],
+                },
+                "createIndexSql": row["create_index_sql"],
+                "existingIndex": {
+                    "status": "NOT_CHECKED",
+                    "indexName": None,
+                    "reason": "Mevcut index ortusmesi kaynak evaluator ile henuz kontrol edilmedi.",
+                },
+                "hypopg": {
+                    "status": "NOT_EVALUATED",
+                    "evaluatedQueries": 0,
+                    "totalQueries": row["affected_query_count"],
+                    "reason": "Bu toplu gorunum otomatik HypoPG sorgusu baslatmaz.",
+                },
+                "maintenanceCost": {
+                    "writeRows": row["write_rows"],
+                    "writesPerHour": row["writes_per_hour"],
+                    "risk": row["maintenance_risk"],
+                    "estimatedIndexSizeBytes": None,
+                    "walBytesEstimate": None,
+                    "reason": (
+                        "Iliski yazma hacmi risk sinyalidir; onerilen indexin ek WAL byte miktari "
+                        "mevcut telemetriden guvenilir bicimde hesaplanamaz."
+                    ),
+                },
+            }
+            for row in rows
+        ],
+    }
+
+
 @router.get("/queries")
 async def queries(
     role: Annotated[str, Depends(request_role)],
@@ -463,6 +801,9 @@ async def queries(
     min_duration_ms: float = Query(default=0, ge=0, alias="minDurationMs"),
     sort_by: str = Query(default="impact", alias="sort"),
 ) -> dict[str, Any]:
+    await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
     effective_page_size = min(page_size, settings.max_query_page_size)
     rows, total = await repository.query_rows(
         window=window,
@@ -1001,13 +1342,20 @@ async def regressions(
     window: Window = "24h",
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
+    server_id: Annotated[int | None, Query(alias="serverId")] = None,
+    database_id: Annotated[int | None, Query(alias="databaseId")] = None,
 ) -> dict[str, Any]:
+    scope = await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
     rows, total = await repository.query_rows(
         window=window,
         page=page,
         page_size=page_size,
         sort_by="regression",
         regressions_only=True,
+        server_id=server_id,
+        database_id=database_id,
     )
     return {
         "items": [serialize_query(row, sql_visible=can_view_sql(role)) for row in rows],
@@ -1015,6 +1363,7 @@ async def regressions(
         "pageSize": page_size,
         "total": total,
         "window": window,
+        "scope": scope,
     }
 
 
@@ -1022,14 +1371,27 @@ async def regressions(
 async def overview(
     role: Annotated[str, Depends(request_role)],
     window: Window = "24h",
+    server_id: Annotated[int | None, Query(alias="serverId")] = None,
+    database_id: Annotated[int | None, Query(alias="databaseId")] = None,
 ) -> dict[str, Any]:
-    rows, _ = await repository.query_rows(window=window, page_size=10, sort_by="impact")
-    summary = await repository.overview_summary(window=window)
-    collectors = await repository.collector_health()
+    scope = await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
+    row_args: dict[str, Any] = {"window": window, "page_size": 10, "sort_by": "impact"}
+    summary_args: dict[str, Any] = {"window": window}
+    trend_args: dict[str, Any] = {"window": window}
+    if server_id is not None:
+        row_args.update(server_id=server_id, database_id=database_id)
+        summary_args.update(server_id=server_id, database_id=database_id)
+        trend_args.update(server_id=server_id, database_id=database_id)
+    rows, _ = await repository.query_rows(**row_args)
+    summary = await repository.overview_summary(**summary_args)
+    collectors = await repository.collector_health(server_id) if server_id is not None else await repository.collector_health()
     collector_summary = _summarize_collectors(collectors)
-    trend = await repository.trend(window=window)
+    trend = await repository.trend(**trend_args)
     return {
         "window": window,
+        "scope": scope,
         "cards": {
             "totalDbTimeMs": round(float(summary.get("total_db_time_ms") or 0), 2),
             "trackedQueries": int(summary.get("tracked_queries") or 0),
@@ -1057,6 +1419,9 @@ async def indexes(
     server_id: int | None = Query(default=None, alias="serverId"),
     database_id: int | None = Query(default=None, alias="databaseId"),
 ) -> dict[str, Any]:
+    await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
     rows, summary = await repository.index_rows(
         window=window,
         server_id=server_id,
@@ -1080,6 +1445,9 @@ async def io_telemetry(
     server_id: int | None = Query(default=None, alias="serverId"),
     database_id: int | None = Query(default=None, alias="databaseId"),
 ) -> dict[str, Any]:
+    await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
     database_rows, context_rows, server_rows = await repository.io_telemetry(
         window=window,
         server_id=server_id,
@@ -1148,17 +1516,27 @@ async def io_telemetry(
 
 @router.get("/tables")
 @router.get("/system-health")
-async def system_health() -> dict[str, Any]:
-    rows = await repository.table_health()
-    transactions = await repository.long_transactions()
+async def system_health(
+    window: Window = "24h",
+    server_id: Annotated[int | None, Query(alias="serverId")] = None,
+    database_id: Annotated[int | None, Query(alias="databaseId")] = None,
+) -> dict[str, Any]:
+    scope = await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
+    rows = await repository.table_health(server_id=server_id, database_id=database_id)
+    summary = await repository.table_health_summary(server_id=server_id, database_id=database_id)
+    transactions = await repository.long_transactions(server_id=server_id, database_id=database_id)
     items = [_table_payload(row) for row in rows]
     return {
+        "window": window,
         "summary": {
-            "tablesObserved": len(items),
-            "critical": sum(1 for row in items if row["signalLevel"] == "CRITICAL"),
-            "warnings": sum(1 for row in items if row["signalLevel"] == "WARNING"),
-            "notices": sum(1 for row in items if row["signalLevel"] == "NOTICE"),
+            "tablesObserved": int(summary.get("tables_observed") or 0),
+            "critical": int(summary.get("critical") or 0),
+            "warnings": int(summary.get("warnings") or 0),
+            "notices": int(summary.get("notices") or 0),
         },
+        "scope": scope,
         "capabilities": [
             {"key": "seqScan", "label": "Seq Scan", "available": True, "source": "PoWA pg_stat_all_tables"},
             {"key": "deadTuple", "label": "Dead tuple", "available": True, "source": "PoWA pg_stat_all_tables"},
@@ -1191,9 +1569,17 @@ async def system_health() -> dict[str, Any]:
 
 
 @router.get("/operations")
-async def operations() -> dict[str, Any]:
+async def operations(
+    window: Window = "24h",
+    server_id: Annotated[int | None, Query(alias="serverId")] = None,
+    database_id: Annotated[int | None, Query(alias="databaseId")] = None,
+) -> dict[str, Any]:
+    scope = await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
     database = await repository.ping()
-    collectors = await repository.collector_health()
+    release = await repository.release_info()
+    collectors = await repository.collector_health(server_id) if server_id is not None else await repository.collector_health()
     collector = _summarize_collectors(collectors)
     collector_state = collector["status"]
     source_services = [
@@ -1205,6 +1591,8 @@ async def operations() -> dict[str, Any]:
         for row in collectors
     ]
     return {
+        "window": window,
+        "scope": scope,
         "architecture": {
             "host": "Tek Docker/OrbStack hostu",
             "source": {"count": len(collectors), "role": "İzlenen PostgreSQL kaynakları + pg_stat_statements"},
@@ -1227,6 +1615,7 @@ async def operations() -> dict[str, Any]:
             "sizeBytes": database["repository_size_bytes"],
             "retentionDays": settings.retention_days,
         },
+        "release": _release_payload(release),
     }
 
 
@@ -1242,6 +1631,9 @@ async def export_queries(
     min_duration_ms: float = Query(default=0, ge=0, alias="minDurationMs"),
     sort_by: str = Query(default="impact", alias="sort"),
 ) -> StreamingResponse:
+    await _scope_payload(
+        window=window, server_id=server_id, database_id=database_id
+    )
     export_id = str(uuid4())
     export_context = {
         "exportId": export_id,

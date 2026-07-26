@@ -1,5 +1,9 @@
 # Repository migration modeli
 
+Release yükseltmesi; yedek, writer-stop, explicit migrator ve doğrulanmış
+cutover sırasıyla yapılır. Başarılı migration sonrası down migration yoktur;
+ayrıntılar [upgrade/rollback runbook'undadır](UPGRADE_ROLLBACK.md).
+
 PoWA repository şeması, boş volume kurulumu ve mevcut named volume yükseltmesi
 için aynı `repository-migrate` servisi tarafından yönetilir. PostgreSQL'in
 `docker-entrypoint-initdb.d` mekanizması yalnız PoWA extension'ını, cluster
@@ -77,6 +81,11 @@ indirger. Global ve tam sorgu kimliğiyle scoped iki overload bulunur. Scoped
 çağrı server/database/query filtrelerini PoWA history/current taramalarına iter;
 iki çağrı da her aktif seri için pencere öncesindeki tek gerçek predecessor'ı
 okuyarak counter reset ve `3 x frequency` sınır-gap davranışını korur.
+
+`0014`, ürün `1.1.0` scope/optimize yolları için scoped query-trend planını,
+release bilgisini ve tablo yazma maliyeti sinyalini ekler. Bu migration uygulama
+`1.1.0` ile birlikte yükseltilir; geri dönüş sınırı
+[upgrade/rollback runbook'undadır](UPGRADE_ROLLBACK.md).
 
 ## Yeni migration ekleme
 

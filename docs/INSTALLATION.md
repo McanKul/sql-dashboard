@@ -1,5 +1,9 @@
 # Kurulum ve işletim rehberi
 
+Mevcut kurulum yükseltmesi veya geri dönüş için önce
+[Upgrade ve rollback runbook'unu](UPGRADE_ROLLBACK.md) okuyun. Sürüm değişiklikleri
+[CHANGELOG](../CHANGELOG.md) içinde tutulur.
+
 Bu rehber PostgreSQL 18 üzerinde predicate, HypoPG, `pg_stat_kcache`, `pg_wait_sampling`, JOIN snapshotter ve composite aday hatlarını içeren stack'i macOS/OrbStack veya Docker Engine çalıştırabilen Linux üzerinde kurar. Disposable clone testi varsayılan kapalı `real-validation` profilidir. Ana yol container tabanlıdır; işletim sistemi yalnız Docker kurulum adımını değiştirir.
 
 ## 1. Kurulum modelini doğru okuyun
@@ -434,7 +438,7 @@ Beklenen sonuç, bütün kontrollerin `[OK]` ile tamamlanması ve scriptin sıf�
 
 Full verifier, API rebuild'inden sonraki ilk `24h` query-list çağrısı olabileceği
 için önce sonuç verisini doğrulayan, latency kapısına katılmayan ve varsayılan
-`45s` ile sınırlı bir cold-cache warmup yapar. Hemen sonraki warm-cache çağrısı
+`120s` ile sınırlı bir cold-cache warmup yapar. Hemen sonraki warm-cache çağrısı
 yine katı biçimde `2s` altında olmalıdır. Farklı donanımda yalnız warmup sınırını
 değiştirmek için host shell'inde `VERIFY_API_WARMUP_TIMEOUT_SECONDS` (`5..120`)
 export edilebilir; bu değişken ölçülen `2s` eşiğini değiştirmez.
@@ -883,7 +887,8 @@ bitince en fazla `300s` yaşındaki metrics snapshot hemen sunulur ve process
 genelinde her pencere için yalnız bir query-metrics refresh'i çalışır.
 
 Overview global trendi query-metrics'ten ayrı bir window snapshot cache'inde
-aynı fresh/stale sürelerini, `QUERY_LIST_CACHE_MAX_ENTRIES=4` LRU sınırını ve
+aynı fresh/stale sürelerini, kaynak/veritabanı kapsamları için ayrı
+`GLOBAL_TREND_CACHE_MAX_ENTRIES=64` LRU sınırını ve
 `QUERY_LIST_CACHE_MAX_ROWS=100000` satır kapısını kullanır. Stale global trend
 anında sunulur ve tek refresh arka planda devam eder; cold veya `300s` üstü istek
 ortak single-flight refresh'i bekler. Query-metrics ve global-trend refresh'leri
@@ -913,9 +918,11 @@ Yalnız query-metrics için PostgreSQL payload hesabı
 `QUERY_LIST_CACHE_MAX_BYTES=67108864` (64 MiB) sınırını aşarsa da aynı şekilde
 durur. Metrics snapshot named/server-side cursor ile parça parça okunur ve
 libpq'nun bütün sonucu tek seferde bufferlaması engellenir; sınır içindeki tam
-snapshot API cache'inde tutulur. Query-metrics ve global trend cache'lerinin her
-biri en fazla `QUERY_LIST_CACHE_MAX_ENTRIES=4` pencere tutar; Python nesne ek
-yüküne karşı API container'ı ayrıca `API_MEMORY_LIMIT=1g` hard zarfındadır.
+snapshot API cache'inde tutulur. Query-metrics cache'i en fazla
+`QUERY_LIST_CACHE_MAX_ENTRIES=4` tam pencere; çok daha küçük trend cache'i ise
+pencere × kaynak × veritabanı anahtarlarından en fazla
+`GLOBAL_TREND_CACHE_MAX_ENTRIES=64` kayıt tutar. Python nesne ek yüküne karşı API
+container'ı ayrıca `API_MEMORY_LIMIT=1g` hard zarfındadır.
 
 Fresh süreyi izlenen kaynakların en sık collector cadence'inden daha kısa seçmek
 dashboard verisini daha taze yapmaz; metrics ve global-trend refresh CPU/I/O

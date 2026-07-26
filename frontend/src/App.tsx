@@ -32,8 +32,11 @@ import {
 } from 'lucide-react'
 import { advisorApi, ApiClientError, demoModeEnabled } from './api'
 import type {
+  AnalysisScope,
   ApiList,
+  CapabilityMatrixData,
   CompositeIndexCandidate,
+  DatabaseOptimizeData,
   DatabaseOption,
   OperationsData,
   OverviewStats,
@@ -47,6 +50,7 @@ import type {
   QuerySummary,
   ServerOption,
   Severity,
+  SourceCapability,
   SystemHealth,
   TimeWindow,
   TrendPoint,
@@ -68,6 +72,17 @@ import {
   windowLabels,
 } from './utils'
 import { ExplainPlanErrorBoundary } from './components/explain/ExplainPlanErrorBoundary'
+import { GlobalScopeBar } from './components/scope/GlobalScopeBar'
+import { CapabilityMatrix } from './components/capabilities/CapabilityMatrix'
+import { DatabaseOptimizePage } from './pages/DatabaseOptimizePage'
+import {
+  buildAppHash,
+  parseAppHash,
+  queryAfterScopeChange,
+  queryBelongsToScope,
+  resolveScope,
+  sameScope,
+} from './scope'
 import './styles.css'
 
 const ExplainPlanGraph = lazy(async () => {
@@ -85,6 +100,7 @@ interface Loadable<T> {
 const navItems: Array<{ id: PageId; label: string; description: string; icon: typeof LayoutDashboard }> = [
   { id: 'overview', label: 'Genel Bakış', description: 'Performans özeti', icon: LayoutDashboard },
   { id: 'queries', label: 'Sorgular', description: 'Analiz ve bulgular', icon: Code2 },
+  { id: 'optimize', label: 'Database Optimize', description: 'Index adayları', icon: Sparkles },
   { id: 'health', label: 'Sistem Sağlığı', description: 'PostgreSQL metrikleri', icon: HeartPulse },
   { id: 'operations', label: 'Operasyonlar', description: 'Repository ve telemetri', icon: Network },
 ]
@@ -92,13 +108,9 @@ const navItems: Array<{ id: PageId; label: string; description: string; icon: ty
 const pageTitles: Record<PageId, string> = {
   overview: 'Genel Bakış',
   queries: 'Sorgu Analizi',
+  optimize: 'Database Optimize',
   health: 'Sistem Sağlığı',
   operations: 'Operasyonlar',
-}
-
-const getInitialPage = (): PageId => {
-  const page = window.location.hash.replace('#/', '') as PageId
-  return navItems.some((item) => item.id === page) ? page : 'overview'
 }
 
 function SeverityBadge({ severity, label }: { severity: Severity; label?: string }) {
@@ -133,25 +145,11 @@ function PageHeading({ eyebrow, title, description, children }: {
   )
 }
 
-const timeWindows: TimeWindow[] = ['1h', '24h', '7d', '30d']
-
-function WindowPicker({ value, onChange }: { value: TimeWindow; onChange: (window: TimeWindow) => void }) {
-  return (
-    <div className="window-picker" aria-label="Analiz zaman aralığı">
-      <span>Zaman aralığı</span>
-      <div>
-        {timeWindows.map((window) => <button type="button" key={window} className={value === window ? 'active' : ''} onClick={() => onChange(window)} aria-pressed={value === window}>{window}</button>)}
-      </div>
-    </div>
-  )
-}
-
 function LoadingPanel({ label = 'Veriler yükleniyor' }: { label?: string }) {
   return (
     <div className="loading-panel" role="status">
       <LoaderCircle className="spin" size={28} aria-hidden="true" />
       <strong>{label}</strong>
-      <span>Advisor API yanıtı bekleniyor.</span>
     </div>
   )
 }
@@ -163,19 +161,10 @@ function ErrorPanel({ message, onRetry }: { message: string; onRetry: () => void
       <div>
         <strong>Veri alınamadı</strong>
         <p>{message}</p>
-        <small>API’nin <code>/api/v1</code> altında çalıştığını ve web proxy ayarını kontrol edin.</small>
+        <small>Yeniden deneyin. Sorun sürerse Operasyonlar ekranını kontrol edin.</small>
       </div>
       <button type="button" className="secondary-button" onClick={onRetry}><RefreshCw size={15} /> Yeniden dene</button>
     </div>
-  )
-}
-
-function ReadingGuide({ children }: { children: React.ReactNode }) {
-  return (
-    <aside className="reading-guide">
-      <span><Info size={18} aria-hidden="true" /></span>
-      <div><strong>Bu ekran ne anlatıyor?</strong><p>{children}</p></div>
-    </aside>
   )
 }
 
@@ -243,9 +232,8 @@ function StatCard({ icon: Icon, label, value, unit, delta, tone, helper }: {
   )
 }
 
-function OverviewPage({ state, queries, window, onRetry, onOpenQuery, onNavigate }: {
+function OverviewPage({ state, window, onRetry, onOpenQuery, onNavigate }: {
   state: Loadable<OverviewStats>
-  queries?: ApiList<QuerySummary>
   window: TimeWindow
   onRetry: () => void
   onOpenQuery: (id: string) => void
@@ -254,15 +242,13 @@ function OverviewPage({ state, queries, window, onRetry, onOpenQuery, onNavigate
   if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel label="Genel bakış hazırlanıyor" />
   if (state.status === 'error' || !state.data) return <ErrorPanel message={state.error ?? 'Bilinmeyen bir hata oluştu.'} onRetry={onRetry} />
   const data = state.data
-  const queryPreview = queries?.items.slice(0, 4) ?? []
+  const queryPreview = data.topQueries
 
   return (
     <section className="page-section" aria-labelledby="overview-title">
       <PageHeading eyebrow={`${data.environment} · ${data.databaseName} · ${windowLabels[window]}`} title="Veritabanınız nasıl?" description={`Son toplama ${formatDateTime(data.lastCollectedAt)} tarihinde tamamlandı.`}>
         <button type="button" className="primary-button" onClick={() => onNavigate('queries')}><Sparkles size={16} /> Bulguları incele</button>
       </PageHeading>
-
-      <ReadingGuide>Önce kritik sorgulara ve “En yüksek etkili sorgular” listesine bakın. Etki puanı yükseldikçe sorgunun toplam kaynak tüketimindeki önceliği artar; bu puan tek başına sorgunun hatalı olduğu anlamına gelmez.</ReadingGuide>
 
       <div className="stats-grid">
         <StatCard icon={Code2} label="Analiz edilen sorgu" value={formatNumber(data.queriesAnalyzed, true)} tone="blue" helper="Seçili dönemdeki benzersiz sorgu desenleri" />
@@ -342,34 +328,13 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
   onOpenQuery: (id: string) => void
 }) {
   const [draft, setDraft] = useState<QueryListParams>(params)
-  const [servers, setServers] = useState<ServerOption[]>([])
-  const [databases, setDatabases] = useState<DatabaseOption[]>([])
-
-  useEffect(() => {
-    const controller = new AbortController()
-    Promise.all([advisorApi.getServers(controller.signal), advisorApi.getDatabases(undefined, controller.signal)])
-      .then(([serverResult, databaseResult]) => { setServers(serverResult.data); setDatabases(databaseResult.data) })
-      .catch(() => { /* Filtre meta verisi yoksa sorgu listesi kullanılmaya devam eder. */ })
-    return () => controller.abort()
-  }, [])
 
   useEffect(() => setDraft(params), [params])
-
-  const filteredDatabases = draft.serverId === undefined ? databases : databases.filter((database) => database.serverId === draft.serverId)
-  const selectedDatabaseKey = draft.serverId !== undefined && draft.databaseId !== undefined ? `${draft.serverId}:${draft.databaseId}` : ''
-  const selectDatabase = (key: string) => {
-    if (!key) {
-      setDraft((value) => ({ ...value, databaseId: undefined }))
-      return
-    }
-    const [serverId, databaseId] = key.split(':').map(Number)
-    setDraft((value) => ({ ...value, serverId, databaseId }))
-  }
-  const hasFilters = Boolean(params.search || params.priority || params.serverId !== undefined || params.databaseId !== undefined || params.minCalls || params.minDurationMs)
+  const hasFilters = Boolean(params.search || params.priority || params.minCalls || params.minDurationMs)
   const totalPages = Math.max(1, Math.ceil((state.data?.total || 0) / params.pageSize))
   const applyFilters = () => onParamsChange({ ...draft, page: 1 })
   const clearFilters = () => {
-    const cleared: QueryListParams = { page: 1, pageSize: params.pageSize, sort: 'impact' }
+    const cleared: QueryListParams = { page: 1, pageSize: params.pageSize, sort: 'impact', serverId: params.serverId, databaseId: params.databaseId }
     setDraft(cleared)
     onParamsChange(cleared)
   }
@@ -378,12 +343,8 @@ function QueriesPage({ state, params, window, onParamsChange, onRetry, onOpenQue
     <section className="page-section" aria-labelledby="queries-title">
       <PageHeading eyebrow={`Sorgu envanteri · ${windowLabels[window]}`} title="Etkiyi bulun, nedeni anlayın" description={`${formatNumber(state.data?.total || 0)} benzersiz sorgu; repository telemetrisiyle sunucu tarafında filtrelenir.`} />
 
-      <ReadingGuide>Etki puanı seçili penceredeki diğer sorgulara göre inceleme önceliğini gösterir. DB yükü, gerçek CPU ve sampled wait dağılımını birlikte okuyun; CPU süresi ile wait örnekleri aynı paydada toplanmaz.</ReadingGuide>
-
       <div className="query-toolbar query-toolbar-expanded" role="search" onKeyDown={(event) => { if (event.key === 'Enter' && (event.target as HTMLElement).tagName === 'INPUT') applyFilters() }}>
         <label className="search-field"><Search size={18} aria-hidden="true" /><span className="sr-only">Sorgularda ara</span><input value={draft.search || ''} onChange={(event) => setDraft((value) => ({ ...value, search: event.target.value || undefined }))} placeholder="SQL veya sorgu kimliği ara…" /></label>
-        <label className="select-field"><Network size={15} /><span className="sr-only">Sunucu</span><select value={draft.serverId ?? ''} onChange={(event) => setDraft((value) => ({ ...value, serverId: event.target.value ? Number(event.target.value) : undefined, databaseId: undefined }))}><option value="">Tüm sunucular</option>{servers.map((server) => <option key={server.id} value={server.id}>{server.alias || server.hostname || `server-${server.id}`}</option>)}</select><ChevronDown size={14} /></label>
-        <label className="select-field"><Database size={15} /><span className="sr-only">Veritabanı</span><select value={selectedDatabaseKey} onChange={(event) => selectDatabase(event.target.value)}><option value="">Tüm veritabanları</option>{filteredDatabases.map((database) => <option key={`${database.serverId}:${database.databaseId}`} value={`${database.serverId}:${database.databaseId}`}>{database.name}{draft.serverId === undefined ? ` · ${servers.find((server) => server.id === database.serverId)?.alias || `server-${database.serverId}`}` : ''}</option>)}</select><ChevronDown size={14} /></label>
         <label className="select-field"><CircleDot size={15} /><span className="sr-only">Öncelik</span><select value={draft.priority || ''} onChange={(event) => setDraft((value) => ({ ...value, priority: event.target.value || undefined }))}><option value="">Tüm öncelikler</option><option value="CRITICAL">Kritik</option><option value="HIGH">Yüksek</option><option value="MEDIUM">Orta</option><option value="LOW">Düşük</option></select><ChevronDown size={14} /></label>
         <label className="number-field"><span>Min. çağrı</span><input type="number" min="0" value={draft.minCalls ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minCalls: event.target.value ? Number(event.target.value) : undefined }))} /></label>
         <label className="number-field"><span>Min. toplam süre</span><input type="number" min="0" step="10" value={draft.minDurationMs ?? ''} onChange={(event) => setDraft((value) => ({ ...value, minDurationMs: event.target.value ? Number(event.target.value) : undefined }))} /><small>ms</small></label>
@@ -517,18 +478,24 @@ function indexAdviceLabel(status: QueryIndexAdvice['status']): string {
   }[status]
 }
 
-function PredicateIndexEvaluation({
+function sourceCapabilityAvailable(capability?: SourceCapability): boolean {
+  return capability?.status === 'AVAILABLE' && capability.available
+}
+
+export function PredicateIndexEvaluation({
   predicate,
   state,
   copied,
   onEvaluate,
   onCopy,
+  capability,
 }: {
   predicate: QueryPredicate
   state?: Loadable<QueryIndexAdvice>
   copied: boolean
   onEvaluate: () => void
   onCopy: (statement: string) => void
+  capability?: SourceCapability
 }) {
   const eligible = predicate.evalType === 'FILTER'
     && (predicate.signal === 'INDEX_CANDIDATE' || predicate.signal === 'REVIEW')
@@ -537,16 +504,17 @@ function PredicateIndexEvaluation({
   if (!eligible) return null
 
   const advice = state?.data
+  const canEvaluate = sourceCapabilityAvailable(capability)
   return (
     <div className="index-evaluation" aria-live="polite">
       {!state && (
         <div className="index-evaluation-start">
           <div><strong>Gerçek SQL önerisi henüz doğrulanmadı</strong><span>HypoPG kaynakta sanal index kurup yalnız EXPLAIN maliyetini karşılaştırır.</span></div>
-          <button type="button" className="hypopg-button" onClick={onEvaluate}><Sparkles size={15} /> HypoPG ile doğrula</button>
+          <button type="button" className="hypopg-button" onClick={onEvaluate} disabled={!canEvaluate} title={!canEvaluate ? capability?.reason || 'HypoPG capability durumu yükleniyor.' : undefined}><Sparkles size={15} /> HypoPG ile doğrula</button>
         </div>
       )}
       {state?.status === 'loading' && <div className="index-evaluation-loading"><LoaderCircle className="spin" size={17} /> Baseline ve sanal index planları karşılaştırılıyor…</div>}
-      {state?.status === 'error' && <div className="index-evaluation-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
+      {state?.status === 'error' && <div className="index-evaluation-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate} disabled={!canEvaluate} title={!canEvaluate ? capability?.reason || 'HypoPG kullanılamıyor.' : undefined}>Tekrar dene</button></div>}
       {state?.status === 'success' && advice && (
         <div className={`index-evaluation-result ${advice.status.toLowerCase()}`}>
           <div className="index-evaluation-status">
@@ -561,7 +529,7 @@ function PredicateIndexEvaluation({
                 <div><span>Tahmini düşüş</span><strong>%{formatNumber(advice.validation.costReductionPercent)}</strong><small>Planner cost, süre değil</small></div>
                 <div><span>Tahmini index boyutu</span><strong>{formatBytes(advice.validation.estimatedIndexSizeBytes)}</strong><small>HypoPG {advice.validation.hypopgVersion}</small></div>
               </div>
-              <div className="index-sql-heading"><div><strong>Kopyalanabilir index SQL’i</strong><span>İncelemeden çalıştırmayın; uygulama bu DDL’i yürütmedi.</span></div><button type="button" className="copy-sql-button" onClick={() => onCopy(advice.candidate!.createIndexSql)}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'Index SQL’ini kopyala'}</button></div>
+              <div className="index-sql-heading"><div><strong>Index SQL’i</strong></div><button type="button" className="copy-sql-button" onClick={() => onCopy(advice.candidate!.createIndexSql)}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'Index SQL’ini kopyala'}</button></div>
               <pre className="index-sql"><code>{advice.candidate.createIndexSql}</code></pre>
               <div className="index-confidence"><span>{advice.confidence?.level === 'HIGH' ? 'Yüksek' : 'Orta'} güven</span>{advice.confidence?.reasons.map((reason) => <small key={reason}>{reason}</small>)}</div>
             </>
@@ -587,14 +555,17 @@ export function CompositeIndexEvaluation({
   copied,
   onEvaluate,
   onCopy,
+  capability,
 }: {
   candidate: CompositeIndexCandidate
   state?: Loadable<QueryIndexAdvice>
   copied: boolean
   onEvaluate: () => void
   onCopy: (statement: string) => void
+  capability?: SourceCapability
 }) {
   const advice = state?.data
+  const canEvaluate = sourceCapabilityAvailable(capability)
   return (
     <div className="predicate-item review composite-candidate">
       <div className="predicate-item-heading">
@@ -608,18 +579,18 @@ export function CompositeIndexEvaluation({
         <div><span>Snapshot</span><strong>{formatLargeNumber(candidate.sampleCount)}</strong></div>
       </div>
       <div className="predicate-recommendation"><Network size={16} /><div><strong>Kolon sırası</strong><span>{compositeOrderingLabel(candidate.orderingRule)}</span></div></div>
-      {!state && <div className="index-evaluation-start"><div><strong>Önce canlı katalog + HypoPG kontrolü</strong><span>Mevcut index prefix’i ve planner maliyeti salt-okunur doğrulanır.</span></div><button type="button" className="hypopg-button" onClick={onEvaluate}><Sparkles size={15} /> Composite adayı doğrula</button></div>}
+      {!state && <div className="index-evaluation-start"><div><strong>Önce canlı katalog + HypoPG kontrolü</strong><span>Mevcut index prefix’i ve planner maliyeti salt-okunur doğrulanır.</span></div><button type="button" className="hypopg-button" onClick={onEvaluate} disabled={!canEvaluate} title={!canEvaluate ? capability?.reason || 'HypoPG capability durumu yükleniyor.' : undefined}><Sparkles size={15} /> Composite adayı doğrula</button></div>}
       {state?.status === 'loading' && <div className="index-evaluation-loading"><LoaderCircle className="spin" size={17} /> Composite baseline ve sanal plan karşılaştırılıyor…</div>}
-      {state?.status === 'error' && <div className="index-evaluation-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
+      {state?.status === 'error' && <div className="index-evaluation-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate} disabled={!canEvaluate} title={!canEvaluate ? capability?.reason || 'HypoPG kullanılamıyor.' : undefined}>Tekrar dene</button></div>}
       {state?.status === 'success' && advice && <div className={`index-evaluation-result ${advice.status.toLowerCase()}`}>
         <div className="index-evaluation-status">{advice.status === 'VALIDATED' ? <CheckCircle2 size={18} /> : <Info size={18} />}<div><strong>{indexAdviceLabel(advice.status)}</strong><span>{advice.message}</span></div></div>
         {advice.validation && <div className="index-plan-metrics"><div><span>Başlangıç cost</span><strong>{formatNumber(advice.validation.baselineTotalCost)}</strong></div><div><span>Composite cost</span><strong>{formatNumber(advice.validation.hypotheticalTotalCost)}</strong></div><div><span>Tahmini düşüş</span><strong>%{formatNumber(advice.validation.costReductionPercent)}</strong></div><div><span>Tahmini boyut</span><strong>{formatBytes(advice.validation.estimatedIndexSizeBytes)}</strong></div></div>}
-        {advice.status === 'VALIDATED' && advice.candidate && <><div className="index-sql-heading"><div><strong>Kopyalanabilir composite SQL</strong><span>Uygulama kaynakta DDL çalıştırmadı.</span></div><button type="button" className="copy-sql-button" onClick={() => onCopy(advice.candidate!.createIndexSql)}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'SQL’i kopyala'}</button></div><pre className="index-sql"><code>{advice.candidate.createIndexSql}</code></pre></>}
+        {advice.status === 'VALIDATED' && advice.candidate && <><div className="index-sql-heading"><div><strong>Composite index SQL’i</strong></div><button type="button" className="copy-sql-button" onClick={() => onCopy(advice.candidate!.createIndexSql)}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'SQL’i kopyala'}</button></div><pre className="index-sql"><code>{advice.candidate.createIndexSql}</code></pre></>}
         <small className="ddl-safety-note"><ShieldAlert size={13} /> ddlExecuted=false</small>
       </div>}
       {advice?.status === 'VALIDATED' && (candidate.runtimeFixtureAvailable
-        ? <div className="index-evaluation-start runtime-validation-start"><div><strong>Operator doğrulamasına hazır</strong><span>Replay fixture onaylı. Browser admin secret’ı taşımaz; disposable clone testi yalnız server-side token kullanan operator API/CLI akışından başlatılır.</span></div><button type="button" className="hypopg-button" disabled><ShieldAlert size={15} /> Operator API</button></div>
-        : <div className="index-evaluation-start runtime-validation-start"><div><strong>Replay fixture gerekli</strong><span>Normalize bind değerleri saklanmaz. DBA bu sorgu ve aday için sentetik/anonymize fixture onayladığında operator API akışı açılır.</span></div><button type="button" className="hypopg-button" disabled><ShieldAlert size={15} /> Fixture yok</button></div>)}
+        ? <div className="index-evaluation-start runtime-validation-start"><div><strong>Clone doğrulamasına hazır</strong><span>Operator API üzerinden başlatılır.</span></div><button type="button" className="hypopg-button" disabled><ShieldAlert size={15} /> Operator API</button></div>
+        : <div className="index-evaluation-start runtime-validation-start"><div><strong>Replay fixture gerekli</strong></div><button type="button" className="hypopg-button" disabled><ShieldAlert size={15} /> Fixture yok</button></div>)}
     </div>
   )
 }
@@ -785,22 +756,26 @@ export function ExplainAnalyzePanel({
   bindInput,
   onBindInput,
   onEvaluate,
+  capability,
 }: {
   statement: string
   state: Loadable<QueryExplainAnalyzeResult>
   bindInput: string
   onBindInput: (value: string) => void
   onEvaluate: () => void
+  capability?: SourceCapability
 }) {
   const bindCount = highestBindParameter(statement)
   const result = state.data
+  const capabilityAvailable = capability?.status === 'AVAILABLE' && capability.available
   return (
     <article className="detail-card explain-analyze-card" aria-live="polite">
       <div className="detail-card-heading">
         <div><span className="panel-kicker">Gerçek kaynak · read-only</span><h2>Ana DB'de EXPLAIN ANALYZE</h2></div>
         <span className="simulation-label"><Database size={14} /> Ana veritabanı</span>
       </div>
-      <p className="explain-intro">Bu sorguyu gerçek veri ve cache koşullarıyla ana veritabanında ölçer. Yalnız salt-okunur SELECT kabul edilir; işlem read-only transaction içinde çalıştırılıp geri alınır.</p>
+      <p className="explain-intro">Ana veritabanında gerçek yük oluşturur. Yalnız SELECT.</p>
+      {!capabilityAvailable && <div className="capability-action-warning"><ShieldAlert size={16} /><span><strong>Source EXPLAIN kullanılamıyor.</strong> {capability?.reason || 'Capability durumu yükleniyor.'}</span></div>}
       {bindCount > 0 ? (
         <label className="explain-bind-field">
           <span>Bind değerleri · $1–${bindCount}</span>
@@ -808,14 +783,15 @@ export function ExplainAnalyzePanel({
           <small className={bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES ? 'explain-limit-warning' : ''}>{bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES ? `Bu sorgu ${bindCount} değer istiyor; kaynak EXPLAIN sınırı ${SOURCE_EXPLAIN_MAX_BIND_VALUES} olduğu için çalıştırılamaz.` : `Sorgudaki sırayla tam ${bindCount} JSON scalar değer girin; en fazla ${SOURCE_EXPLAIN_MAX_BIND_VALUES} değer ve toplam 64 KiB.`}</small>
         </label>
       ) : <div className="explain-no-binds"><CheckCircle2 size={16} /><span>Bu sorguda bind parametresi yok; <code>bindValues: []</code> gönderilecek.</span></div>}
+      <details className="explain-safety-details"><summary>Güvenlik ayrıntıları</summary><p>Read-only transaction ve rollback uygulanır. Bind değerleri advisor’a kaydedilmez; kaynak log politikası geçerlidir.</p></details>
       <div className="explain-actions">
-        <div><strong>Gerçek kaynakta read-only çalışma</strong><span>Gerçek sorgu yükü ana veritabanında oluşur. Bind değerleri advisor’a kaydedilmez; kaynak DB log/audit politikası geçerlidir. DDL ve yazma sorguları kabul edilmez.</span></div>
-        <button type="button" className="hypopg-button explain-run-button" onClick={onEvaluate} disabled={state.status === 'loading' || bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES}>
+        <div><strong>Gerçek kaynak</strong><span>Ölçüm ana veritabanında çalışır.</span></div>
+        <button type="button" className="hypopg-button explain-run-button" onClick={onEvaluate} disabled={!capabilityAvailable || state.status === 'loading' || bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES} title={!capabilityAvailable ? capability?.reason || 'Capability durumu yükleniyor.' : undefined}>
           {state.status === 'loading' ? <LoaderCircle className="spin" size={16} /> : <Zap size={16} />}
           {state.status === 'loading' ? 'Kaynakta çalışıyor…' : 'EXPLAIN ANALYZE çalıştır'}
         </button>
       </div>
-      {state.status === 'error' && <div className="index-evaluation-error explain-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
+      {state.status === 'error' && <div className="index-evaluation-error explain-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate} disabled={!capabilityAvailable || bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES} title={!capabilityAvailable ? capability?.reason || 'Capability durumu yükleniyor.' : undefined}>Tekrar dene</button></div>}
       {state.status === 'success' && result && (
         <div className={`explain-result ${result.status.toLowerCase()}`}>
           <div className="index-evaluation-status">
@@ -861,7 +837,7 @@ export function ExplainAnalyzePanel({
   )
 }
 
-function QueryDetailModal({ queryId, window, onClose }: { queryId: string; window: TimeWindow; onClose: () => void }) {
+function QueryDetailModal({ queryId, window, capabilities, onClose }: { queryId: string; window: TimeWindow; capabilities: CapabilityMatrixData['items']; onClose: () => void }) {
   const [state, setState] = useState<Loadable<QueryDetail>>({ status: 'loading' })
   const [copied, setCopied] = useState(false)
   const [indexAdvice, setIndexAdvice] = useState<Record<string, Loadable<QueryIndexAdvice>>>({})
@@ -912,7 +888,16 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
     globalThis.setTimeout(() => setCopied(false), 1800)
   }
 
+  const detailCapabilityRow = state.data
+    ? capabilities.find((row) => row.serverId === state.data!.serverId && row.databaseId === state.data!.databaseId)
+    : undefined
+  const sourceExplainCapability = detailCapabilityRow?.capabilities.find((item) => item.key === 'sourceExplain')
+  const sourceExplainAvailable = sourceCapabilityAvailable(sourceExplainCapability)
+  const hypopgCapability = detailCapabilityRow?.capabilities.find((item) => item.key === 'hypopg')
+  const hypopgAvailable = sourceCapabilityAvailable(hypopgCapability)
+
   const evaluateIndex = async (predicate: QueryPredicate) => {
+    if (!hypopgAvailable) return
     const key = predicateAdviceKey(predicate)
     setIndexAdvice((current) => ({ ...current, [key]: { status: 'loading' } }))
     try {
@@ -927,6 +912,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
   }
 
   const evaluateCompositeIndex = async (candidate: CompositeIndexCandidate) => {
+    if (!hypopgAvailable) return
     const key = `composite:${candidate.candidateId}`
     setIndexAdvice((current) => ({ ...current, [key]: { status: 'loading' } }))
     try {
@@ -941,7 +927,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
   }
 
   const evaluateExplainAnalyze = async () => {
-    if (!state.data) return
+    if (!state.data || !sourceExplainAvailable) return
     const parsed = parseExplainBindValues(bindInput, highestBindParameter(state.data.fullSql))
     if ('error' in parsed) {
       setExplainState({ status: 'error', error: parsed.error })
@@ -980,7 +966,6 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
   const totalSharedBlocks = (state.data?.sharedBlocksHit ?? 0) + (state.data?.sharedBlocksRead ?? 0)
   const cacheHitPercent = totalSharedBlocks > 0 ? ((state.data?.sharedBlocksHit ?? 0) / totalSharedBlocks) * 100 : null
   const cacheHitLabel = state.data ? formatCacheHit(state.data.sharedBlocksHit, state.data.sharedBlocksRead) : '—'
-
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
       <section className="query-modal" role="dialog" aria-modal="true" aria-labelledby="query-modal-title">
@@ -1002,10 +987,6 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
               <div className="hero-score"><ImpactRing impact={state.data.impactScore} severity={state.data.severity} /><div><strong>İnceleme puanı</strong><span>Yükseldikçe önce bakılma sırası artar</span></div></div>
             </div>
 
-            <div className="modal-reading-guide">
-              <ReadingGuide>Yüksek inceleme puanı önce bakılması gereken sorguyu, pozitif değişim ise yavaşlamayı gösterir. Bu puan yalnızca sıralama yapar; SQL üzerinde otomatik değişiklik yapmaz. Gerçek CPU oranını DB süresiyle, filesystem I/O'yu shared bloklarla birlikte okuyun.</ReadingGuide>
-            </div>
-
             <div className="query-detail-layout">
               <main className="query-detail-main">
                 <article className="detail-card sql-card">
@@ -1013,7 +994,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                   <pre><code>{state.data.fullSql}</code></pre>
                 </article>
 
-                <ExplainAnalyzePanel statement={state.data.fullSql} state={explainState} bindInput={bindInput} onBindInput={updateExplainBindInput} onEvaluate={evaluateExplainAnalyze} />
+                <ExplainAnalyzePanel statement={state.data.fullSql} state={explainState} bindInput={bindInput} onBindInput={updateExplainBindInput} onEvaluate={evaluateExplainAnalyze} capability={sourceExplainCapability} />
 
                 <article className="detail-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">{windowLabels[window]}</span><h2>Çalışma süresi eğilimi</h2></div>{state.data.hasComparison
@@ -1027,7 +1008,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
 
                 <article className="detail-card cpu-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">pg_stat_kcache {state.data.cpu.capability.version || ''}</span><h2>Gerçek CPU ve işletim sistemi I/O'su</h2></div><span className="simulation-label"><Activity size={14} /> Skora dahil değil</span></div>
-                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.cpu.capability.reason} Bu metrik bu iterasyonda yalnız gözlemdir ve inceleme puanını değiştirmez.</span></div>
+                  {!state.data.cpu.capability.available && <div className="predicate-scope-note"><Info size={16} /><span>{state.data.cpu.capability.reason}</span></div>}
                   {!state.data.cpu.capability.available ? (
                     <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>CPU telemetrisi kapalı</strong><p>Kaynakta pg_stat_kcache preload, extension ve PoWA datasource kaydı gerekir.</p></div></div>
                   ) : !state.data.cpu.capability.dataAvailable ? (
@@ -1045,7 +1026,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
 
                 <article className="detail-card wait-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">pg_wait_sampling {state.data.waits.capability.release}</span><h2>Sampled wait profili</h2></div><span className="simulation-label"><Clock3 size={14} /> Skora dahil değil</span></div>
-                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.waits.capability.reason}</span></div>
+                  {!state.data.waits.capability.available && <div className="predicate-scope-note"><Info size={16} /><span>{state.data.waits.capability.reason}</span></div>}
                   {!state.data.waits.capability.available ? (
                     <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>Wait telemetrisi kapalı</strong><p>Kaynakta pg_wait_sampling preload, extension ve PoWA datasource kaydı gerekir.</p></div></div>
                   ) : !state.data.waits.capability.dataAvailable ? (
@@ -1083,7 +1064,8 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                     <div><span className="panel-kicker">pg_qualstats {state.data.predicates.capability.version || ''}</span><h2>WHERE filtreleri ve index adayı gözlemleri</h2></div>
                     <span className="finding-count">{state.data.predicates.items.length} gözlem</span>
                   </div>
-                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.predicates.capability.reason} Bu alan otomatik <code>CREATE INDEX</code> çalıştırmaz.</span></div>
+                  {!hypopgAvailable && state.data.predicates.capability.available && <div className="capability-action-warning"><ShieldAlert size={16} /><span><strong>HypoPG doğrulaması kullanılamıyor.</strong> {hypopgCapability?.reason || 'Capability durumu yükleniyor.'}</span></div>}
+                  {!state.data.predicates.capability.available && <div className="predicate-scope-note"><Info size={16} /><span>{state.data.predicates.capability.reason}</span></div>}
                   {!state.data.predicates.capability.available ? (
                     <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>Predicate telemetrisi kapalı</strong><p>Kaynak sunucuda pg_qualstats ve PoWA datasource kaydını etkinleştirin.</p></div></div>
                   ) : state.data.predicates.items.length ? (
@@ -1108,6 +1090,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                             copied={copiedIndexKey === predicateAdviceKey(predicate)}
                             onEvaluate={() => evaluateIndex(predicate)}
                             onCopy={(statement) => copyIndexSql(predicateAdviceKey(predicate), statement)}
+                            capability={hypopgCapability}
                           />
                         </div>
                       ))}
@@ -1122,7 +1105,8 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                     <div><span className="panel-kicker">JOIN snapshotter · reset boundary</span><h2>JOIN ilişkileri ve composite index adayları</h2></div>
                     <span className="finding-count">{state.data.predicates.joins.length} JOIN · {state.data.predicates.candidates.length} aday</span>
                   </div>
-                  <div className="predicate-scope-note"><Info size={16} /><span>{state.data.predicates.joinCapability.reason} JOIN ve aday kanıtları skora dahil değildir; hiçbir DDL kaynakta otomatik çalışmaz.</span></div>
+                  {!state.data.predicates.joinCapability.available && <div className="predicate-scope-note"><Info size={16} /><span>{state.data.predicates.joinCapability.reason}</span></div>}
+                  {!hypopgAvailable && state.data.predicates.joinCapability.available && state.data.predicates.candidates.length > 0 && <div className="capability-action-warning"><ShieldAlert size={16} /><span><strong>Composite HypoPG doğrulaması kullanılamıyor.</strong> {hypopgCapability?.reason || 'Capability durumu yükleniyor.'}</span></div>}
                   {!state.data.predicates.joinCapability.available ? (
                     <div className="predicate-empty"><ShieldAlert size={20} /><div><strong>JOIN snapshotter kapalı</strong><p>Kaynak outbox ve düşük yetkili snapshotter servisini etkinleştirin.</p></div></div>
                   ) : <>
@@ -1136,7 +1120,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                     {state.data.predicates.candidates.length > 0 && <div className="predicate-list composite-list">
                       {state.data.predicates.candidates.map((candidate) => {
                         const key = `composite:${candidate.candidateId}`
-                        return <CompositeIndexEvaluation key={candidate.candidateId} candidate={candidate} state={indexAdvice[key]} copied={copiedIndexKey === key} onEvaluate={() => evaluateCompositeIndex(candidate)} onCopy={(statement) => copyIndexSql(key, statement)} />
+                        return <CompositeIndexEvaluation key={candidate.candidateId} candidate={candidate} state={indexAdvice[key]} copied={copiedIndexKey === key} onEvaluate={() => evaluateCompositeIndex(candidate)} onCopy={(statement) => copyIndexSql(key, statement)} capability={hypopgCapability} />
                       })}
                     </div>}
                   </>}
@@ -1160,7 +1144,6 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
               <aside className="query-detail-aside">
                 <article className="detail-card score-breakdown-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">İnceleme önceliği</span><h2>Puanın nedenleri</h2></div></div>
-                  <p className="score-model-note"><Info size={14} /> Bu bölüm yalnızca puan hesaplar ve sorguları öncelik sırasına dizer; veritabanında otomatik değişiklik yapmaz.</p>
                   <div className="score-breakdown-list">
                     {state.data.scoreBreakdown.map((item) => (
                       <div key={item.key} className="breakdown-item">
@@ -1187,19 +1170,17 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
   )
 }
 
-function SystemHealthPage({ state, onRetry }: { state: Loadable<SystemHealth>; onRetry: () => void }) {
+export function SystemHealthPage({ state, onRetry }: { state: Loadable<SystemHealth>; onRetry: () => void }) {
   if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel label="Sistem metrikleri yükleniyor" />
   if (state.status === 'error' || !state.data) return <ErrorPanel message={state.error ?? 'Sistem metrikleri alınamadı.'} onRetry={onRetry} />
   const data = state.data
 
   return (
     <section className="page-section" aria-labelledby="health-title">
-      <PageHeading eyebrow={data.postgresVersion} title="Tablo ve işlem sinyalleri" description={`Son ölçüm ${formatDateTime(data.collectedAt)} tarihinde alındı.`}>
+      <PageHeading eyebrow={`${data.postgresVersion} · güncel snapshot`} title="Tablo ve işlem sinyalleri" description={`Zaman filtresinden bağımsız anlık ölçüm ${formatDateTime(data.collectedAt)} tarihinde alındı.`}>
         <SeverityBadge severity={data.overall} label={data.overall === 'healthy' ? 'Öncelikli sinyal yok' : 'İzlenmesi gereken sinyal var'} />
         <button type="button" className="secondary-button" onClick={onRetry}><RefreshCw size={15} /> Yenile</button>
       </PageHeading>
-
-      <ReadingGuide>Yeşil değerler hedef içinde, turuncu ve kırmızı değerler inceleme gerektirir. Ölü satır veya uzun transaction sayısı yükseliyorsa ilgili tabloyu ve işlem süresini kontrol edin; tek bir sayaç tek başına sorun kanıtı değildir.</ReadingGuide>
 
       <div className="health-grid">
         {data.metrics.map((metric) => (
@@ -1253,7 +1234,23 @@ function indexSignalLabel(signal?: string): string {
   return labels[(signal || '').toUpperCase()] || signal || 'Bilgi'
 }
 
-function OperationsPage({ state, window, onRetry }: { state: Loadable<OperationsData>; window: TimeWindow; onRetry: () => void }) {
+export function FleetCapabilityMatrix({ state, onRetry }: { state: Loadable<CapabilityMatrixData>; onRetry: () => void }) {
+  if (state.status === 'loading' || state.status === 'idle') {
+    return <div className="capability-load-state" role="status"><LoaderCircle className="spin" size={19} /><span>Tüm kaynakların capability matrisi yükleniyor.</span></div>
+  }
+  if (state.status === 'error' || !state.data) {
+    return <div className="capability-load-state error" role="alert"><ShieldAlert size={19} /><span>{state.error ?? 'Capability matrisi alınamadı.'}</span><button type="button" className="secondary-button" onClick={onRetry}><RefreshCw size={14} /> Yeniden dene</button></div>
+  }
+  return <CapabilityMatrix rows={state.data.items} />
+}
+
+function OperationsPage({ state, capabilities, window, onRetry, onCapabilitiesRetry }: {
+  state: Loadable<OperationsData>
+  capabilities: Loadable<CapabilityMatrixData>
+  window: TimeWindow
+  onRetry: () => void
+  onCapabilitiesRetry: () => void
+}) {
   if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel label="Operasyon telemetrisi yükleniyor" />
   if (state.status === 'error' || !state.data) return <ErrorPanel message={state.error ?? 'Operasyon telemetrisi alınamadı.'} onRetry={onRetry} />
   const data = state.data
@@ -1269,8 +1266,6 @@ function OperationsPage({ state, window, onRetry }: { state: Loadable<Operations
         <button type="button" className="secondary-button" onClick={onRetry}><RefreshCw size={15} /> Yenile</button>
       </PageHeading>
 
-      <ReadingGuide>Bu ekran repository’ye zaten kaydedilen sunucu düzeyi verileri görünür kılar. Index gözlemleri otomatik silme önerisi değildir; tablo yazma yükü ve sorgu planlarıyla doğrulanmalıdır.</ReadingGuide>
-
       <div className="stats-grid operations-stats">
         <StatCard icon={Database} label="Repository boyutu" value={formatBytes(data.repository.sizeBytes)} tone="blue" helper={`PostgreSQL ${data.repository.postgresVersion || '—'} · PoWA ${data.repository.powaVersion || '—'}`} />
         <StatCard icon={Clock3} label="Saklama hedefi" value={formatNumber(data.repository.retentionDays)} unit="gün" tone="green" helper={`Collector kaydı: ${data.collector.retention || 'henüz yok'}`} />
@@ -1278,11 +1273,22 @@ function OperationsPage({ state, window, onRetry }: { state: Loadable<Operations
         <StatCard icon={Network} label="İzlenen kaynak" value={formatNumber(data.architecture.sourceCount)} tone="blue" helper={`${data.collectors.length} collector kaydı repository'de görünür`} />
       </div>
 
+      <div className={`release-status ${data.release.migration.upToDate ? 'healthy' : 'warning'}`}>
+        {data.release.migration.upToDate ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}
+        <div><strong>PG Advisor {data.release.applicationVersion}</strong><span>Migration {data.release.migration.current || '—'} / {data.release.migration.expected} · {data.release.migration.appliedCount} uygulandı</span></div>
+        <SeverityBadge severity={data.release.migration.upToDate ? 'healthy' : 'warning'} label={data.release.migration.upToDate ? 'Güncel' : 'Migration gerekli'} />
+      </div>
+
+      <article className="panel telemetry-panel capability-panel">
+        <div className="panel-heading"><div><span className="panel-kicker">Tüm izlenen fleet · kaynak bazında</span><h2>Capability matrisi</h2></div><Network size={20} className="panel-accent-icon" /></div>
+        <FleetCapabilityMatrix state={capabilities} onRetry={onCapabilitiesRetry} />
+      </article>
+
       <div className="operations-top-grid">
         <article className="panel architecture-panel">
-          <div className="panel-heading"><div><span className="panel-kicker">Veri yolu</span><h2>Repository-only mimari</h2></div><Network size={20} className="panel-accent-icon" /></div>
+          <div className="panel-heading"><div><span className="panel-kicker">Veri yolu</span><h2>Telemetri mimarisi</h2></div><Network size={20} className="panel-accent-icon" /></div>
           <div className="operations-flow">{data.architecture.dataFlow.map((step, index) => <div key={`${step}-${index}`}><span>{index + 1}</span><strong>{step}</strong>{index < data.architecture.dataFlow.length - 1 && <ArrowRight size={17} />}</div>)}</div>
-          <p className="architecture-note"><ShieldAlert size={15} /> API’nin kaynak PostgreSQL’e doğrudan bağlantısı {data.architecture.apiSourceConnection ? 'açık' : 'kapalı'}; analiz repository üzerinden yapılır.</p>
+          <p className="architecture-note"><ShieldAlert size={15} /> Tarihsel metrikler repository’den gelir. Source EXPLAIN ayrı evaluator üzerinden çalışır.</p>
         </article>
         <article className="panel service-panel">
           <div className="panel-heading"><div><span className="panel-kicker">Çalışma durumu</span><h2>Servisler</h2></div><Activity size={19} className="panel-accent-icon" /></div>
@@ -1322,13 +1328,32 @@ function OperationsPage({ state, window, onRetry }: { state: Loadable<Operations
       <article className="panel telemetry-panel">
         <div className="panel-heading"><div><span className="panel-kicker">Index geçmişi · {windowLabels[window]}</span><h2>Index kullanım sinyalleri</h2></div><span className="index-disclaimer"><Info size={13} /> DROP önerisi değildir</span></div>
         {data.indexes.available ? <>
-          <p className="telemetry-caveat"><ShieldAlert size={15} /> Repository PK, unique ve constraint-backed index rollerini güvenilir biçimde ayıramaz. Sıfır tarama yalnız seçili penceredeki gözlemdir; silmeden önce daha uzun trafik, replica ve dönemsel işleri doğrulayın.</p>
+          <p className="telemetry-caveat"><ShieldAlert size={15} /> Sıfır tarama DROP önerisi değildir.</p>
           {indexSummary && <div className="index-summary"><span><b>{formatLargeNumber(indexSummary.indexesObserved)}</b> index izlendi</span><span><b>{formatLargeNumber(data.indexes.items.length)}</b> listede</span><span><b>{formatLargeNumber(indexSummary.candidateSignals)}</b> gözlemsel sinyal</span><span><b>{formatBytes(indexSummary.totalSizeBytes)}</b> toplam</span><span><b>{formatBytes(indexSummary.noScanSizeBytes)}</b> tarama gözlenmeyen alan</span></div>}
           <div className="database-health-table-wrap telemetry-table-wrap telemetry-scroll-table"><table className="database-health-table"><thead><tr><th>Index</th><th>Tablo</th><th>Boyut</th><th>Tarama / tuple</th><th>Blok read / hit</th><th>Son tarama</th><th>Sinyal / açıklama</th></tr></thead><tbody>{data.indexes.items.map((item) => <tr key={`${item.serverId}:${item.databaseId}:${item.indexId ?? item.indexName}`}><td><span className="index-name"><strong>{item.indexName}</strong><small>{item.serverAlias ? `${item.serverAlias} / ` : ''}{item.databaseName} · OID {item.indexId ?? '—'}</small></span></td><td><span className="index-name"><strong>{item.schemaName ? `${item.schemaName}.` : ''}{item.tableName}</strong><small>relation OID {item.relationId ?? '—'}</small></span></td><td>{formatBytes(item.indexSizeBytes)}</td><td>{formatLargeNumber(item.indexScans)}<small>read {formatLargeNumber(item.tuplesRead || 0)} · fetch {formatLargeNumber(item.tuplesFetched || 0)}</small></td><td>{formatLargeNumber(item.blocksRead || 0)} / {formatLargeNumber(item.blocksHit || 0)}<small>{formatCacheHit(item.blocksHit || 0, item.blocksRead || 0)} cache hit</small></td><td>{item.lastUsedAt ? formatDateTime(item.lastUsedAt) : 'Gözlenmedi'}</td><td><SeverityBadge severity={statusSeverity(item.signalLevel)} label={indexSignalLabel(item.signal || item.signalLevel)} />{item.recommendation && <small className="signal-detail">{item.recommendation}</small>}</td></tr>)}</tbody></table>{!data.indexes.items.length && <div className="empty-state"><Info size={26} /><strong>Index telemetrisi yok</strong><p>Seçili pencerede henüz index gözlemi oluşmadı.</p></div>}</div>
         </> : <div className="telemetry-unavailable"><Info size={20} /><div><strong>Index telemetrisi henüz kullanılamıyor</strong><p>{data.indexes.message || 'Collector yeterli örnek oluşturduğunda bu alan dolacak.'}</p></div></div>}
       </article>
 
       {data.collector.errors.length > 0 && <div className="error-panel collector-errors"><span className="error-panel-icon"><ShieldAlert size={24} /></span><div><strong>Collector uyarıları</strong>{data.collector.errors.map((error) => <p key={error}>{error}</p>)}</div></div>}
+    </section>
+  )
+}
+
+export function ScopeBootstrapPanel({ state, onRetry }: { state: Loadable<unknown>; onRetry: () => void }) {
+  if (state.status !== 'error') {
+    return <section className="page-section"><LoadingPanel label="Kaynak ve veritabanı kapsamı hazırlanıyor" /></section>
+  }
+  return (
+    <section className="page-section">
+      <div className="error-panel scope-bootstrap-error" role="alert">
+        <span className="error-panel-icon"><ShieldAlert size={24} /></span>
+        <div>
+          <strong>Kaynak kapsamı alınamadı</strong>
+          <p>{state.error ?? 'Sunucu ve veritabanı listesi alınamadı.'}</p>
+          <small>Kesin bir sunucu/veritabanı seçilmeden analiz sorguları başlatılmadı.</small>
+        </div>
+        <button type="button" className="secondary-button" onClick={onRetry}><RefreshCw size={15} /> Yeniden dene</button>
+      </div>
     </section>
   )
 }
@@ -1358,19 +1383,40 @@ function Sidebar({ page, onNavigate, collapsed, onToggle, sourceName, connection
 }
 
 function App() {
-  const [page, setPage] = useState<PageId>(getInitialPage)
-  const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
+  const initialLocation = useMemo(() => parseAppHash(window.location.hash), [])
+  const [page, setPage] = useState<PageId>(initialLocation.page)
+  const [timeWindow, setTimeWindow] = useState<TimeWindow>(initialLocation.window)
+  const [scope, setScope] = useState<AnalysisScope>(initialLocation.scope)
   const [collapsed, setCollapsed] = useState(false)
-  const [selectedQuery, setSelectedQuery] = useState<string | null>(null)
-  const [queryParams, setQueryParams] = useState<QueryListParams>({ page: 1, pageSize: 50, sort: 'impact' })
+  const [selectedQuery, setSelectedQuery] = useState<string | null>(
+    queryBelongsToScope(initialLocation.queryId, initialLocation.scope) ? initialLocation.queryId : null,
+  )
+  const [servers, setServers] = useState<ServerOption[]>([])
+  const [databases, setDatabases] = useState<DatabaseOption[]>([])
+  const [scopeMetadata, setScopeMetadata] = useState<Loadable<true>>({ status: 'idle' })
+  const scopeMetadataController = useRef<AbortController | null>(null)
+  const capabilityController = useRef<AbortController | null>(null)
+  const [queryParams, setQueryParams] = useState<QueryListParams>({ page: 1, pageSize: 50, sort: 'impact', ...initialLocation.scope })
+  const [optimizePage, setOptimizePage] = useState(1)
   const [overview, setOverview] = useState<Loadable<OverviewStats>>({ status: 'idle' })
   const [queries, setQueries] = useState<Loadable<ApiList<QuerySummary>>>({ status: 'idle' })
   const [health, setHealth] = useState<Loadable<SystemHealth>>({ status: 'idle' })
   const [operations, setOperations] = useState<Loadable<OperationsData>>({ status: 'idle' })
+  const [capabilities, setCapabilities] = useState<Loadable<CapabilityMatrixData>>({ status: 'idle' })
+  const [fleetCapabilities, setFleetCapabilities] = useState<Loadable<CapabilityMatrixData>>({ status: 'idle' })
+  const [optimize, setOptimize] = useState<Loadable<DatabaseOptimizeData>>({ status: 'idle' })
+
+  const clearScopedData = () => {
+    setOverview({ status: 'idle' })
+    setQueries({ status: 'idle' })
+    setHealth({ status: 'idle' })
+    setOperations({ status: 'idle' })
+    setCapabilities({ status: 'idle' })
+    setOptimize({ status: 'idle' })
+  }
 
   const navigate = (next: PageId) => {
     setPage(next)
-    window.history.replaceState(null, '', `#/${next}`)
     document.querySelector<HTMLElement>('#main-content')?.focus()
   }
 
@@ -1379,9 +1425,34 @@ function App() {
     return error instanceof Error ? error.message : 'Beklenmeyen bir hata oluştu.'
   }
 
+  const exactScopeReady = scopeMetadata.status === 'success'
+    && scope.serverId !== undefined
+    && scope.databaseId !== undefined
+    && servers.some((server) => server.id === scope.serverId)
+    && databases.some((database) => database.serverId === scope.serverId && database.databaseId === scope.databaseId)
+
+  const loadScopeMetadata = () => {
+    scopeMetadataController.current?.abort()
+    const controller = new AbortController()
+    scopeMetadataController.current = controller
+    setScopeMetadata({ status: 'loading' })
+    Promise.all([advisorApi.getServers(controller.signal), advisorApi.getDatabases(undefined, controller.signal)])
+      .then(([serverResult, databaseResult]) => {
+        if (!serverResult.data.length) throw new Error('İzlenebilir PostgreSQL kaynağı bulunamadı.')
+        if (!databaseResult.data.length) throw new Error('İzlenebilir veritabanı bulunamadı; collector snapshot durumunu kontrol edin.')
+        setServers(serverResult.data)
+        setDatabases(databaseResult.data)
+        setScopeMetadata({ status: 'success', data: true })
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setScopeMetadata({ status: 'error', error: errorMessage(error) })
+      })
+    return controller
+  }
+
   const loadOverview = () => {
     const controller = new AbortController(); setOverview({ status: 'loading' })
-    advisorApi.getOverview(timeWindow, controller.signal).then(({ data }) => setOverview({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOverview({ status: 'error', error: errorMessage(error) }) })
+    advisorApi.getOverview(timeWindow, scope, controller.signal).then(({ data }) => setOverview({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOverview({ status: 'error', error: errorMessage(error) }) })
     return controller
   }
   const loadQueries = () => {
@@ -1391,51 +1462,158 @@ function App() {
   }
   const loadHealth = () => {
     const controller = new AbortController(); setHealth({ status: 'loading' })
-    advisorApi.getSystemHealth(controller.signal).then(({ data }) => setHealth({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setHealth({ status: 'error', error: errorMessage(error) }) })
+    advisorApi.getSystemHealth(timeWindow, scope, controller.signal).then(({ data }) => setHealth({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setHealth({ status: 'error', error: errorMessage(error) }) })
     return controller
   }
   const loadOperations = () => {
     const controller = new AbortController(); setOperations({ status: 'loading' })
-    advisorApi.getOperations(timeWindow, controller.signal).then(({ data }) => setOperations({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOperations({ status: 'error', error: errorMessage(error) }) })
+    advisorApi.getOperations(timeWindow, scope, controller.signal).then(({ data }) => setOperations({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOperations({ status: 'error', error: errorMessage(error) }) })
+    return controller
+  }
+  const loadCapabilities = () => {
+    capabilityController.current?.abort()
+    const controller = new AbortController(); capabilityController.current = controller
+    setCapabilities((current) => current.status === 'success' ? current : { status: 'loading' })
+    advisorApi.getCapabilities(timeWindow, scope, controller.signal).then(({ data }) => setCapabilities({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setCapabilities({ status: 'error', error: errorMessage(error) }) })
+    return controller
+  }
+  const loadFleetCapabilities = () => {
+    const controller = new AbortController(); setFleetCapabilities({ status: 'loading' })
+    advisorApi.getCapabilities(timeWindow, {}, controller.signal).then(({ data }) => setFleetCapabilities({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setFleetCapabilities({ status: 'error', error: errorMessage(error) }) })
+    return controller
+  }
+  const loadOptimize = () => {
+    const controller = new AbortController(); setOptimize({ status: 'loading' })
+    advisorApi.getDatabaseOptimize(timeWindow, scope, optimizePage, 50, controller.signal).then(({ data }) => setOptimize({ status: 'success', data })).catch((error) => { if (!controller.signal.aborted) setOptimize({ status: 'error', error: errorMessage(error) }) })
     return controller
   }
 
   useEffect(() => {
-    const controller = loadHealth()
-    const onHashChange = () => setPage(getInitialPage())
+    loadScopeMetadata()
+    const onHashChange = () => {
+      const location = parseAppHash(window.location.hash)
+      setPage(location.page)
+      setTimeWindow(location.window)
+      setScope(location.scope)
+      setSelectedQuery(queryBelongsToScope(location.queryId, location.scope) ? location.queryId : null)
+    }
     window.addEventListener('hashchange', onHashChange)
-    return () => { controller.abort(); window.removeEventListener('hashchange', onHashChange) }
-    // Sistem sağlığı pencere bağımsızdır ve ilk yüklemede hazırlanır.
+    return () => { scopeMetadataController.current?.abort(); window.removeEventListener('hashchange', onHashChange) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    const controllers = [loadOverview(), loadOperations()]
-    return () => controllers.forEach((controller) => controller.abort())
-    // Zaman aralığı değiştiğinde pencereye bağlı özet ve operasyon telemetrisi yenilenir.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeWindow])
+    if (!servers.length || !databases.length) return
+    const resolved = resolveScope(scope, servers, databases)
+    if (!sameScope(scope, resolved)) {
+      setSelectedQuery((current) => queryAfterScopeChange(scope, resolved, current))
+      setScope(resolved)
+    }
+  }, [databases, scope, servers])
 
   useEffect(() => {
+    setQueryParams((value) => ({ ...value, page: 1, serverId: scope.serverId, databaseId: scope.databaseId }))
+    setOptimizePage(1)
+  }, [scope.serverId, scope.databaseId])
+
+  useEffect(() => {
+    window.history.replaceState(null, '', buildAppHash({ page, scope, window: timeWindow, queryId: selectedQuery }))
+  }, [page, scope, selectedQuery, timeWindow])
+
+  useEffect(() => {
+    if (!exactScopeReady) return
+    const controller = loadCapabilities()
+    const interval = window.setInterval(loadCapabilities, 60_000)
+    return () => { window.clearInterval(interval); controller.abort(); capabilityController.current?.abort() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exactScopeReady, timeWindow, scope.serverId, scope.databaseId])
+
+  useEffect(() => {
+    if (page !== 'overview' || !exactScopeReady) return
+    const controller = loadOverview()
+    return () => controller.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, exactScopeReady, timeWindow, scope.serverId, scope.databaseId])
+
+  useEffect(() => {
+    if (page !== 'queries' || !exactScopeReady || !sameScope(queryParams, scope)) return
     const controller = loadQueries()
     return () => controller.abort()
     // Sorgu filtresi veya zaman aralığı değiştiğinde sunucu tarafında yeni sayfa alınır.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeWindow, queryParams])
+  }, [page, exactScopeReady, timeWindow, queryParams, scope.serverId, scope.databaseId])
 
-  const hasError = [overview, queries, health, operations].some((state) => state.status === 'error')
-  const isConnecting = [overview, queries, health, operations].some((state) => state.status === 'loading' || state.status === 'idle')
+  useEffect(() => {
+    if (page !== 'health' || !exactScopeReady) return
+    const controller = loadHealth()
+    return () => controller.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, exactScopeReady, timeWindow, scope.serverId, scope.databaseId])
+
+  useEffect(() => {
+    if (page !== 'operations' || !exactScopeReady) return
+    const controller = loadOperations()
+    return () => controller.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, exactScopeReady, timeWindow, scope.serverId, scope.databaseId])
+
+  useEffect(() => {
+    if (page !== 'operations' || !exactScopeReady) return
+    const controller = loadFleetCapabilities()
+    return () => controller.abort()
+    // Operations matrisi bilinçli olarak yalnız bu sayfada ve tüm fleet kapsamıyla yüklenir.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, exactScopeReady, timeWindow])
+
+  useEffect(() => {
+    if (page !== 'optimize' || !exactScopeReady) return
+    const controller = loadOptimize()
+    return () => controller.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, exactScopeReady, timeWindow, scope.serverId, scope.databaseId, optimizePage])
+
+  const activePageState: Loadable<unknown> = page === 'overview' ? overview
+    : page === 'queries' ? queries
+      : page === 'optimize' ? optimize
+        : page === 'health' ? health
+          : operations
+  const connectionStates: Loadable<unknown>[] = [scopeMetadata, capabilities, activePageState, ...(page === 'operations' ? [fleetCapabilities] : [])]
+  const hasError = connectionStates.some((state) => state.status === 'error')
+  const isConnecting = connectionStates.some((state) => state.status === 'loading' || state.status === 'idle')
+  const capabilityRows = capabilities.data?.items || []
+  const selectedCapabilityRow = capabilityRows.find((row) => row.serverId === scope.serverId && row.databaseId === scope.databaseId)
+  const availableCapabilityCount = selectedCapabilityRow?.capabilities.filter((item) => item.status === 'AVAILABLE' && item.available).length || 0
+  const totalCapabilityCount = selectedCapabilityRow?.capabilities.length || 0
+  const hypopgCapability = selectedCapabilityRow?.capabilities.find((item) => item.key === 'hypopg')
+  const activeServer = servers.find((item) => item.id === scope.serverId)
+  const activeDatabase = databases.find((item) => item.serverId === scope.serverId && item.databaseId === scope.databaseId)
+  const changeWindow = (nextWindow: TimeWindow) => {
+    if (nextWindow === timeWindow) return
+    clearScopedData()
+    setFleetCapabilities({ status: 'idle' })
+    setTimeWindow(nextWindow)
+    setQueryParams((value) => ({ ...value, page: 1 }))
+    setOptimizePage(1)
+  }
+  const changeScope = (nextScope: AnalysisScope) => {
+    if (sameScope(scope, nextScope)) return
+    clearScopedData()
+    setSelectedQuery((current) => queryAfterScopeChange(scope, nextScope, current))
+    setScope(nextScope)
+  }
+  const retryOperations = () => { loadOperations(); loadFleetCapabilities() }
+  const openQuery = (id: string) => setSelectedQuery(queryBelongsToScope(id, scope) ? id : null)
 
   return (
     <div className={`app-shell ${collapsed ? 'sidebar-is-collapsed' : ''}`}>
       <a className="skip-link" href="#main-content">Ana içeriğe geç</a>
-      <Sidebar page={page} onNavigate={navigate} collapsed={collapsed} onToggle={() => setCollapsed((value) => !value)} sourceName={overview.data?.databaseName || 'test-source · PoWA'} connectionState={hasError ? 'error' : isConnecting ? 'loading' : 'connected'} />
+      <Sidebar page={page} onNavigate={navigate} collapsed={collapsed} onToggle={() => setCollapsed((value) => !value)} sourceName={activeServer && activeDatabase ? `${activeServer.alias} · ${activeDatabase.name}` : 'Kaynak seçiliyor'} connectionState={hasError ? 'error' : isConnecting ? 'loading' : 'connected'} />
       <div className="app-main">
         <header className="topbar">
           <div className="mobile-brand"><span className="brand-mark"><Database size={18} /><i /></span><strong>PG Advisor</strong></div>
           <div className="breadcrumb"><span>PG Advisor</span><ChevronRight size={14} /><strong>{pageTitles[page]}</strong></div>
           <div className="topbar-actions">
-            {page !== 'health' && <WindowPicker value={timeWindow} onChange={(nextWindow) => { setTimeWindow(nextWindow); setQueryParams((value) => ({ ...value, page: 1 })) }} />}
+            <GlobalScopeBar servers={servers} databases={databases} scope={scope} window={timeWindow} availableCapabilities={availableCapabilityCount} totalCapabilities={totalCapabilityCount} capabilityStatus={capabilities.status} onCapabilitiesRetry={loadCapabilities} onScopeChange={changeScope} onWindowChange={changeWindow} />
             <div className={`api-indicator ${demoModeEnabled ? 'demo' : hasError ? 'error' : isConnecting ? 'loading' : 'connected'}`} title={hasError ? 'Bazı API istekleri başarısız' : 'API bağlantı durumu'}>
               <i />{demoModeEnabled ? 'Demo modu' : hasError ? 'API sorunu' : isConnecting ? 'Bağlanıyor' : 'Canlı veri'}
             </div>
@@ -1443,13 +1621,16 @@ function App() {
         </header>
         {demoModeEnabled && <div className="demo-banner" role="status"><Info size={15} /><span><strong>Demo verisi gösteriliyor.</strong> Bu veri API hatası nedeniyle otomatik açılmadı; <code>VITE_DEMO_MODE=true</code> ile bilinçli olarak etkinleştirildi.</span></div>}
         <main id="main-content" tabIndex={-1}>
-          {page === 'overview' && <OverviewPage state={overview} queries={queries.data} window={timeWindow} onRetry={loadOverview} onOpenQuery={setSelectedQuery} onNavigate={navigate} />}
-          {page === 'queries' && <QueriesPage state={queries} params={queryParams} window={timeWindow} onParamsChange={setQueryParams} onRetry={loadQueries} onOpenQuery={setSelectedQuery} />}
-          {page === 'health' && <SystemHealthPage state={health} onRetry={loadHealth} />}
-          {page === 'operations' && <OperationsPage state={operations} window={timeWindow} onRetry={loadOperations} />}
+          {!exactScopeReady ? <ScopeBootstrapPanel state={scopeMetadata} onRetry={loadScopeMetadata} /> : <>
+            {page === 'overview' && <OverviewPage state={overview} window={timeWindow} onRetry={loadOverview} onOpenQuery={openQuery} onNavigate={navigate} />}
+            {page === 'queries' && <QueriesPage state={queries} params={queryParams} window={timeWindow} onParamsChange={setQueryParams} onRetry={loadQueries} onOpenQuery={openQuery} />}
+            {page === 'optimize' && <DatabaseOptimizePage state={optimize} window={timeWindow} page={optimizePage} onPageChange={setOptimizePage} onRetry={loadOptimize} onOpenQuery={openQuery} hypopgCapability={hypopgCapability} />}
+            {page === 'health' && <SystemHealthPage state={health} onRetry={loadHealth} />}
+            {page === 'operations' && <OperationsPage state={operations} capabilities={fleetCapabilities} window={timeWindow} onRetry={retryOperations} onCapabilitiesRetry={loadFleetCapabilities} />}
+          </>}
         </main>
       </div>
-      {selectedQuery && <QueryDetailModal queryId={selectedQuery} window={timeWindow} onClose={() => setSelectedQuery(null)} />}
+      {exactScopeReady && queryBelongsToScope(selectedQuery, scope) && selectedQuery && <QueryDetailModal queryId={selectedQuery} window={timeWindow} capabilities={capabilityRows} onClose={() => setSelectedQuery(null)} />}
     </div>
   )
 }

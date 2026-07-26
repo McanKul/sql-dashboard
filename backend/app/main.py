@@ -13,6 +13,7 @@ from app.api.router import router
 from app.config import get_settings
 from app.db import close_pool, open_pool
 from app.repositories.powa import repository
+from app.version import APPLICATION_VERSION
 
 
 settings = get_settings()
@@ -38,7 +39,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="PostgreSQL Sorgu Performansi ve Oneri Motoru",
-    version="1.0.0-iteration-2.7",
+    version=APPLICATION_VERSION,
     description=(
         "PoWA repository uzerinden CPU/bekleme analizi, JOIN snapshotlari, composite "
         "index onerileri, HypoPG ve istege bagli izole clone dogrulamasi."

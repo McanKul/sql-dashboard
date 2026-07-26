@@ -1,10 +1,14 @@
-import { demoHealth, demoOverview, demoQueries, demoQueryDetails } from './demoData'
+import { demoCapabilities, demoDatabaseOptimize, demoHealth, demoOverview, demoQueries, demoQueryDetails } from './demoData'
 import type {
+  AnalysisScope,
   ApiErrorShape,
   ApiList,
   ApiResult,
+  CapabilityMatrixData,
   DatabaseOption,
   CompositeIndexCandidate,
+  DatabaseOptimizeData,
+  DatabaseOptimizeItem,
   IndexTelemetryItem,
   IoTelemetryItem,
   OperationsData,
@@ -22,6 +26,7 @@ import type {
   SystemHealth,
   TimeWindow,
 } from './types'
+import { scopedQuery } from './scope'
 import { comparisonAvailable } from './utils'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/$/, '')
@@ -211,6 +216,12 @@ interface RawPredicateResponse {
 
 interface RawOverview {
   window: string
+  scope?: {
+    serverId?: number | null
+    serverAlias?: string | null
+    databaseId?: number | null
+    databaseName?: string | null
+  }
   cards: {
     totalDbTimeMs: number
     trackedQueries: number
@@ -257,6 +268,16 @@ interface RawSystemHealth {
 }
 
 interface RawOperations {
+  release?: {
+    applicationVersion?: string
+    migration?: {
+      current?: string | null
+      expected?: string
+      appliedCount?: number
+      latestAppliedAt?: string | null
+      upToDate?: boolean
+    }
+  }
   architecture?: {
     host?: string
     source?: { count?: number }
@@ -602,9 +623,10 @@ function mapOverview(raw: RawOverview): OverviewStats {
     value: point.calls ? Number(point.totalExecTimeMs || 0) / point.calls : 0,
   }))
   const collectorHealthy = (raw.collector?.status || '').toUpperCase() === 'HEALTHY'
+  const scopedDatabaseName = [raw.scope?.serverAlias, raw.scope?.databaseName].filter(Boolean).join(' / ')
 
   return {
-    databaseName: raw.collector?.alias || raw.collector?.hostname || 'PoWA repository',
+    databaseName: scopedDatabaseName || raw.collector?.alias || raw.collector?.hostname || 'PoWA repository',
     environment: 'Canlı telemetri',
     lastCollectedAt: observedAt,
     queriesAnalyzed: Number(raw.cards.trackedQueries || 0),
@@ -623,6 +645,7 @@ function mapOverview(raw: RawOverview): OverviewStats {
       averageMs: Number(query.meanExecTimeMs || 0),
       loadPercent: Number(query.dbLoadPercent || 0),
     })),
+    topQueries: raw.topQueries.slice(0, 4).map((query) => mapSummary(query, observedAt)),
   }
 }
 
@@ -749,6 +772,16 @@ function mapOperations(raw: RawOperations, indexes: OperationsData['indexes'], i
     ...mapCollector(collector),
   }))
   return {
+    release: {
+      applicationVersion: raw.release?.applicationVersion || '—',
+      migration: {
+        current: raw.release?.migration?.current ?? null,
+        expected: raw.release?.migration?.expected || '—',
+        appliedCount: Number(raw.release?.migration?.appliedCount || 0),
+        latestAppliedAt: raw.release?.migration?.latestAppliedAt ?? null,
+        upToDate: Boolean(raw.release?.migration?.upToDate),
+      },
+    },
     architecture: {
       host: raw.architecture?.host,
       dataFlow: raw.architecture?.dataFlow || [],
@@ -774,9 +807,9 @@ function mapOperations(raw: RawOperations, indexes: OperationsData['indexes'], i
 }
 
 export const advisorApi = {
-  async getOverview(window: TimeWindow = '24h', signal?: AbortSignal): Promise<ApiResult<OverviewStats>> {
+  async getOverview(window: TimeWindow = '24h', scope: AnalysisScope = {}, signal?: AbortSignal): Promise<ApiResult<OverviewStats>> {
     if (demoModeEnabled) return asResult(demoOverview, 'demo')
-    return asResult(mapOverview(await request<RawOverview>(`/overview?window=${window}`, { signal })), 'api')
+    return asResult(mapOverview(await request<RawOverview>(`/overview?${scopedQuery(window, scope)}`, { signal })), 'api')
   },
 
   async getQueries(window: TimeWindow = '24h', params: QueryListParams = { page: 1, pageSize: 50 }, signal?: AbortSignal): Promise<ApiResult<ApiList<QuerySummary>>> {
@@ -886,9 +919,9 @@ export const advisorApi = {
     return asResult(payload, 'api')
   },
 
-  async getSystemHealth(signal?: AbortSignal): Promise<ApiResult<SystemHealth>> {
+  async getSystemHealth(window: TimeWindow = '24h', scope: AnalysisScope = {}, signal?: AbortSignal): Promise<ApiResult<SystemHealth>> {
     if (demoModeEnabled) return asResult(demoHealth, 'demo')
-    return asResult(mapSystemHealth(await request<RawSystemHealth>('/system-health', { signal })), 'api')
+    return asResult(mapSystemHealth(await request<RawSystemHealth>(`/system-health?${scopedQuery(window, scope)}`, { signal })), 'api')
   },
 
   async getServers(signal?: AbortSignal): Promise<ApiResult<ServerOption[]>> {
@@ -907,8 +940,9 @@ export const advisorApi = {
     return asResult(payload.items || [], 'api')
   },
 
-  async getOperations(window: TimeWindow = '24h', signal?: AbortSignal): Promise<ApiResult<OperationsData>> {
+  async getOperations(window: TimeWindow = '24h', scope: AnalysisScope = {}, signal?: AbortSignal): Promise<ApiResult<OperationsData>> {
     const demoRaw: RawOperations = {
+      release: { applicationVersion: '1.1.0', migration: { current: '001', expected: '001', appliedCount: 1, latestAppliedAt: '2026-07-22T10:00:00Z', upToDate: true } },
       architecture: { host: 'Demo host', source: { count: 1 }, dataFlow: ['PostgreSQL kaynakları', 'collector', 'repository-db', 'api', 'web'], apiSourceConnection: false },
       services: [{ name: 'PoWA Collector', service: 'collector', status: 'HEALTHY' }, { name: 'PostgreSQL repository', service: 'repository-db', status: 'HEALTHY' }],
       collector: { alias: 'demo-source', status: 'HEALTHY', lagSeconds: 4, frequencySeconds: 30, retention: '90 days' },
@@ -917,9 +951,9 @@ export const advisorApi = {
     if (demoModeEnabled) return asResult(mapOperations(demoRaw, { available: true, items: [] }, { available: true, items: [], capabilities: [], contexts: [], servers: [] }), 'demo')
 
     const [raw, indexResult, ioResult] = await Promise.all([
-      request<RawOperations>('/operations', { signal }),
-      request<unknown>(`/indexes?window=${window}`, { signal }).then((payload) => ({ payload })).catch((error: unknown) => ({ error })),
-      request<unknown>(`/io?window=${window}`, { signal }).then((payload) => ({ payload })).catch((error: unknown) => ({ error })),
+      request<RawOperations>(`/operations?${scopedQuery(window, scope)}`, { signal }),
+      request<unknown>(`/indexes?${scopedQuery(window, scope)}`, { signal }).then((payload) => ({ payload })).catch((error: unknown) => ({ error })),
+      request<unknown>(`/io?${scopedQuery(window, scope)}`, { signal }).then((payload) => ({ payload })).catch((error: unknown) => ({ error })),
     ])
     const indexPayload = 'payload' in indexResult ? indexResult.payload : undefined
     const ioPayload = 'payload' in ioResult ? ioResult.payload : undefined
@@ -966,5 +1000,30 @@ export const advisorApi = {
       servers: Array.isArray(ioRecord?.servers) ? ioRecord.servers as OperationsData['io']['servers'] : [],
     }
     return asResult(mapOperations(raw, indexes, io), 'api')
+  },
+
+  async getCapabilities(window: TimeWindow = '24h', scope: AnalysisScope = {}, signal?: AbortSignal): Promise<ApiResult<CapabilityMatrixData>> {
+    if (demoModeEnabled) return asResult(demoCapabilities, 'demo')
+    return asResult(await request<CapabilityMatrixData>(`/capabilities?${scopedQuery(window, scope)}`, { signal }), 'api')
+  },
+
+  async getDatabaseOptimize(window: TimeWindow = '24h', scope: AnalysisScope = {}, page = 1, pageSize = 50, signal?: AbortSignal): Promise<ApiResult<DatabaseOptimizeData>> {
+    if (demoModeEnabled) return asResult({ ...demoDatabaseOptimize, page, pageSize }, 'demo')
+    const params = scopedQuery(window, scope)
+    params.set('page', String(page))
+    params.set('pageSize', String(pageSize))
+    return asResult(await request<DatabaseOptimizeData>(`/database-optimize?${params}`, { signal }), 'api')
+  },
+
+  async evaluateOptimizeGroup(item: DatabaseOptimizeItem, window: TimeWindow, signal?: AbortSignal): Promise<ApiResult<QueryIndexAdvice>> {
+    if (demoModeEnabled) return asResult({ status: 'UNAVAILABLE', reasonCode: 'DEMO_MODE', message: 'HypoPG demo modunda çalıştırılmaz.', ddlExecuted: false }, 'demo')
+    const payload = await request<QueryIndexAdvice>(
+      `/queries/${encodeURIComponent(item.representative.queryId)}/composite-index-evaluations?window=${window}`,
+      {
+        method: 'POST', signal,
+        body: JSON.stringify({ serverId: item.serverId, databaseId: item.databaseId, candidateId: item.representative.candidateId }),
+      },
+    )
+    return asResult(payload, 'api')
   },
 }

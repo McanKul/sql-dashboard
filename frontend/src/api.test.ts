@@ -35,9 +35,12 @@ describe('advisor API contracts', () => {
   })
 
   it('keeps repository index, IO capability, and detailed telemetry fields', async () => {
+    const requestedUrls: string[] = []
     vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => {
       const url = String(input)
+      requestedUrls.push(url)
       if (url.includes('/operations')) return Promise.resolve(jsonResponse({
+        release: { applicationVersion: '1.1.0', migration: { current: '007', expected: '007', appliedCount: 7, latestAppliedAt: '2026-07-26T12:00:00Z', upToDate: true } },
         architecture: { source: { count: 1 }, dataFlow: ['source', 'repository'], apiSourceConnection: false },
         services: [],
         collector: { alias: 'primary', hostname: 'db', port: 5432, retention: '90 days', errors: [] },
@@ -58,14 +61,53 @@ describe('advisor API contracts', () => {
       throw new Error(`Beklenmeyen URL: ${url}`)
     }))
 
-    const { data } = await advisorApi.getOperations('24h')
+    const { data } = await advisorApi.getOperations('24h', { serverId: 1, databaseId: 2 })
 
     expect(data.collectors[0].port).toBe(5432)
+    expect(data.release).toMatchObject({ applicationVersion: '1.1.0', migration: { current: '007', expected: '007', appliedCount: 7, upToDate: true } })
     expect(data.indexes.summary?.noScanSizeBytes).toBe(0)
     expect(data.indexes.items[0]).toMatchObject({ relationId: 10, indexId: 11, tuplesRead: 8, tuplesFetched: 5, signal: 'INSUFFICIENT_DATA' })
     expect(data.io.capabilities[0]).toMatchObject({ resetEpochAware: false, limitation: 'Reset zamanı yok.' })
     expect(data.io.contexts[0]).toMatchObject({ writebacks: 2, extends: 3, fsyncs: 4 })
     expect(data.io.servers[0]).toMatchObject({ walBuffersFull: 1, checkpointBuffersWritten: 2 })
+    expect(requestedUrls).toHaveLength(3)
+    expect(requestedUrls.every((url) => url.includes('window=24h') && url.includes('serverId=1') && url.includes('databaseId=2'))).toBe(true)
+  })
+
+  it('passes one exact scope to overview, health, capabilities, and database optimize', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => {
+      const url = String(input); urls.push(url)
+      if (url.includes('/overview')) return Promise.resolve(jsonResponse({ cards: {}, topQueries: [], trend: [], collector: null }))
+      if (url.includes('/queries')) return Promise.resolve(jsonResponse({ items: [], total: 0, page: 1, pageSize: 50, window: '7d' }))
+      if (url.includes('/system-health')) return Promise.resolve(jsonResponse({ summary: { tablesObserved: 0, critical: 0, warnings: 0, notices: 0 }, capabilities: [], items: [], longTransactions: [] }))
+      if (url.includes('/capabilities')) return Promise.resolve(jsonResponse({ window: '7d', items: [] }))
+      if (url.includes('/database-optimize')) return Promise.resolve(jsonResponse({ window: '7d', scope: { serverId: 9, databaseId: 99 }, summary: { candidateGroups: 0, affectedQueries: 0, affectedLoadMs: 0, validatedGroups: 0 }, items: [], page: 2, pageSize: 25, total: 0 }))
+      throw new Error(`Beklenmeyen URL: ${url}`)
+    }))
+    const scope = { serverId: 9, databaseId: 99 }
+    await Promise.all([
+      advisorApi.getOverview('7d', scope), advisorApi.getSystemHealth('7d', scope),
+      advisorApi.getQueries('7d', { page: 1, pageSize: 50, ...scope }),
+      advisorApi.getCapabilities('7d', scope), advisorApi.getDatabaseOptimize('7d', scope, 2, 25),
+    ])
+    expect(urls).toHaveLength(5)
+    expect(urls.every((url) => url.includes('window=7d') && url.includes('serverId=9') && url.includes('databaseId=99'))).toBe(true)
+    expect(urls.find((url) => url.includes('/database-optimize'))).toContain('page=2&pageSize=25')
+  })
+
+  it('labels overview with the backend-resolved database scope instead of the collector alias', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse({
+      window: '24h',
+      scope: { serverId: 9, serverAlias: 'erp-prod', databaseId: 99, databaseName: 'erp_main' },
+      cards: { totalDbTimeMs: 0, trackedQueries: 0, criticalQueries: 0, regressions: 0, collectorLagSeconds: 2 },
+      topQueries: [], trend: [],
+      collector: { serverId: 9, alias: 'collector-internal', status: 'HEALTHY', lastSnapshotAt: '2026-07-26T12:00:00Z' },
+    }))))
+
+    const { data } = await advisorApi.getOverview('24h', { serverId: 9, databaseId: 99 })
+
+    expect(data.databaseName).toBe('erp-prod / erp_main')
   })
 
   it('preserves honest p95 unavailability and low non-zero score contributions', async () => {
@@ -173,6 +215,24 @@ describe('advisor API contracts', () => {
     })
 
     expect(data).toMatchObject({ status: 'VALIDATED', ddlExecuted: false, candidate: { columns: ['status'], copyable: true } })
+  })
+
+  it('validates only the representative optimize candidate without fanout', async () => {
+    const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toContain('/queries/-42/composite-index-evaluations?window=24h')
+      expect(JSON.parse(String(init?.body))).toEqual({ serverId: 1, databaseId: 2, candidateId: 'candidate-1' })
+      return Promise.resolve(jsonResponse({ status: 'NO_IMPROVEMENT', reasonCode: 'NO_GAIN', message: 'Plan iyileşmedi.', ddlExecuted: false }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await advisorApi.evaluateOptimizeGroup({
+      groupId: 'group-1', serverId: 1, serverAlias: 'erp', databaseId: 2, databaseName: 'app', relationId: 10,
+      schemaName: 'public', tableName: 'orders', method: 'btree', columns: ['status', 'customer_id'], confidence: 'HIGH', createIndexSql: 'CREATE INDEX ...',
+      representative: { candidateId: 'candidate-1', queryId: '-42' }, affectedQueryCount: 3, affectedQueryIds: ['-42', '-43', '-44'], affectedLoadMs: 100,
+      evidence: { joinOccurrences: 20, filterOccurrences: 20, sampleCount: 3, observedFrom: '2026-07-26T10:00:00Z', observedTo: '2026-07-26T11:00:00Z' },
+      existingIndex: { status: 'NOT_CHECKED', reason: null }, hypopg: { status: 'NOT_EVALUATED', reason: null },
+      maintenanceCost: { writeRows: null, writesPerHour: null, risk: 'UNKNOWN', walBytesEstimate: null, reason: null },
+    }, '24h')
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it('requests source-database EXPLAIN ANALYZE with identifiers and scalar binds only', async () => {

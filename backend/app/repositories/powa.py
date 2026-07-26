@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import logging
+import re
 from time import monotonic
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from app.config import WINDOW_BUCKETS, WINDOW_INTERVALS, get_settings
 from app.db import pool
@@ -31,6 +33,7 @@ SORT_COLUMNS = {
 
 EXPORT_FETCH_SIZE = 500
 QUERY_METRICS_CACHE_FETCH_SIZE = 1_000
+OPTIMIZE_AFFECTED_QUERY_PREVIEW_SIZE = 20
 
 
 class QueryMetricsSnapshotTooLarge(RuntimeError):
@@ -65,6 +68,9 @@ class _GlobalTrendCacheEntry:
 class _QueryMetricsRetryState:
     failures: int
     retry_not_before: float
+
+
+TrendCacheKey = str | tuple[str, int, int | None]
 
 
 def _sql_numeric_ge(value: Any, minimum: int | float) -> bool:
@@ -516,6 +522,7 @@ class PowaRepository:
         query_list_cache_fresh_seconds: float | None = None,
         query_list_cache_stale_seconds: float | None = None,
         query_list_cache_max_entries: int | None = None,
+        global_trend_cache_max_entries: int | None = None,
         query_list_cache_max_rows: int | None = None,
         query_list_cache_max_bytes: int | None = None,
         clock: Callable[[], float] = monotonic,
@@ -536,6 +543,11 @@ class PowaRepository:
             if query_list_cache_max_entries is None
             else query_list_cache_max_entries
         )
+        self._global_trend_cache_max_entries = (
+            settings.global_trend_cache_max_entries
+            if global_trend_cache_max_entries is None
+            else global_trend_cache_max_entries
+        )
         self._query_list_cache_max_rows = (
             settings.query_list_cache_max_rows
             if query_list_cache_max_rows is None
@@ -555,6 +567,8 @@ class PowaRepository:
             raise ValueError("query-list cache stale suresi fresh suresinden kisa olamaz")
         if not 1 <= self._query_list_cache_max_entries <= len(WINDOW_INTERVALS):
             raise ValueError("query-list cache entry siniri 1 ile desteklenen pencere sayisi arasinda olmali")
+        if not 4 <= self._global_trend_cache_max_entries <= 1_024:
+            raise ValueError("global trend cache entry siniri 4 ile 1024 arasinda olmali")
         if not 1 <= self._query_list_cache_max_rows <= 1_000_000:
             raise ValueError("query-list cache satir siniri 1 ile 1000000 arasinda olmali")
         if not 1024 * 1024 <= self._query_list_cache_max_bytes <= 1024 * 1024 * 1024:
@@ -576,14 +590,16 @@ class PowaRepository:
         self._query_metrics_refresh_tasks: dict[
             tuple[int, str], asyncio.Task[list[dict[str, Any]]]
         ] = {}
-        self._global_trend_cache: OrderedDict[str, _GlobalTrendCacheEntry] = (
+        self._global_trend_cache: OrderedDict[TrendCacheKey, _GlobalTrendCacheEntry] = (
             OrderedDict()
         )
         self._global_trend_cache_generation = 0
-        self._global_trend_retry: dict[str, _QueryMetricsRetryState] = {}
+        self._global_trend_retry: OrderedDict[
+            TrendCacheKey, _QueryMetricsRetryState
+        ] = OrderedDict()
         self._global_trend_cache_lock = asyncio.Lock()
         self._global_trend_refresh_tasks: dict[
-            tuple[int, str], asyncio.Task[list[dict[str, Any]]]
+            tuple[int, TrendCacheKey], asyncio.Task[list[dict[str, Any]]]
         ] = {}
         self._clock = clock
 
@@ -779,11 +795,45 @@ class PowaRepository:
         # single-flight database query.
         return await asyncio.shield(refresh)
 
+    @staticmethod
+    def _trend_cache_key(
+        window: str,
+        *,
+        server_id: int | None,
+        database_id: int | None,
+    ) -> TrendCacheKey:
+        if server_id is None:
+            return window
+        return (window, server_id, database_id)
+
     async def _load_global_trend_snapshot(
-        self, window: str
+        self,
+        window: str,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
     ) -> list[dict[str, Any]]:
         interval = interval_for(window)
         bucket = WINDOW_BUCKETS[window]
+        if server_id is None:
+            function_sql = "advisor.query_trend(now() - %s::interval, %s::interval)"
+            params: list[Any] = [
+                interval,
+                bucket,
+                self._query_list_cache_max_rows + 1,
+            ]
+        else:
+            function_sql = (
+                "advisor.query_trend("
+                "now() - %s::interval, %s::interval, %s, %s)"
+            )
+            params = [
+                interval,
+                bucket,
+                server_id,
+                database_id,
+                self._query_list_cache_max_rows + 1,
+            ]
         async with pool.connection() as connection:
             # Keep background SWR work visible to the benchmark so its
             # repository cost cannot leak beyond the measurement boundary.
@@ -795,23 +845,16 @@ class PowaRepository:
                 )
             async with connection.cursor() as cursor:
                 await cursor.execute(
-                    """
+                    f"""
                     /* advisor-global-trend-cache-refresh */
                     SELECT bucket_at AS timestamp,
                            total_exec_time_ms,
                            calls
-                    FROM advisor.query_trend(
-                        now() - %s::interval,
-                        %s::interval
-                    )
+                    FROM {function_sql}
                     LIMIT %s
                     /* advisor-global-trend-cache-refresh */
                     """,
-                    [
-                        interval,
-                        bucket,
-                        self._query_list_cache_max_rows + 1,
-                    ],
+                    params,
                 )
                 rows = [dict(row) for row in await cursor.fetchall()]
         if len(rows) > self._query_list_cache_max_rows:
@@ -839,8 +882,13 @@ class PowaRepository:
         *,
         window: str,
         generation: int,
+        server_id: int | None = None,
+        database_id: int | None = None,
     ) -> asyncio.Task[list[dict[str, Any]]]:
-        task_key = (generation, window)
+        cache_key = self._trend_cache_key(
+            window, server_id=server_id, database_id=database_id
+        )
+        task_key = (generation, cache_key)
         existing = self._global_trend_refresh_tasks.get(task_key)
         if existing is not None:
             return existing
@@ -849,8 +897,14 @@ class PowaRepository:
             self._refresh_global_trend_snapshot(
                 window=window,
                 generation=generation,
+                server_id=server_id,
+                database_id=database_id,
             ),
-            name=f"global-trend-cache-refresh-{window}",
+            name=(
+                f"global-trend-cache-refresh-{window}-"
+                f"{server_id if server_id is not None else 'all'}-"
+                f"{database_id if database_id is not None else 'all'}"
+            ),
         )
         self._global_trend_refresh_tasks[task_key] = task
         task.add_done_callback(self._observe_global_trend_refresh)
@@ -861,11 +915,23 @@ class PowaRepository:
         *,
         window: str,
         generation: int,
+        server_id: int | None = None,
+        database_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        task_key = (generation, window)
+        cache_key = self._trend_cache_key(
+            window, server_id=server_id, database_id=database_id
+        )
+        task_key = (generation, cache_key)
         try:
             async with self._repository_refresh_lock:
-                loaded_rows = await self._load_global_trend_snapshot(window)
+                if server_id is None:
+                    loaded_rows = await self._load_global_trend_snapshot(window)
+                else:
+                    loaded_rows = await self._load_global_trend_snapshot(
+                        window,
+                        server_id=server_id,
+                        database_id=database_id,
+                    )
             if len(loaded_rows) > self._query_list_cache_max_rows:
                 # Defense in depth for tests/custom subclasses that override
                 # the bounded loader.
@@ -878,15 +944,15 @@ class PowaRepository:
             cached_rows = deepcopy(loaded_rows)
             async with self._global_trend_cache_lock:
                 if generation == self._global_trend_cache_generation:
-                    self._global_trend_retry.pop(window, None)
-                    self._global_trend_cache[window] = _GlobalTrendCacheEntry(
+                    self._global_trend_retry.pop(cache_key, None)
+                    self._global_trend_cache[cache_key] = _GlobalTrendCacheEntry(
                         rows=cached_rows,
                         refreshed_at=self._clock(),
                     )
-                    self._global_trend_cache.move_to_end(window)
+                    self._global_trend_cache.move_to_end(cache_key)
                     while (
                         len(self._global_trend_cache)
-                        > self._query_list_cache_max_entries
+                        > self._global_trend_cache_max_entries
                     ):
                         self._global_trend_cache.popitem(last=False)
             return cached_rows
@@ -895,13 +961,19 @@ class PowaRepository:
         except Exception:
             async with self._global_trend_cache_lock:
                 if generation == self._global_trend_cache_generation:
-                    previous = self._global_trend_retry.get(window)
+                    previous = self._global_trend_retry.get(cache_key)
                     failures = 1 if previous is None else previous.failures + 1
                     delay_seconds = min(2 ** min(failures - 1, 6), 60)
-                    self._global_trend_retry[window] = _QueryMetricsRetryState(
+                    self._global_trend_retry[cache_key] = _QueryMetricsRetryState(
                         failures=failures,
                         retry_not_before=self._clock() + delay_seconds,
                     )
+                    self._global_trend_retry.move_to_end(cache_key)
+                    while (
+                        len(self._global_trend_retry)
+                        > self._global_trend_cache_max_entries
+                    ):
+                        self._global_trend_retry.popitem(last=False)
             raise
         finally:
             async with self._global_trend_cache_lock:
@@ -909,16 +981,27 @@ class PowaRepository:
                 if current is asyncio.current_task():
                     self._global_trend_refresh_tasks.pop(task_key, None)
 
-    async def _global_trend_snapshot(self, window: str) -> list[dict[str, Any]]:
-        """Return an immutable-by-contract global trend with bounded SWR."""
+    async def _global_trend_snapshot(
+        self,
+        window: str,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return an immutable global or database trend with bounded SWR."""
         interval_for(window)
+        cache_key = self._trend_cache_key(
+            window, server_id=server_id, database_id=database_id
+        )
         async with self._global_trend_cache_lock:
             generation = self._global_trend_cache_generation
-            entry = self._global_trend_cache.get(window)
-            retry = self._global_trend_retry.get(window)
+            entry = self._global_trend_cache.get(cache_key)
+            retry = self._global_trend_retry.get(cache_key)
+            if retry is not None:
+                self._global_trend_retry.move_to_end(cache_key)
             now_monotonic = self._clock()
             if entry is not None:
-                self._global_trend_cache.move_to_end(window)
+                self._global_trend_cache.move_to_end(cache_key)
                 age = max(0.0, now_monotonic - entry.refreshed_at)
                 if age <= self._query_list_cache_fresh_seconds:
                     return deepcopy(entry.rows)
@@ -928,6 +1011,8 @@ class PowaRepository:
                         self._start_global_trend_refresh_locked(
                             window=window,
                             generation=generation,
+                            server_id=server_id,
+                            database_id=database_id,
                         )
                     return deepcopy(entry.rows)
 
@@ -938,6 +1023,8 @@ class PowaRepository:
             refresh = self._start_global_trend_refresh_locked(
                 window=window,
                 generation=generation,
+                server_id=server_id,
+                database_id=database_id,
             )
 
         # Cold or too-old misses wait for the per-window single-flight task.
@@ -1055,7 +1142,42 @@ class PowaRepository:
                 )
                 return dict(await cursor.fetchone())
 
-    async def collector_health(self) -> list[dict[str, Any]]:
+    async def release_info(self) -> dict[str, Any]:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("SELECT * FROM advisor.release_info()")
+                return dict(await cursor.fetchone())
+
+    async def resolve_scope(
+        self, *, server_id: int, database_id: int | None = None
+    ) -> dict[str, Any] | None:
+        clauses = ["server.id = %s", "server.id > 0", "server.frequency > 0"]
+        params: list[Any] = [server_id]
+        if database_id is not None:
+            clauses.append("database.oid = %s")
+            params.append(database_id)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT server.id AS server_id, server.alias AS server_alias,
+                           database.oid AS database_id, database.datname AS database_name
+                    FROM "PoWA".powa_servers AS server
+                    LEFT JOIN "PoWA".powa_databases AS database
+                      ON database.srvid = server.id AND database.dropped IS NULL
+                    WHERE {' AND '.join(clauses)}
+                      AND database.datname NOT IN ('powa', 'template0', 'template1')
+                    ORDER BY database.datname
+                    LIMIT 1
+                    """,
+                    params,
+                )
+                row = await cursor.fetchone()
+                return None if row is None else dict(row)
+
+    async def collector_health(
+        self, server_id: int | None = None
+    ) -> list[dict[str, Any]]:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
@@ -1068,8 +1190,10 @@ class PowaRepository:
                                 THEN NULL ELSE lag_seconds END AS lag_seconds,
                            errors, status
                     FROM advisor.v_collector_health
+                    WHERE (%s::integer IS NULL OR server_id = %s::integer)
                     ORDER BY server_id
                     """
+                    , (server_id, server_id)
                 )
                 return [dict(row) for row in await cursor.fetchall()]
 
@@ -1092,6 +1216,7 @@ class PowaRepository:
             SELECT d.srvid AS server_id, d.oid AS database_id, d.datname AS name, d.dropped
             FROM "PoWA".powa_databases AS d
             WHERE d.dropped IS NULL
+              AND d.datname NOT IN ('powa', 'template0', 'template1')
         """
         params: list[Any] = []
         if server_id is not None:
@@ -1183,27 +1308,49 @@ class PowaRepository:
                         break
                     yield [dict(row) for row in fetched]
 
-    async def overview_summary(self, *, window: str) -> dict[str, Any]:
+    async def overview_summary(
+        self,
+        *,
+        window: str,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> dict[str, Any]:
         """Aggregate every tracked query; pagination must never affect cards."""
         rows = await self._query_metrics_snapshot(window)
-        return await asyncio.to_thread(self._overview_summary_from_rows, rows)
+        return await asyncio.to_thread(
+            self._overview_summary_from_rows,
+            rows,
+            server_id=server_id,
+            database_id=database_id,
+        )
 
     @staticmethod
-    def _overview_summary_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def _overview_summary_from_rows(
+        rows: list[dict[str, Any]],
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> dict[str, Any]:
+        scoped_rows = [
+            row
+            for row in rows
+            if (server_id is None or row.get("server_id") == server_id)
+            and (database_id is None or row.get("database_id") == database_id)
+        ]
         return {
             "total_db_time_ms": float(
                 sum(
-                    (_as_float(row.get("total_exec_time_ms")) for row in rows),
+                    (_as_float(row.get("total_exec_time_ms")) for row in scoped_rows),
                     start=0.0,
                 )
             ),
-            "tracked_queries": len(rows),
+            "tracked_queries": len(scoped_rows),
             "critical_queries": sum(
-                1 for row in rows if row.get("priority") == "CRITICAL"
+                1 for row in scoped_rows if row.get("priority") == "CRITICAL"
             ),
             "regressions": sum(
                 1
-                for row in rows
+                for row in scoped_rows
                 if row.get("previous_period_available") is True
                 and row.get("comparison_reliable") is True
                 and _sql_numeric_ge(row.get("regression_percent"), 20)
@@ -1271,13 +1418,17 @@ class PowaRepository:
         server_id: int | None = None,
         database_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        scope = (server_id, database_id, query_id)
-        if all(value is None for value in scope):
-            return await self._global_trend_snapshot(window)
-        if not all(value is not None for value in scope):
+        if database_id is not None and server_id is None:
             raise ValueError(
-                "Trend kapsami server_id, database_id ve query_id "
-                "alanlarini birlikte gerektirir."
+                "Trend database_id kapsami server_id alanini gerektirir."
+            )
+        if query_id is not None and (server_id is None or database_id is None):
+            raise ValueError("Query trend kapsami server_id ve database_id gerektirir.")
+        if query_id is None:
+            return await self._global_trend_snapshot(
+                window,
+                server_id=server_id,
+                database_id=database_id,
             )
         interval = interval_for(window)
         bucket = WINDOW_BUCKETS[window]
@@ -1421,33 +1572,92 @@ class PowaRepository:
                 servers = [dict(row) for row in await cursor.fetchall()]
         return databases, contexts, servers
 
-    async def table_health(self) -> list[dict[str, Any]]:
+    async def table_health(
+        self,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["TRUE"]
+        params: list[Any] = []
+        if server_id is not None:
+            clauses.append("health.server_id = %s")
+            params.append(server_id)
+        if database_id is not None:
+            clauses.append("health.database_id = %s")
+            params.append(database_id)
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
-                    """
+                    f"""
                     SELECT health.*, servers.alias AS server_alias
                     FROM advisor.v_table_health AS health
                     LEFT JOIN "PoWA".powa_servers AS servers ON servers.id = health.server_id
+                    WHERE {' AND '.join(clauses)}
                     ORDER BY
                         CASE signal_level
                             WHEN 'CRITICAL' THEN 1 WHEN 'WARNING' THEN 2
                             WHEN 'NOTICE' THEN 3 ELSE 4 END,
                         dead_tuples DESC
                     LIMIT 200
-                    """
+                    """,
+                    params,
                 )
                 return [dict(row) for row in await cursor.fetchall()]
 
-    async def long_transactions(self) -> list[dict[str, Any]]:
+    async def table_health_summary(
+        self,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> dict[str, Any]:
+        clauses = ["TRUE"]
+        params: list[Any] = []
+        if server_id is not None:
+            clauses.append("server_id = %s")
+            params.append(server_id)
+        if database_id is not None:
+            clauses.append("database_id = %s")
+            params.append(database_id)
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
-                    """
+                    f"""
+                    SELECT count(*)::bigint AS tables_observed,
+                           count(*) FILTER (WHERE signal_level = 'CRITICAL')::bigint AS critical,
+                           count(*) FILTER (WHERE signal_level = 'WARNING')::bigint AS warnings,
+                           count(*) FILTER (WHERE signal_level = 'NOTICE')::bigint AS notices
+                    FROM advisor.v_table_health
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    params,
+                )
+                return dict(await cursor.fetchone())
+
+    async def long_transactions(
+        self,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["TRUE"]
+        params: list[Any] = []
+        if server_id is not None:
+            clauses.append("server_id = %s")
+            params.append(server_id)
+        if database_id is not None:
+            clauses.append("database_id = %s")
+            params.append(database_id)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    f"""
                     SELECT * FROM advisor.v_long_transactions
+                    WHERE {' AND '.join(clauses)}
                     ORDER BY age_seconds DESC
                     LIMIT 100
-                    """
+                    """,
+                    params,
                 )
                 return [dict(row) for row in await cursor.fetchall()]
 
@@ -1560,6 +1770,488 @@ class PowaRepository:
             (row for row in rows if str(row["candidate_id"]) == candidate_id),
             None,
         )
+
+    async def capability_rows(
+        self,
+        *,
+        window: str,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    WITH requested AS MATERIALIZED (
+                        SELECT %s::interval AS metric_window,
+                               %s::integer AS server_id,
+                               %s::oid AS database_id,
+                               now() AS observed_until
+                    ), telemetry_data AS MATERIALIZED (
+                        -- Capability discovery must stay independent from the
+                        -- full advisor.query_metrics scoring scan.  The PoWA
+                        -- statement catalogue is small, indexed by scope and
+                        -- carries the last collector observation timestamp.
+                        -- Historical readiness is catalogue evidence only;
+                        -- CPU and wait readiness below come from their own
+                        -- datasource tables and can therefore fail closed
+                        -- independently.
+                        SELECT statement.srvid AS server_id,
+                               statement.dbid AS database_id,
+                               true AS data_available
+                        FROM requested
+                        JOIN "PoWA".powa_statements AS statement
+                          ON statement.last_present_ts
+                                 >= requested.observed_until - requested.metric_window
+                         AND statement.last_present_ts <= requested.observed_until
+                         AND (requested.server_id IS NULL
+                              OR statement.srvid = requested.server_id)
+                         AND (requested.database_id IS NULL
+                              OR statement.dbid = requested.database_id)
+                        JOIN "PoWA".powa_databases AS tracked_database
+                          ON tracked_database.srvid = statement.srvid
+                         AND tracked_database.oid = statement.dbid
+                         AND tracked_database.dropped IS NULL
+                         AND tracked_database.datname
+                                 NOT IN ('powa', 'template0', 'template1')
+                        WHERE statement.query ~*
+                            '^[[:space:]]*((/[*].*[*]/|--[^\r\n]*[\r\n]+)[[:space:]]*)*(SELECT|WITH|INSERT|UPDATE|DELETE|MERGE)([[:space:]]|$)'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM "PoWA".powa_snapshot_metas AS snapshot
+                              WHERE snapshot.srvid = statement.srvid
+                                AND snapshot.snapts
+                                      >= requested.observed_until
+                                         - requested.metric_window
+                                AND snapshot.snapts
+                                      <= requested.observed_until
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM "PoWA".powa_catalog_roles AS excluded_role
+                              WHERE excluded_role.srvid = statement.srvid
+                                AND excluded_role.oid = statement.userid
+                                AND excluded_role.rolname IN (
+                                    'powa_collector', 'advisor_evaluator'
+                                )
+                          )
+                        GROUP BY statement.srvid, statement.dbid
+                    ), kcache_data AS MATERIALIZED (
+                        -- Coalesced ranges and current composite timestamps
+                        -- are narrow PoWA headers; no metric arrays are
+                        -- unnested and no query scoring function is invoked.
+                        -- Exact database requests use short-circuit EXISTS;
+                        -- fleet/server matrices scan each datasource once.
+                        SELECT requested.server_id AS server_id,
+                               requested.database_id AS database_id,
+                               true AS data_available
+                        FROM requested
+                        WHERE requested.database_id IS NOT NULL
+                          AND (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM "PoWA".powa_kcache_metrics_current
+                                      AS current_sample
+                                  WHERE current_sample.srvid = requested.server_id
+                                    AND current_sample.dbid = requested.database_id
+                                    AND current_sample.top
+                                    AND current_sample.metrics IS NOT NULL
+                                    AND (current_sample.metrics).ts
+                                          >= requested.observed_until
+                                             - requested.metric_window
+                                    AND (current_sample.metrics).ts
+                                          <= requested.observed_until
+                              )
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM "PoWA".powa_kcache_metrics AS history
+                                  WHERE history.srvid = requested.server_id
+                                    AND history.dbid = requested.database_id
+                                    AND history.top
+                                    AND history.coalesce_range && tstzrange(
+                                        requested.observed_until
+                                            - requested.metric_window,
+                                        requested.observed_until,
+                                        '[]'
+                                    )
+                              )
+                          )
+
+                        UNION
+
+                        SELECT DISTINCT history.srvid AS server_id,
+                               history.dbid AS database_id,
+                               true AS data_available
+                        FROM requested
+                        JOIN "PoWA".powa_kcache_metrics AS history
+                          ON (requested.server_id IS NULL
+                              OR history.srvid = requested.server_id)
+                         AND (requested.database_id IS NULL
+                              OR history.dbid = requested.database_id)
+                         AND history.coalesce_range && tstzrange(
+                             requested.observed_until
+                                 - requested.metric_window,
+                             requested.observed_until,
+                             '[]'
+                         )
+                        WHERE requested.database_id IS NULL
+                          AND history.top
+
+                        UNION
+
+                        SELECT DISTINCT current_sample.srvid,
+                               current_sample.dbid,
+                               true
+                        FROM requested
+                        JOIN "PoWA".powa_kcache_metrics_current
+                            AS current_sample
+                          ON (requested.server_id IS NULL
+                              OR current_sample.srvid = requested.server_id)
+                         AND (requested.database_id IS NULL
+                              OR current_sample.dbid = requested.database_id)
+                        WHERE current_sample.top
+                          AND requested.database_id IS NULL
+                          AND current_sample.metrics IS NOT NULL
+                          AND (current_sample.metrics).ts
+                                >= requested.observed_until
+                                   - requested.metric_window
+                          AND (current_sample.metrics).ts
+                                <= requested.observed_until
+                    ), wait_data AS MATERIALIZED (
+                        SELECT requested.server_id AS server_id,
+                               requested.database_id AS database_id,
+                               true AS data_available
+                        FROM requested
+                        WHERE requested.database_id IS NOT NULL
+                          AND (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM "PoWA".powa_wait_sampling_history_current
+                                      AS current_sample
+                                  WHERE current_sample.srvid = requested.server_id
+                                    AND current_sample.dbid = requested.database_id
+                                    AND (current_sample.record).ts
+                                          >= requested.observed_until
+                                             - requested.metric_window
+                                    AND (current_sample.record).ts
+                                          <= requested.observed_until
+                              )
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM "PoWA".powa_wait_sampling_history AS history
+                                  WHERE history.srvid = requested.server_id
+                                    AND history.dbid = requested.database_id
+                                    AND history.coalesce_range && tstzrange(
+                                        requested.observed_until
+                                            - requested.metric_window,
+                                        requested.observed_until,
+                                        '[]'
+                                    )
+                              )
+                          )
+
+                        UNION
+
+                        SELECT DISTINCT history.srvid AS server_id,
+                               history.dbid AS database_id,
+                               true AS data_available
+                        FROM requested
+                        JOIN "PoWA".powa_wait_sampling_history AS history
+                          ON (requested.server_id IS NULL
+                              OR history.srvid = requested.server_id)
+                         AND (requested.database_id IS NULL
+                              OR history.dbid = requested.database_id)
+                         AND history.coalesce_range && tstzrange(
+                             requested.observed_until
+                                 - requested.metric_window,
+                             requested.observed_until,
+                             '[]'
+                         )
+                        WHERE requested.database_id IS NULL
+
+                        UNION
+
+                        SELECT DISTINCT current_sample.srvid,
+                               current_sample.dbid,
+                               true
+                        FROM requested
+                        JOIN "PoWA".powa_wait_sampling_history_current
+                            AS current_sample
+                          ON (requested.server_id IS NULL
+                              OR current_sample.srvid = requested.server_id)
+                         AND (requested.database_id IS NULL
+                              OR current_sample.dbid = requested.database_id)
+                        WHERE requested.database_id IS NULL
+                          AND (current_sample.record).ts
+                                >= requested.observed_until
+                                   - requested.metric_window
+                          AND (current_sample.record).ts
+                                <= requested.observed_until
+                    ), predicate_data AS MATERIALIZED (
+                        SELECT DISTINCT metric.server_id, metric.database_id,
+                               true AS data_available
+                        FROM requested
+                        CROSS JOIN LATERAL advisor.predicate_metrics(
+                            requested.metric_window,
+                            requested.server_id,
+                            requested.database_id,
+                            NULL::bigint
+                        ) AS metric
+                    ), join_data AS MATERIALIZED (
+                        -- The ingest tables intentionally remain hidden from
+                        -- advisor_api.  This SECURITY DEFINER adapter is the
+                        -- narrow evidence surface and is evaluated once for
+                        -- the requested fleet/scope, not once per database.
+                        SELECT DISTINCT metric.server_id, metric.database_id,
+                               true AS data_available
+                        FROM requested
+                        CROSS JOIN LATERAL advisor.join_predicate_metrics(
+                            requested.metric_window,
+                            requested.server_id,
+                            requested.database_id,
+                            NULL::bigint
+                        ) AS metric
+                    ), join_capabilities AS MATERIALIZED (
+                        SELECT source.id AS server_id, capability.*
+                        FROM requested
+                        JOIN "PoWA".powa_servers AS source
+                          ON source.id > 0 AND source.frequency > 0
+                         AND (requested.server_id IS NULL OR source.id = requested.server_id)
+                        CROSS JOIN LATERAL advisor.join_snapshot_capability(source.id)
+                            AS capability
+                    )
+                    SELECT server.id AS server_id, server.alias AS server_alias,
+                           database.oid AS database_id, database.datname AS database_name,
+                           collector.status AS collector_status,
+                           collector.last_snapshot_at,
+                           COALESCE(telemetry.data_available, false)
+                               AS historical_data_available,
+                           max(config.version) FILTER (WHERE config.extname = 'pg_stat_kcache') AS kcache_version,
+                           COALESCE(bool_or(config.enabled) FILTER (WHERE config.extname = 'pg_stat_kcache'), false) AS kcache_configured,
+                           COALESCE(kcache.data_available, false)
+                               AS cpu_data_available,
+                           max(config.version) FILTER (WHERE config.extname = 'pg_wait_sampling') AS wait_version,
+                           COALESCE(bool_or(config.enabled) FILTER (WHERE config.extname = 'pg_wait_sampling'), false) AS wait_configured,
+                           COALESCE(wait_metric.data_available, false)
+                               AS wait_data_available,
+                           max(config.version) FILTER (WHERE config.extname = 'pg_qualstats') AS predicate_version,
+                           COALESCE(bool_or(config.enabled) FILTER (WHERE config.extname = 'pg_qualstats'), false) AS predicate_configured,
+                           join_cap.available AS join_configured,
+                           COALESCE(join_data.data_available, false) AS join_data_available,
+                           join_cap.status AS join_status,
+                           join_cap.reason AS join_reason,
+                           COALESCE(predicate_data.data_available, false)
+                               AS predicate_data_available
+                    FROM requested
+                    JOIN "PoWA".powa_servers AS server
+                      ON server.id > 0 AND server.frequency > 0
+                    JOIN "PoWA".powa_databases AS database ON database.srvid = server.id
+                    LEFT JOIN advisor.v_collector_health AS collector ON collector.server_id = server.id
+                    LEFT JOIN "PoWA".powa_extension_config AS config ON config.srvid = server.id
+                    LEFT JOIN join_capabilities AS join_cap ON join_cap.server_id = server.id
+                    LEFT JOIN telemetry_data AS telemetry
+                      ON telemetry.server_id = server.id
+                     AND telemetry.database_id = database.oid
+                    LEFT JOIN kcache_data AS kcache
+                      ON kcache.server_id = server.id
+                     AND kcache.database_id = database.oid
+                    LEFT JOIN wait_data AS wait_metric
+                      ON wait_metric.server_id = server.id
+                     AND wait_metric.database_id = database.oid
+                    LEFT JOIN predicate_data
+                      ON predicate_data.server_id = server.id
+                     AND predicate_data.database_id = database.oid
+                    LEFT JOIN join_data
+                      ON join_data.server_id = server.id
+                     AND join_data.database_id = database.oid
+                    WHERE database.dropped IS NULL
+                      AND database.datname NOT IN ('powa', 'template0', 'template1')
+                      AND (requested.server_id IS NULL OR server.id = requested.server_id)
+                      AND (requested.database_id IS NULL OR database.oid = requested.database_id)
+                    GROUP BY server.id, server.alias, database.oid, database.datname,
+                             collector.status, collector.last_snapshot_at,
+                             join_cap.available, join_cap.status, join_cap.reason,
+                             telemetry.data_available, kcache.data_available,
+                             wait_metric.data_available,
+                             predicate_data.data_available, join_data.data_available
+                    ORDER BY server.id, database.datname
+                    """,
+                    (interval, server_id, database_id),
+                )
+                rows = [dict(row) for row in await cursor.fetchall()]
+        return rows
+
+    async def database_optimize_rows(
+        self,
+        *,
+        window: str,
+        server_id: int | None,
+        database_id: int | None,
+        page: int,
+        page_size: int,
+        sort_by: str,
+    ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+        interval = interval_for(window)
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT candidate.*, server.alias AS server_alias,
+                           database.datname AS database_name
+                    FROM advisor.composite_index_candidates(
+                        %s::interval, %s::integer, %s::oid, NULL::bigint
+                    ) AS candidate
+                    LEFT JOIN "PoWA".powa_servers AS server ON server.id = candidate.server_id
+                    LEFT JOIN "PoWA".powa_databases AS database
+                      ON database.srvid = candidate.server_id
+                     AND database.oid = candidate.database_id
+                    """,
+                    (interval, server_id, database_id),
+                )
+                candidates = [dict(row) for row in await cursor.fetchall()]
+
+        metrics = await self._query_metrics_snapshot(window)
+        load_by_query = {
+            (int(row["server_id"]), int(row["database_id"]), int(row["query_id"])):
+                _as_float(row.get("total_exec_time_ms"))
+            for row in metrics
+            if (server_id is None or row.get("server_id") == server_id)
+            and (database_id is None or row.get("database_id") == database_id)
+        }
+        grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            key = (
+                int(candidate["server_id"]),
+                int(candidate["database_id"]),
+                int(candidate["relation_id"]),
+                str(candidate["method"]),
+                tuple(int(value) for value in candidate["key_attnums"]),
+            )
+            grouped.setdefault(key, []).append(candidate)
+
+        relation_ids = sorted({key[2] for key in grouped})
+        write_by_relation: dict[tuple[int, int, int], dict[str, Any]] = {}
+        if relation_ids:
+            async with pool.connection() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT * FROM advisor.table_write_metrics(
+                            %s::interval, %s::integer, %s::oid, %s::oid[]
+                        )
+                        """,
+                        (interval, server_id, database_id, relation_ids),
+                    )
+                    for raw in await cursor.fetchall():
+                        write = dict(raw)
+                        write_by_relation[(
+                            int(write["server_id"]),
+                            int(write["database_id"]),
+                            int(write["relation_id"]),
+                        )] = write
+
+        items: list[dict[str, Any]] = []
+        all_affected_queries: set[tuple[int, int, int]] = set()
+        for key, members in grouped.items():
+            source_id, db_id, relation_id, method, attnums = key
+            query_ids = sorted({int(row["query_id"]) for row in members})
+            query_id_preview = sorted(
+                query_ids,
+                key=lambda query_id: (
+                    -load_by_query.get((source_id, db_id, query_id), 0.0),
+                    query_id,
+                ),
+            )[:OPTIMIZE_AFFECTED_QUERY_PREVIEW_SIZE]
+            all_affected_queries.update((source_id, db_id, query_id) for query_id in query_ids)
+            affected_load = sum(
+                load_by_query.get((source_id, db_id, query_id), 0.0)
+                for query_id in query_ids
+            )
+            representative = max(
+                members,
+                key=lambda row: (
+                    load_by_query.get((source_id, db_id, int(row["query_id"])), 0.0),
+                    -int(row["query_id"]),
+                ),
+            )
+            group_id = uuid5(
+                NAMESPACE_URL,
+                f"postgresql-advisor:index:{source_id}:{db_id}:{relation_id}:{method}:"
+                + ",".join(str(value) for value in attnums),
+            )
+            columns = list(representative["key_column_names"])
+            safe_table = re.sub(r"[^A-Za-z0-9_]+", "_", str(representative["table_name"]))[:24]
+            index_name = f"idx_advisor_{safe_table}_{group_id.hex[:8]}"
+            quote = lambda value: '"' + str(value).replace('"', '""') + '"'
+            create_sql = (
+                f"CREATE INDEX CONCURRENTLY {quote(index_name)} ON "
+                f"{quote(representative['schema_name'])}.{quote(representative['table_name'])} "
+                f"USING btree ({', '.join(quote(column) for column in columns)});"
+            )
+            write = write_by_relation.get((source_id, db_id, relation_id))
+            write_rows = None if write is None else int(write.get("write_rows") or 0)
+            writes_per_hour = None if write is None else _optional_float(write.get("writes_per_hour"))
+            if writes_per_hour is None:
+                risk = "UNKNOWN"
+            elif writes_per_hour >= 100_000:
+                risk = "HIGH"
+            elif writes_per_hour >= 10_000:
+                risk = "MEDIUM"
+            else:
+                risk = "LOW"
+            confidence_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+            confidence = max(
+                (str(row.get("confidence") or "LOW") for row in members),
+                key=lambda value: confidence_rank.get(value, 0),
+            )
+            items.append({
+                "group_id": str(group_id),
+                "server_id": source_id,
+                "server_alias": representative.get("server_alias"),
+                "database_id": db_id,
+                "database_name": representative.get("database_name"),
+                "relation_id": relation_id,
+                "schema_name": representative["schema_name"],
+                "table_name": representative["table_name"],
+                "method": method,
+                "columns": columns,
+                "ordering_rules": sorted({str(row["ordering_rule"]) for row in members}),
+                "confidence": confidence,
+                # Keep the aggregate exact while bounding one common-candidate
+                # group from turning the API response (and browser DOM) into a
+                # list of thousands of query identifiers. The highest-load
+                # queries make the preview useful and deterministic.
+                "affected_query_ids": [str(value) for value in query_id_preview],
+                "affected_query_count": len(query_ids),
+                "affected_load_ms": affected_load,
+                "join_occurrences": sum(int(row.get("join_occurrences") or 0) for row in members),
+                "filter_occurrences": sum(int(row.get("filter_occurrences") or 0) for row in members),
+                "sample_count": sum(int(row.get("sample_count") or 0) for row in members),
+                "observed_from": min(row["observed_from"] for row in members),
+                "observed_to": max(row["observed_to"] for row in members),
+                "representative_query_id": str(representative["query_id"]),
+                "representative_candidate_id": str(representative["candidate_id"]),
+                "create_index_sql": create_sql,
+                "write_rows": write_rows,
+                "writes_per_hour": writes_per_hour,
+                "maintenance_risk": risk,
+            })
+
+        if sort_by == "affectedQueries":
+            items.sort(key=lambda row: (-row["affected_query_count"], -row["affected_load_ms"], row["group_id"]))
+        elif sort_by == "evidence":
+            items.sort(key=lambda row: (-(row["join_occurrences"] + row["filter_occurrences"]), -row["affected_load_ms"], row["group_id"]))
+        else:
+            items.sort(key=lambda row: (-row["affected_load_ms"], -row["affected_query_count"], row["group_id"]))
+        total = len(items)
+        offset = (page - 1) * page_size
+        summary = {
+            "candidate_groups": total,
+            "affected_queries": len(all_affected_queries),
+            "affected_load_ms": sum(load_by_query.get(key, 0.0) for key in all_affected_queries),
+        }
+        return items[offset:offset + page_size], total, summary
 
     async def runtime_replay_fixture_status(
         self,

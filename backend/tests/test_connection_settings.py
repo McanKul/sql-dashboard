@@ -150,6 +150,7 @@ def test_query_list_cache_defaults_match_collector_cadence_and_are_bounded() -> 
     assert settings.query_list_cache_fresh_seconds == 60
     assert settings.query_list_cache_stale_seconds == 300
     assert settings.query_list_cache_max_entries == 4
+    assert settings.global_trend_cache_max_entries == 64
     assert settings.query_list_cache_max_rows == 100_000
     assert settings.query_list_cache_max_bytes == 64 * 1024 * 1024
 
@@ -164,6 +165,10 @@ def test_query_list_cache_rejects_an_unbounded_or_inverted_window() -> None:
         Settings(query_list_cache_max_entries=5)
     with pytest.raises(ValidationError):
         Settings(query_list_cache_max_entries=0)
+    with pytest.raises(ValidationError):
+        Settings(global_trend_cache_max_entries=3)
+    with pytest.raises(ValidationError):
+        Settings(global_trend_cache_max_entries=1_025)
     with pytest.raises(ValidationError):
         Settings(query_list_cache_max_rows=1_000_001)
     with pytest.raises(ValidationError):

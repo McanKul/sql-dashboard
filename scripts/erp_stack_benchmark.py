@@ -35,6 +35,13 @@ SYNC_PROTOCOL_VERSION = 1
 SYNC_PHASES = ("start", "end")
 SYNC_MAX_PAYLOAD_BYTES = 4096
 SUPPORTED_POWA_MAINTENANCE_SEMANTICS = frozenset({"5.2.0"})
+API_WARMUP_TIMEOUT_SECONDS = 120.0
+SUBPROCESS_SECRET_ENV_KEYS = frozenset(
+    {
+        "ADVISOR_API_TOKEN",
+        "ADVISOR_AUTH_PRINCIPALS",
+    }
+)
 
 
 SOURCE_SQL = r"""
@@ -501,6 +508,7 @@ API_PROBE_SCRIPT = r"""
 import concurrent.futures
 import json
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -604,8 +612,240 @@ print(json.dumps(results, separators=(",", ":")))
 """
 
 
+FULL_ACCEPTANCE_PROBE_SCRIPT = r"""
+import concurrent.futures
+import csv
+import datetime as dt
+import json
+import re
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+server_id = int(sys.argv[1])
+query_wait_seconds = float(sys.argv[2])
+request_timeout = float(sys.argv[3])
+minimum_csv_records = int(sys.argv[4])
+if minimum_csv_records < 201:
+    raise RuntimeError("full acceptance CSV minimum must be at least 201")
+secret = json.load(sys.stdin)
+token = secret.get("token")
+if not isinstance(token, str) or not token.startswith("adv_pat_v1_"):
+    raise RuntimeError("full acceptance admin token is missing")
+
+web_base = "http://web"
+api_base = web_base + "/api/v1"
+tag = "advisor-erp:erp_entity_0001:point-read"
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+def timed_json(request, timeout):
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.load(response)
+    return payload, time.perf_counter() - started
+
+probe_started_at = utc_now()
+root_started = time.perf_counter()
+with urllib.request.urlopen(web_base + "/", timeout=request_timeout) as response:
+    root_body = response.read()
+root_latency = time.perf_counter() - root_started
+root_text = root_body.decode("utf-8", errors="strict")
+if '<div id="root"></div>' not in root_text:
+    raise RuntimeError("web root mount is missing")
+asset_paths = sorted(set(re.findall(r'(?:src|href)=["\'](/assets/[^"\']+-[A-Za-z0-9_-]{6,}\.(?:js|css))["\']', root_text)))
+if not asset_paths or not any(path.endswith(".js") for path in asset_paths):
+    raise RuntimeError("web root has no hashed JavaScript asset")
+asset_bytes = 0
+assets_started = time.perf_counter()
+for path in asset_paths:
+    with urllib.request.urlopen(web_base + path, timeout=request_timeout) as response:
+        body = response.read()
+        content_type = response.headers.get("Content-Type", "")
+    if not body or not ("javascript" in content_type or "css" in content_type):
+        raise RuntimeError("web asset response is invalid")
+    asset_bytes += len(body)
+assets_latency = time.perf_counter() - assets_started
+
+health, health_latency = timed_json(
+    urllib.request.Request(api_base + "/health", headers={"X-Advisor-Role": "analyst"}),
+    request_timeout,
+)
+if health.get("status") != "healthy" or health.get("repository") != "healthy":
+    raise RuntimeError("proxied health is not healthy")
+
+query_deadline = time.monotonic() + query_wait_seconds
+selected = None
+scoped_query_total = 0
+query_lookup_latency = 0.0
+while time.monotonic() < query_deadline:
+    query = urllib.parse.urlencode({
+        "window": "24h",
+        "pageSize": 50,
+        "serverId": server_id,
+        "search": tag,
+    })
+    payload, latency = timed_json(
+        urllib.request.Request(api_base + "/queries?" + query, headers={"X-Advisor-Role": "analyst"}),
+        request_timeout,
+    )
+    query_lookup_latency += latency
+    items = payload.get("items")
+    if isinstance(items, list):
+        selected = next((item for item in items if isinstance(item, dict) and tag in str(item.get("sql", ""))), None)
+    if selected is not None:
+        candidate_database_id = selected.get("databaseId")
+        if isinstance(candidate_database_id, int):
+            inventory_query = urllib.parse.urlencode({
+                "window": "24h",
+                "pageSize": 1,
+                "serverId": server_id,
+                "databaseId": candidate_database_id,
+            })
+            inventory, latency = timed_json(
+                urllib.request.Request(api_base + "/queries?" + inventory_query, headers={"X-Advisor-Role": "analyst"}),
+                request_timeout,
+            )
+            query_lookup_latency += latency
+            inventory_total = inventory.get("total")
+            scoped_query_total = inventory_total if isinstance(inventory_total, int) else 0
+            if scoped_query_total >= minimum_csv_records:
+                break
+        selected = None
+    time.sleep(1.0)
+if selected is None:
+    raise RuntimeError("exact ERP point-read and minimum CSV inventory were not ready")
+query_id = str(selected.get("queryId"))
+database_id = selected.get("databaseId")
+selected_server_id = selected.get("serverId")
+if not query_id.lstrip("-").isdigit() or not isinstance(database_id, int) or selected_server_id != server_id:
+    raise RuntimeError("persisted tagged ERP query identity is invalid")
+
+parallel_barrier = threading.Barrier(2)
+
+def explain_once():
+    body = json.dumps({
+        "serverId": server_id,
+        "databaseId": database_id,
+        "bindValues": [1],
+    }, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        api_base + "/queries/" + urllib.parse.quote(query_id, safe="-") + "/explain-analyze?window=24h",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Advisor-Role": "analyst"},
+    )
+    parallel_barrier.wait(timeout=5.0)
+    started_at = utc_now()
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=request_timeout) as response:
+        payload = json.load(response)
+    return {
+        "startedAt": started_at,
+        "finishedAt": utc_now(),
+        "latencySeconds": time.perf_counter() - started,
+        "queryId": query_id,
+        "databaseId": database_id,
+        "response": payload,
+    }
+
+def csv_once():
+    query = urllib.parse.urlencode({
+        "window": "24h",
+        "serverId": server_id,
+        "databaseId": database_id,
+    })
+    request = urllib.request.Request(
+        api_base + "/export/queries.csv?" + query,
+        headers={"Authorization": "Bearer " + token},
+    )
+    parallel_barrier.wait(timeout=5.0)
+    started_at = utc_now()
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=request_timeout) as response:
+        if "text/csv" not in response.headers.get("Content-Type", ""):
+            raise RuntimeError("CSV response content type is invalid")
+        first_byte = response.read(1)
+        first_byte_seconds = time.perf_counter() - started
+        if not first_byte:
+            raise RuntimeError("CSV response body is empty")
+        first_line = first_byte + response.readline()
+        byte_count = len(first_line)
+
+        def decoded_lines():
+            nonlocal byte_count
+            yield first_line.decode("utf-8", errors="strict")
+            for raw_line in response:
+                byte_count += len(raw_line)
+                yield raw_line.decode("utf-8", errors="strict")
+
+        rows = csv.reader(decoded_lines(), strict=True)
+        header = next(rows, None)
+        if not isinstance(header, list) or header[:4] != ["server_id", "database_id", "query_id", "sql"]:
+            raise RuntimeError("CSV header is invalid")
+        record_count = 0
+        for row in rows:
+            if len(row) != len(header):
+                raise RuntimeError("CSV row width is invalid")
+            if row[0] != str(server_id) or row[1] != str(database_id):
+                raise RuntimeError("CSV row escaped the selected scope")
+            record_count += 1
+    return {
+        "startedAt": started_at,
+        "finishedAt": utc_now(),
+        "firstByteSeconds": first_byte_seconds,
+        "latencySeconds": time.perf_counter() - started,
+        "bytes": byte_count,
+        "records": record_count,
+        "databaseId": database_id,
+    }
+
+parallel_started_at = utc_now()
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    explain_future = executor.submit(explain_once)
+    csv_future = executor.submit(csv_once)
+    source_explain = explain_future.result()
+    csv_export = csv_future.result()
+parallel_finished_at = utc_now()
+
+print(json.dumps({
+    "enabled": True,
+    "startedAt": probe_started_at,
+    "finishedAt": utc_now(),
+    "parallelStartedAt": parallel_started_at,
+    "parallelFinishedAt": parallel_finished_at,
+    "queryLookupSeconds": query_lookup_latency,
+    "scopedQueryTotalBeforeExport": scoped_query_total,
+    "web": {
+        "rootLatencySeconds": root_latency,
+        "assetsLatencySeconds": assets_latency,
+        "healthLatencySeconds": health_latency,
+        "assetCount": len(asset_paths),
+        "bytes": len(root_body) + asset_bytes,
+        "healthStatus": health.get("status"),
+    },
+    "sourceExplain": source_explain,
+    "csvExport": csv_export,
+}, separators=(",", ":")))
+"""
+
+
 class BenchmarkError(RuntimeError):
     pass
+
+
+def sanitized_subprocess_environment(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a child environment without raw dashboard auth material."""
+
+    sanitized = dict(os.environ if env is None else env)
+    for key in SUBPROCESS_SECRET_ENV_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
 
 
 class CommandRunner:
@@ -617,14 +857,16 @@ class CommandRunner:
         check: bool = True,
         timeout: float | None = 30,
         env: Mapping[str, str] | None = None,
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             list(args),
             cwd=ROOT,
-            env=dict(env) if env is not None else None,
+            env=sanitized_subprocess_environment(env),
             text=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
+            input=input_text,
             timeout=timeout,
             check=False,
         )
@@ -645,7 +887,7 @@ class CommandRunner:
         return subprocess.Popen(
             list(args),
             cwd=ROOT,
-            env=dict(env) if env is not None else None,
+            env=sanitized_subprocess_environment(env),
             text=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
@@ -925,6 +1167,28 @@ def require_source_frequency(frequency_seconds: int) -> int:
             "Mevcut kaydi scripts/register-source.sh --frequency 60 ile "
             "guncelleyin; yalniz bilincli worst-case testinde "
             "ERP_MIN_SOURCE_FREQUENCY_SECONDS=0 kullanin."
+        )
+    return minimum
+
+
+def require_full_acceptance_duration(
+    duration_seconds: int,
+    frequency_seconds: int,
+    query_wait_seconds: float,
+    acceptance_timeout_seconds: float,
+) -> int:
+    """Reserve one cadence, the bounded probe envelope and shutdown grace."""
+
+    minimum = math.ceil(
+        frequency_seconds
+        + query_wait_seconds
+        + acceptance_timeout_seconds
+        + 30.0
+    )
+    if duration_seconds < minimum:
+        raise BenchmarkError(
+            "ERP_FULL_ACCEPTANCE workload ile çakışmayı kanıtlamak için en az "
+            f"{minimum}s duration gerektirir"
         )
     return minimum
 
@@ -1431,6 +1695,157 @@ def capture_api_probe(
             raise BenchmarkError("API latency probe secili sorgusu gecersiz")
         normalized.append(normalized_item)
     return normalized
+
+
+def _finite_nonnegative(value: Any, field: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        raise BenchmarkError(f"Full acceptance {field} metrigi gecersiz")
+    return float(value)
+
+
+def normalize_full_acceptance(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the untrusted helper result before it enters a report."""
+
+    if payload.get("enabled") is not True:
+        raise BenchmarkError("Full acceptance sonucu etkin degil")
+    timestamps = (
+        "startedAt",
+        "finishedAt",
+        "parallelStartedAt",
+        "parallelFinishedAt",
+    )
+    for field in timestamps:
+        if not isinstance(payload.get(field), str) or not payload[field].endswith("Z"):
+            raise BenchmarkError(f"Full acceptance {field} zamani gecersiz")
+
+    web = payload.get("web")
+    source = payload.get("sourceExplain")
+    export = payload.get("csvExport")
+    if not all(isinstance(item, Mapping) for item in (web, source, export)):
+        raise BenchmarkError("Full acceptance sonuc bolumleri eksik")
+    assert isinstance(web, Mapping) and isinstance(source, Mapping) and isinstance(export, Mapping)
+
+    normalized_web = {
+        "rootLatencySeconds": _finite_nonnegative(web.get("rootLatencySeconds"), "web root latency"),
+        "assetsLatencySeconds": _finite_nonnegative(web.get("assetsLatencySeconds"), "web asset latency"),
+        "healthLatencySeconds": _finite_nonnegative(web.get("healthLatencySeconds"), "web health latency"),
+        "assetCount": int(web.get("assetCount")) if isinstance(web.get("assetCount"), int) and not isinstance(web.get("assetCount"), bool) else -1,
+        "bytes": int(web.get("bytes")) if isinstance(web.get("bytes"), int) and not isinstance(web.get("bytes"), bool) else -1,
+        "healthStatus": web.get("healthStatus"),
+    }
+    if normalized_web["assetCount"] < 1 or normalized_web["bytes"] < 1:
+        raise BenchmarkError("Full acceptance web asset sonucu gecersiz")
+
+    response = source.get("response")
+    if not isinstance(response, Mapping):
+        raise BenchmarkError("Full acceptance source EXPLAIN yaniti eksik")
+    normalized_source = {
+        "startedAt": source.get("startedAt"),
+        "finishedAt": source.get("finishedAt"),
+        "latencySeconds": _finite_nonnegative(source.get("latencySeconds"), "source EXPLAIN latency"),
+        "queryId": str(source.get("queryId")),
+        "databaseId": source.get("databaseId"),
+        "response": dict(response),
+    }
+    normalized_export = {
+        "startedAt": export.get("startedAt"),
+        "finishedAt": export.get("finishedAt"),
+        "firstByteSeconds": _finite_nonnegative(export.get("firstByteSeconds"), "CSV first byte"),
+        "latencySeconds": _finite_nonnegative(export.get("latencySeconds"), "CSV latency"),
+        "bytes": export.get("bytes"),
+        "records": export.get("records"),
+        "databaseId": export.get("databaseId"),
+    }
+    for section_name, section in (("source EXPLAIN", normalized_source), ("CSV", normalized_export)):
+        for field in ("startedAt", "finishedAt"):
+            value = section.get(field)
+            if not isinstance(value, str) or not value.endswith("Z"):
+                raise BenchmarkError(f"Full acceptance {section_name} {field} gecersiz")
+    if (
+        not isinstance(normalized_export["bytes"], int)
+        or isinstance(normalized_export["bytes"], bool)
+        or normalized_export["bytes"] < 1
+        or not isinstance(normalized_export["records"], int)
+        or isinstance(normalized_export["records"], bool)
+        or normalized_export["records"] < 0
+    ):
+        raise BenchmarkError("Full acceptance CSV boyut/satir sonucu gecersiz")
+    scoped_query_total = payload.get("scopedQueryTotalBeforeExport")
+    if (
+        not isinstance(scoped_query_total, int)
+        or isinstance(scoped_query_total, bool)
+        or scoped_query_total < 201
+    ):
+        raise BenchmarkError("Full acceptance scoped query envanteri hazir degil")
+    if normalized_export["records"] < scoped_query_total:
+        raise BenchmarkError(
+            "Full acceptance CSV export'u scoped query envanterinden eksik"
+        )
+    return {
+        "enabled": True,
+        **{field: payload[field] for field in timestamps},
+        "queryLookupSeconds": _finite_nonnegative(payload.get("queryLookupSeconds"), "query lookup"),
+        "scopedQueryTotalBeforeExport": scoped_query_total,
+        "web": normalized_web,
+        "sourceExplain": normalized_source,
+        "csvExport": normalized_export,
+    }
+
+
+def capture_full_acceptance(
+    runner: CommandRunner,
+    context: DockerContext,
+    *,
+    admin_token: str,
+    query_wait_seconds: float,
+    request_timeout_seconds: float,
+    minimum_csv_records: int,
+) -> dict[str, Any]:
+    """Exercise web ingress, source EXPLAIN and a complete CSV stream once.
+
+    The raw bearer is written only to docker-exec stdin. It is deliberately
+    absent from argv, child environment, filesystem and returned metrics.
+    """
+
+    if not re.fullmatch(r"adv_pat_v1_[A-Za-z0-9_-]{43}", admin_token):
+        raise BenchmarkError("ERP_FULL_ACCEPTANCE gecerli ADVISOR_API_TOKEN gerektirir")
+    if not 5 <= query_wait_seconds <= 300 or not 5 <= request_timeout_seconds <= 310:
+        raise BenchmarkError("Full acceptance timeout degerleri desteklenen aralikta degil")
+    if not 201 <= minimum_csv_records <= 1_000_000:
+        raise BenchmarkError("Full acceptance CSV minimum degeri desteklenmiyor")
+    secret_input = json.dumps({"token": admin_token}, separators=(",", ":"))
+    result = runner.run(
+        [
+            "docker",
+            "exec",
+            "-i",
+            context.api_container,
+            "python",
+            "-c",
+            FULL_ACCEPTANCE_PROBE_SCRIPT,
+            str(context.server_id),
+            str(query_wait_seconds),
+            str(request_timeout_seconds),
+            str(minimum_csv_records),
+        ],
+        # The subprocess timeout is the total acceptance envelope. Individual
+        # HTTP calls use the same upper bound but cannot extend the phase.
+        timeout=query_wait_seconds + request_timeout_seconds + 20,
+        env=sanitized_subprocess_environment(),
+        input_text=secret_input,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BenchmarkError("Full acceptance helper JSON'i parse edilemedi") from exc
+    if not isinstance(payload, Mapping):
+        raise BenchmarkError("Full acceptance helper nesne dondurmedi")
+    return normalize_full_acceptance(payload)
 
 
 def wait_for_repository_cache_refresh(
@@ -2421,6 +2836,17 @@ def load_thresholds(
         ),
         "minApiSamples": env_int("ERP_MIN_API_SAMPLES", 5, minimum=1),
         "maxApiErrors": env_int("ERP_MAX_API_ERRORS", 0),
+        "maxFullWebSeconds": env_float("ERP_MAX_FULL_WEB_SECONDS", 10.0),
+        "maxSourceExplainSeconds": env_float(
+            "ERP_MAX_SOURCE_EXPLAIN_SECONDS", 130.0
+        ),
+        "maxCsvExportSeconds": env_float("ERP_MAX_CSV_EXPORT_SECONDS", 180.0),
+        "maxCsvFirstByteSeconds": env_float(
+            "ERP_MAX_CSV_FIRST_BYTE_SECONDS", 30.0
+        ),
+        "minCsvExportRecords": env_int(
+            "ERP_MIN_CSV_EXPORT_RECORDS", 201, minimum=201
+        ),
         "maxPgssOccupancyPercent": env_float(
             "ERP_MAX_PGSS_OCCUPANCY_PERCENT", 90.0
         ),
@@ -2481,6 +2907,10 @@ def evaluate_guardrails(
     *,
     elapsed_seconds: float,
     workload_exit_code: int,
+    full_acceptance: Mapping[str, Any] | None = None,
+    full_acceptance_required: bool = False,
+    measurement_started_at: str | None = None,
+    generator_finished_at: str | None = None,
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
 
@@ -3015,6 +3445,132 @@ def evaluate_guardrails(
         "yük penceresinde query API hedef source icin veri dondurmeli",
     )
 
+    if not full_acceptance_required:
+        skip(
+            "full_acceptance",
+            {"enabled": False},
+            "ERP_FULL_ACCEPTANCE etkin degil",
+        )
+    elif not isinstance(full_acceptance, Mapping) or full_acceptance.get("enabled") is not True:
+        add(
+            "full_acceptance",
+            False,
+            full_acceptance,
+            {"enabled": True},
+            "web, source EXPLAIN ve tam CSV kabul fazi tamamlanmali",
+        )
+    else:
+        web = full_acceptance.get("web") or {}
+        source = full_acceptance.get("sourceExplain") or {}
+        export = full_acceptance.get("csvExport") or {}
+        scoped_query_total = full_acceptance.get(
+            "scopedQueryTotalBeforeExport"
+        )
+        response = source.get("response") if isinstance(source, Mapping) else {}
+        validation = response.get("validation") if isinstance(response, Mapping) else {}
+        plan = validation.get("plan") if isinstance(validation, Mapping) else {}
+        web_total = sum(
+            float(web.get(field) or 0)
+            for field in (
+                "rootLatencySeconds",
+                "assetsLatencySeconds",
+                "healthLatencySeconds",
+            )
+        ) if isinstance(web, Mapping) else math.inf
+        add(
+            "full_web_ingress",
+            isinstance(web, Mapping)
+            and web.get("healthStatus") == "healthy"
+            and isinstance(web.get("assetCount"), int)
+            and web["assetCount"] >= 1
+            and isinstance(web.get("bytes"), int)
+            and web["bytes"] > 0
+            and web_total <= thresholds["maxFullWebSeconds"],
+            {"seconds": web_total, "assets": web.get("assetCount") if isinstance(web, Mapping) else None},
+            {"maxSeconds": thresholds["maxFullWebSeconds"], "minAssets": 1},
+            "web root, hashed assetler ve proxied health yük altinda calismali",
+        )
+        source_ok = (
+            isinstance(response, Mapping)
+            and response.get("status") == "RUNTIME_VALIDATED"
+            and response.get("sourceExecuted") is True
+            and response.get("sourceDdlExecuted") is False
+            and response.get("transactionRolledBack") is True
+            and isinstance(plan, Mapping)
+            and isinstance(plan.get("Plan"), Mapping)
+            and isinstance(source.get("latencySeconds"), (int, float))
+            and source["latencySeconds"] <= thresholds["maxSourceExplainSeconds"]
+        )
+        add(
+            "full_source_explain",
+            source_ok,
+            {
+                "seconds": source.get("latencySeconds") if isinstance(source, Mapping) else None,
+                "status": response.get("status") if isinstance(response, Mapping) else None,
+                "sourceExecuted": response.get("sourceExecuted") if isinstance(response, Mapping) else None,
+                "sourceDdlExecuted": response.get("sourceDdlExecuted") if isinstance(response, Mapping) else None,
+                "transactionRolledBack": response.get("transactionRolledBack") if isinstance(response, Mapping) else None,
+            },
+            {"maxSeconds": thresholds["maxSourceExplainSeconds"]},
+            "persisted ERP point-read ana DB'de read-only çalışıp rollback olmali",
+        )
+        add(
+            "full_csv_export",
+            isinstance(export, Mapping)
+            and isinstance(export.get("records"), int)
+            and not isinstance(export.get("records"), bool)
+            and export["records"] >= thresholds["minCsvExportRecords"]
+            and isinstance(scoped_query_total, int)
+            and not isinstance(scoped_query_total, bool)
+            and export["records"] >= scoped_query_total
+            and isinstance(export.get("bytes"), int)
+            and export["bytes"] > 0
+            and isinstance(export.get("firstByteSeconds"), (int, float))
+            and export["firstByteSeconds"] <= thresholds["maxCsvFirstByteSeconds"]
+            and isinstance(export.get("latencySeconds"), (int, float))
+            and export["latencySeconds"] <= thresholds["maxCsvExportSeconds"],
+            {
+                "export": dict(export) if isinstance(export, Mapping) else export,
+                "scopedQueryTotalBeforeExport": scoped_query_total,
+            },
+            {
+                "minRecords": thresholds["minCsvExportRecords"],
+                "inventoryRecords": scoped_query_total,
+                "maxFirstByteSeconds": thresholds["maxCsvFirstByteSeconds"],
+                "maxSeconds": thresholds["maxCsvExportSeconds"],
+            },
+            "CSV scoped envanterin tamamini ilk 200 satirla sinirlanmadan stream etmeli",
+        )
+        overlap_ok = False
+        try:
+            parse_time = lambda value: datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            parallel_start = parse_time(full_acceptance["parallelStartedAt"])
+            parallel_finish = parse_time(full_acceptance["parallelFinishedAt"])
+            measurement_start = parse_time(measurement_started_at)
+            generator_finish = parse_time(generator_finished_at)
+            explain_start = parse_time(source["startedAt"])
+            explain_finish = parse_time(source["finishedAt"])
+            csv_start = parse_time(export["startedAt"])
+            csv_finish = parse_time(export["finishedAt"])
+            overlap_ok = (
+                measurement_start <= parallel_start < parallel_finish <= generator_finish
+                and max(explain_start, csv_start) < min(explain_finish, csv_finish)
+            )
+        except (KeyError, TypeError, ValueError):
+            overlap_ok = False
+        add(
+            "full_acceptance_overlap",
+            overlap_ok,
+            {
+                "measurementStartedAt": measurement_started_at,
+                "parallelStartedAt": full_acceptance.get("parallelStartedAt"),
+                "parallelFinishedAt": full_acceptance.get("parallelFinishedAt"),
+                "generatorFinishedAt": generator_finished_at,
+            },
+            "source EXPLAIN ve CSV zaman araliklari workload penceresinde çakışmalı",
+            "full acceptance işleri workload bitmeden ve birbirleriyle çakışarak çalışmalı",
+        )
+
     outbox = value_at(after, "source", "postgres", "joinOutbox") or {}
     for field, threshold_key, guard_name in (
         ("batchCount", "maxJoinOutboxBatches", "join_outbox_batches"),
@@ -3258,6 +3814,19 @@ def print_summary(report: Mapping[str, Any], report_path: pathlib.Path) -> None:
         f"query detail/trend API p95          {'-':>14}"
         f" {value_at(endpoint_metrics, 'query-detail', 'p95Seconds')}s"
     )
+    full = report.get("fullAcceptance") or {}
+    if full.get("enabled") is True:
+        print(
+            f"web root/assets/health              {'-':>14}"
+            f" {value_at(full, 'web', 'rootLatencySeconds')}s /"
+            f" {value_at(full, 'web', 'assetsLatencySeconds')}s /"
+            f" {value_at(full, 'web', 'healthLatencySeconds')}s"
+        )
+        print(
+            f"source EXPLAIN / CSV                {value_at(full, 'sourceExplain', 'latencySeconds')}s"
+            f" {value_at(full, 'csvExport', 'latencySeconds')}s,"
+            f" {value_at(full, 'csvExport', 'records')} records"
+        )
     print(
         f"source collection frequency         {source_frequency:>14}"
         f" {'-':>17}"
@@ -3296,7 +3865,7 @@ def prepare_benchmark_environment(
 ) -> dict[str, str]:
     """Prepare image/seed outside the measured source/repository window."""
 
-    workload_env = dict(os.environ)
+    workload_env = sanitized_subprocess_environment()
     workload_env["COMPOSE_PROJECT_NAME"] = context.project
     workload_env["COMPOSE_FILE"] = context.compose_file
     # BuildKit and image pulls are host preparation, not source/repository
@@ -3342,6 +3911,23 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
         raise BenchmarkError("ERP_API_OVERVIEW_CONCURRENCY en fazla 8 olmali")
     prepare_first = env_bool("ERP_BENCHMARK_PREPARE_FIRST", True)
     fail_on_guardrail = env_bool("ERP_BENCHMARK_FAIL_ON_GUARDRAIL", True)
+    full_acceptance_enabled = env_bool("ERP_FULL_ACCEPTANCE", False)
+    full_acceptance_timeout = env_float(
+        "ERP_FULL_ACCEPTANCE_TIMEOUT_SECONDS", 180.0, minimum=30.0
+    )
+    full_query_wait = env_float(
+        "ERP_FULL_QUERY_WAIT_SECONDS", 120.0, minimum=5.0
+    )
+    if full_acceptance_timeout > 310 or full_query_wait > 300:
+        raise BenchmarkError("Full acceptance timeout en fazla 310/300 saniye olabilir")
+    admin_token = os.environ.get("ADVISOR_API_TOKEN", "")
+    if full_acceptance_enabled:
+        if profile != "erp":
+            raise BenchmarkError("ERP_FULL_ACCEPTANCE yalniz erp profilinde calisir")
+        if not re.fullmatch(r"adv_pat_v1_[A-Za-z0-9_-]{43}", admin_token):
+            raise BenchmarkError(
+                "ERP_FULL_ACCEPTANCE gecerli, admin kayitli ADVISOR_API_TOKEN gerektirir"
+            )
     preflight_timeout = env_int(
         "ERP_BENCHMARK_PREFLIGHT_TIMEOUT_SECONDS", 300, minimum=30
     )
@@ -3361,6 +3947,13 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
     # the expensive workload run. The harness reports but never mutates the
     # monitored source registration.
     require_source_frequency(context.source_frequency)
+    if full_acceptance_enabled:
+        require_full_acceptance_duration(
+            duration,
+            context.source_frequency,
+            full_query_wait,
+            full_acceptance_timeout,
+        )
     baseline_timeout = env_int(
         "ERP_BENCHMARK_BASELINE_TIMEOUT_SECONDS",
         max(60, context.source_frequency * 2),
@@ -3382,14 +3975,14 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
         runner,
         context,
         1,
-        request_timeout_seconds=45.0,
+        request_timeout_seconds=API_WARMUP_TIMEOUT_SECONDS,
         endpoint="query-list",
     )
     capture_api_probe(
         runner,
         context,
         1,
-        request_timeout_seconds=45.0,
+        request_timeout_seconds=API_WARMUP_TIMEOUT_SECONDS,
         endpoint="overview",
     )
     detail_target = next(
@@ -3405,7 +3998,7 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
             runner,
             context,
             1,
-            request_timeout_seconds=45.0,
+            request_timeout_seconds=API_WARMUP_TIMEOUT_SECONDS,
             endpoint="query-detail",
             detail_target=detail_target,
         )
@@ -3422,7 +4015,10 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
     }
     api_completed_batches = {endpoint: 0 for endpoint in api_rotation}
     api_skipped_detail_batches = 0
+    full_acceptance_result: dict[str, Any] = {"enabled": False}
+    full_acceptance_errors: list[str] = []
     stop = threading.Event()
+    workload_active = threading.Event()
 
     def monitor() -> None:
         while not stop.is_set():
@@ -3469,12 +4065,57 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
                 )
             stop.wait(sample_seconds)
 
+    def monitor_full_acceptance() -> None:
+        nonlocal full_acceptance_result
+        while not stop.is_set() and not workload_active.wait(0.25):
+            pass
+        if stop.is_set():
+            full_acceptance_errors.append("Workload aktif olmadan kabul fazi durdu")
+            return
+        baseline_epoch = value_at(
+            before, "repository", "postgres", "collector", "snapshotEpochUs"
+        )
+        while not stop.is_set():
+            advanced = any(
+                isinstance(value_at(sample, "repository", "snapshotEpochUs"), (int, float))
+                and isinstance(baseline_epoch, (int, float))
+                and value_at(sample, "repository", "snapshotEpochUs") > baseline_epoch
+                for sample in list(samples)
+            )
+            if advanced:
+                try:
+                    full_acceptance_result = capture_full_acceptance(
+                        runner,
+                        context,
+                        admin_token=admin_token,
+                        query_wait_seconds=full_query_wait,
+                        request_timeout_seconds=full_acceptance_timeout,
+                        minimum_csv_records=int(
+                            thresholds["minCsvExportRecords"]
+                        ),
+                    )
+                except Exception as exc:
+                    full_acceptance_errors.append(
+                        f"{type(exc).__name__}: {str(exc)[:500]}"
+                    )
+                return
+            stop.wait(0.5)
+        full_acceptance_errors.append(
+            "Workload sona ermeden collector snapshot advance gözlenmedi"
+        )
+
     monitor_thread = threading.Thread(target=monitor, name="erp-stack-monitor", daemon=True)
     api_thread = threading.Thread(
         target=monitor_api, name="erp-stack-api-monitor", daemon=True
     )
+    full_acceptance_thread = threading.Thread(
+        target=monitor_full_acceptance,
+        name="erp-stack-full-acceptance",
+        daemon=True,
+    )
     monitor_started = False
     api_started = False
+    full_acceptance_started = False
     threads_joined = False
 
     def stop_monitors() -> None:
@@ -3486,10 +4127,16 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
             monitor_thread.join(timeout=45.0)
         if api_started:
             api_thread.join(timeout=30.0)
+        if full_acceptance_started:
+            full_acceptance_thread.join(
+                timeout=full_query_wait + full_acceptance_timeout + 25.0
+            )
         if monitor_started and monitor_thread.is_alive():
             sampling_errors.append("monitor thread 45 saniyede durmadi")
         if api_started and api_thread.is_alive():
             api_errors.append("API monitor thread 30 saniyede durmadi")
+        if full_acceptance_started and full_acceptance_thread.is_alive():
+            full_acceptance_errors.append("Full acceptance thread zamaninda durmadi")
         threads_joined = True
 
     wrapper_finished_at: str
@@ -3551,9 +4198,13 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
             monitor_started = True
             api_thread.start()
             api_started = True
+            if full_acceptance_enabled:
+                full_acceptance_thread.start()
+                full_acceptance_started = True
             publish_phase_response(sync_directory, "start")
             start_continued_at = utc_now()
             start_response_sent = True
+            workload_active.set()
 
             end_ready = wait_for_sync_payload(
                 sync_path(sync_directory, "end", "ready"),
@@ -3649,10 +4300,14 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
         thresholds,
         elapsed_seconds=elapsed_seconds,
         workload_exit_code=workload_exit_code,
+        full_acceptance=full_acceptance_result,
+        full_acceptance_required=full_acceptance_enabled,
+        measurement_started_at=start_continued_at,
+        generator_finished_at=generator_finished_at,
     )
     failed = [check for check in guardrails if check["status"] == "FAIL"]
     report = {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "type": "advisor-erp-stack-benchmark",
         "status": "FAILED" if failed else "PASSED",
         "project": context.project,
@@ -3702,6 +4357,10 @@ def run_benchmark(args: argparse.Namespace, runner: CommandRunner) -> int:
         "derivedMetrics": derived_metrics,
         "peaks": peaks,
         "api": api_metrics,
+        "fullAcceptance": {
+            **full_acceptance_result,
+            "errors": list(full_acceptance_errors),
+        },
         "samplingErrors": sampling_errors,
         "apiErrors": api_errors,
         "thresholds": thresholds,

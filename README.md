@@ -1,5 +1,8 @@
 # PostgreSQL Sorgu Performansı ve Öneri Motoru
 
+Güncel sürüm: `1.1.0`. Değişiklikler [CHANGELOG.md](CHANGELOG.md), güvenli
+yükseltme ve geri dönüş adımları [upgrade/rollback runbook'unda](docs/UPGRADE_ROLLBACK.md).
+
 PDF v1.1'de tarif edilen ilk iterasyonun çalışan referans uygulamasıdır. Tek bir Docker/OrbStack hostu üzerinde **iki ayrı PostgreSQL sunucu süreci** çalışır: demo kaynak instance `5432`, PoWA repository instance `5433`. PoWA Collector istatistikleri kaynaktan repository'ye taşır; FastAPI yalnız repository'yi okur ve React arayüzü sonuçları gösterir. Aynı repository/collector, `scripts/register-source.sh` ile birden fazla gerçek PostgreSQL kaynağı izleyebilir.
 
 > Bu sürüm önce hangi sorguya bakılması gerektiğini gösterir; gerçek CPU ile sampled wait profilini ayırır, JOIN ilişkilerini düşük yetkili snapshotter ile taşır ve iki kolonlu adayları HypoPG ile doğrular. Gerçek `CREATE INDEX` yalnız isteğe bağlı disposable clone profilinde çalışır; izlenen kaynakta otomatik DDL, SQL rewrite veya müdahale yapılmaz.
@@ -41,6 +44,9 @@ checksum'ını doğrular; collector, JOIN snapshotter ve API ancak migration
 başarısından sonra başlar. Elle upgrade/tekrar doğrulama için
 `bash scripts/migrate-repository.sh` kullanılabilir. Ayrıntılı model
 [docs/REPOSITORY_MIGRATIONS.md](docs/REPOSITORY_MIGRATIONS.md) içindedir.
+Release yükseltmesini `docker compose up` ile doğrudan başlatmadan önce yedek,
+writer-stop, explicit migrator ve cutover sırasını
+[upgrade/rollback runbook'undan](docs/UPGRADE_ROLLBACK.md) uygulayın.
 TLS-doğrulamalı image build'i, özel karakterli secret kullanımı ve mevcut
 named volume parola/rol drift uzlaştırması
 [portable deployment hardening belgesinde](docs/PORTABLE_DEPLOYMENT_HARDENING.md)
@@ -171,6 +177,18 @@ Additive `derivedMetrics`, source/repository container read-write-total byte/s
 hızlarını ve pencerenin PoWA aggregate/purge sınırına denk gelip gelmediğini
 `maintenanceInclusive` / `steadyStateEligible` olarak verir; eksik veya
 uyumsuz sequence/config kanıtı steady-state iddiası üretmez.
+Release kabulünde admin token'ı yalnız shell ortamında tutarak tam modu açın:
+
+```bash
+ERP_FULL_ACCEPTANCE=true ADVISOR_API_TOKEN="$ADVISOR_API_TOKEN" \
+  bash scripts/benchmark-erp-stack.sh run erp 600 32
+```
+
+Tam mod ilk collector ilerlemesinden sonra web root + hashed asset + proxied
+health'i okur; persisted ERP point-read için source EXPLAIN ile bütün CSV
+stream'ini aynı anda tüketir. Token host benchmark process environment'ından
+okunur; container argv/environment, rapor veya dosyaya yazılmadan `docker exec`
+stdin'iyle aktarılır. Bu HTTP kontrolü browser render testi değildir.
 Bu koşu 7d/30d veya dolu retention soak testi ve observer kapalı/açık A/B ölçümü
 yerine geçmez. API p95 kapıları bounded warmup sonrası SWR yolunu ölçer; 4.000+
 queryid referansında expired-cache ilk fill'i `22,12s` olduğundan katı cold-start

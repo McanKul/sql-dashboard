@@ -79,7 +79,9 @@ jobs:
           '
 
       - name: Validate migration runner and manifest checksums
-        run: python -m unittest deployment/repository/test_migration_runner.py -v
+        run: |
+          python scripts/verify-release-consistency.py
+          python -m unittest deployment/repository/test_migration_runner.py -v
 
       - name: Install deployment test dependency
         run: python -m pip install "psycopg[binary]==3.2.9"

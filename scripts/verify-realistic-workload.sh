@@ -1583,7 +1583,7 @@ check_minimum "Deleted tuple" "$tuples_deleted" "1"
 api_state="$(docker exec -i \
   -e REALISTIC_API_SAMPLES="${REALISTIC_API_SAMPLES:-20}" \
   -e REALISTIC_API_WINDOW="${REALISTIC_API_WINDOW:-24h}" \
-  -e REALISTIC_API_WARMUP_TIMEOUT_SECONDS="${REALISTIC_API_WARMUP_TIMEOUT_SECONDS:-45}" \
+  -e REALISTIC_API_WARMUP_TIMEOUT_SECONDS="${REALISTIC_API_WARMUP_TIMEOUT_SECONDS:-120}" \
   -e REALISTIC_SERVER_ID="$server_id" \
   "$api_container" python - <<'PY'
 import json

@@ -2,7 +2,18 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { CompositeIndexEvaluation, ExplainAnalyzePanel, highestBindParameter, parseExplainBindValues } from './App'
-import type { QueryExplainAnalyzeResult, CompositeIndexCandidate, QueryIndexAdvice } from './types'
+import type { QueryExplainAnalyzeResult, CompositeIndexCandidate, QueryIndexAdvice, SourceCapability } from './types'
+
+const sourceExplainCapability: SourceCapability = {
+  key: 'sourceExplain', label: 'Source EXPLAIN', status: 'AVAILABLE', configured: true,
+  healthy: true, dataAvailable: true, available: true, reasonCode: 'AVAILABLE', reason: 'Kullanılabilir.',
+}
+
+const unavailableHypopgCapability: SourceCapability = {
+  key: 'hypopg', label: 'HypoPG', status: 'NOT_CONFIGURED', configured: false,
+  healthy: null, dataAvailable: null, available: false, reasonCode: 'TARGET_NOT_CONFIGURED',
+  reason: 'Bu veritabanı evaluator hedefi değil.',
+}
 
 const candidate: CompositeIndexCandidate = {
   candidateId: 'candidate-1', serverId: 1, databaseId: 2, queryId: '-42', relationId: 10,
@@ -33,10 +44,24 @@ describe('direct read-only EXPLAIN ANALYZE', () => {
       onCopy: vi.fn(),
     }))
 
-    expect(markup).toContain('Operator doğrulamasına hazır')
+    expect(markup).toContain('Clone doğrulamasına hazır')
     expect(markup).toContain('Operator API')
     expect(markup).toContain('disabled')
     expect(markup).not.toContain('Clone’da gerçek test')
+  })
+
+  it('keeps an unsupported HypoPG action visible but disabled with its reason', () => {
+    const markup = renderToStaticMarkup(createElement(CompositeIndexEvaluation, {
+      candidate,
+      copied: false,
+      onEvaluate: vi.fn(),
+      onCopy: vi.fn(),
+      capability: unavailableHypopgCapability,
+    }))
+
+    expect(markup).toContain('Composite adayı doğrula')
+    expect(markup).toContain('disabled')
+    expect(markup).toContain('Bu veritabanı evaluator hedefi değil.')
   })
 
   it('shows a direct launcher and the exact positional bind requirement', () => {
@@ -46,14 +71,14 @@ describe('direct read-only EXPLAIN ANALYZE', () => {
       bindInput: '[]',
       onBindInput: vi.fn(),
       onEvaluate: vi.fn(),
+      capability: sourceExplainCapability,
     }))
 
     expect(markup).toContain("Ana DB&#x27;de EXPLAIN ANALYZE")
     expect(markup).toContain('$1–$2')
     expect(markup).toContain('Bind değerleri advisor’a kaydedilmez')
-    expect(markup).toContain('kaynak DB log/audit politikası geçerlidir')
-    expect(markup).toContain('ana veritabanında ölçer')
-    expect(markup).toContain('DDL ve yazma sorguları kabul edilmez')
+    expect(markup).toContain('kaynak log politikası geçerlidir')
+    expect(markup).toContain('Ana veritabanında gerçek yük oluşturur. Yalnız SELECT.')
     expect(markup).not.toContain('disabled')
   })
 
@@ -175,6 +200,7 @@ describe('direct read-only EXPLAIN ANALYZE', () => {
     const renderForCount = (count: number) => renderToStaticMarkup(createElement(ExplainAnalyzePanel, {
       statement: `select ${Array.from({ length: count }, (_value, index) => `$${index + 1}`).join(', ')}`,
       state: { status: 'idle' }, bindInput: '[]', onBindInput: vi.fn(), onEvaluate: vi.fn(),
+      capability: sourceExplainCapability,
     }))
     const atLimit = renderForCount(128)
     const overLimit = renderForCount(129)
@@ -184,6 +210,26 @@ describe('direct read-only EXPLAIN ANALYZE', () => {
     expect(atLimit).not.toContain('disabled')
     expect(overLimit).toContain('kaynak EXPLAIN sınırı 128')
     expect(overLimit).toContain('disabled')
+  })
+
+  it('keeps source EXPLAIN visible but disabled when the selected database is not configured', () => {
+    const markup = renderToStaticMarkup(createElement(ExplainAnalyzePanel, {
+      statement: 'select 1', state: { status: 'idle' }, bindInput: '[]', onBindInput: vi.fn(), onEvaluate: vi.fn(),
+      capability: { ...sourceExplainCapability, status: 'NOT_CONFIGURED', available: false, configured: false, reason: 'Bu veritabanı evaluator hedefi değil.' },
+    }))
+    expect(markup).toContain('Source EXPLAIN kullanılamıyor')
+    expect(markup).toContain('Bu veritabanı evaluator hedefi değil.')
+    expect(markup).toContain('disabled')
+  })
+
+  it('keeps the error retry path under the same source capability gate', () => {
+    const markup = renderToStaticMarkup(createElement(ExplainAnalyzePanel, {
+      statement: 'select 1', state: { status: 'error', error: 'Evaluator geçici olarak kapalı.' }, bindInput: '[]', onBindInput: vi.fn(), onEvaluate: vi.fn(),
+      capability: { ...sourceExplainCapability, status: 'UNREACHABLE', available: false, healthy: false, reason: 'Evaluator erişilemiyor.' },
+    }))
+    expect(markup).toContain('Evaluator geçici olarak kapalı.')
+    expect(markup).toContain('Evaluator erişilemiyor.')
+    expect(markup.match(/disabled/g)?.length).toBeGreaterThanOrEqual(2)
   })
 
   it('uses PostgreSQL backslash rules for ordinary and E-prefixed strings', () => {

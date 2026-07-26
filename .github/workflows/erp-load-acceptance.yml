@@ -1,0 +1,104 @@
+name: ERP full load acceptance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 2 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: erp-load-acceptance
+  cancel-in-progress: false
+
+jobs:
+  full-erp:
+    name: Dedicated 500-table concurrent acceptance
+    # This label must point only to an isolated >=12 vCPU, >=16 GiB Docker,
+    # >=30 GiB free runner. Never attach a production PostgreSQL source.
+    runs-on: [self-hosted, advisor-erp-load]
+    timeout-minutes: 120
+    env:
+      COMPOSE_PROJECT_NAME: advisor-erp-${{ github.run_id }}-${{ github.run_attempt }}
+      REGISTER_DEMO_SOURCE: "true"
+      DEMO_SOURCE_FREQUENCY: "60"
+      ERP_FULL_ACCEPTANCE: "true"
+      ERP_BENCHMARK_PREPARE_FIRST: "true"
+      POSTGRES_ADMIN_PASSWORD: ephemeral-admin-${{ github.run_id }}-${{ github.run_attempt }}
+      POWA_COLLECTOR_PASSWORD: ephemeral-collector-${{ github.run_id }}-${{ github.run_attempt }}
+      ADVISOR_API_PASSWORD: ephemeral-api-${{ github.run_id }}-${{ github.run_attempt }}
+      ADVISOR_EVALUATOR_PASSWORD: ephemeral-evaluator-${{ github.run_id }}-${{ github.run_attempt }}
+      ADVISOR_JOIN_SOURCE_PASSWORD: ephemeral-join-source-${{ github.run_id }}-${{ github.run_attempt }}
+      ADVISOR_JOIN_REPOSITORY_PASSWORD: ephemeral-join-repository-${{ github.run_id }}-${{ github.run_attempt }}
+      WORKLOAD_DB_PASSWORD: ephemeral-workload-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Refuse non-isolated or undersized runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "DESTRUCTIVE SYNTHETIC FIXTURE ONLY; NEVER RUN AGAINST A PRODUCTION SOURCE"
+          [[ "$COMPOSE_PROJECT_NAME" =~ ^advisor-erp-[0-9]+-[0-9]+$ ]]
+          if docker volume ls --format '{{.Name}}' | grep -q "^${COMPOSE_PROJECT_NAME}_"; then
+            echo "Fresh isolated project volumes already exist" >&2
+            exit 1
+          fi
+          test "$(getconf _NPROCESSORS_ONLN)" -ge 12
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          memory_kib = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:')))
+          assert memory_kib >= 16 * 1024 * 1024, memory_kib
+          assert shutil.disk_usage('.').free >= 30 * 1024**3, shutil.disk_usage('.')
+          PY
+
+      - name: Generate in-memory principal, boot, and run full acceptance
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          set +x
+          mapfile -t generated < <(python3 - <<'PY'
+          import base64, hashlib, json, secrets
+          token = "adv_pat_v1_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+          registry = json.dumps([{
+              "credential_id": "erp-load-ci",
+              "subject": "ci:erp-load-acceptance",
+              "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+              "roles": ["admin"],
+          }], separators=(",", ":"))
+          print(token)
+          print(registry)
+          PY
+          )
+          test "${#generated[@]}" -eq 2
+          ADVISOR_API_TOKEN="${generated[0]}"
+          ADVISOR_AUTH_PRINCIPALS="${generated[1]}"
+          echo "::add-mask::${ADVISOR_API_TOKEN}"
+          export ADVISOR_API_TOKEN ADVISOR_AUTH_PRINCIPALS
+          unset generated
+          docker compose build
+          docker compose up -d --wait --wait-timeout 300
+          bash scripts/benchmark-erp-stack.sh run erp 600 32
+
+      - name: Upload benchmark reports and workload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erp-load-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime/load-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=500
+
+      - name: Remove only this run's disposable volumes
+        if: always()
+        run: |
+          echo "Removing disposable project: $COMPOSE_PROJECT_NAME"
+          [[ "$COMPOSE_PROJECT_NAME" =~ ^advisor-erp-[0-9]+-[0-9]+$ ]]
+          docker compose --profile realistic-load down --volumes --remove-orphans

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 import app.repositories.powa as powa_module
-from app.repositories.powa import PowaRepository
+from app.repositories.powa import GlobalTrendRefreshBackoff, PowaRepository
 
 
 class FakeClock:
@@ -24,11 +24,15 @@ def cache_repository(
     fresh: float = 60.0,
     stale: float = 300.0,
     entries: int = 4,
+    trend_entries: int | None = None,
 ) -> PowaRepository:
     return PowaRepository(
         query_list_cache_fresh_seconds=fresh,
         query_list_cache_stale_seconds=stale,
         query_list_cache_max_entries=entries,
+        global_trend_cache_max_entries=(
+            entries if trend_entries is None else trend_entries
+        ),
         clock=clock,
     )
 
@@ -99,6 +103,37 @@ async def test_global_trend_cold_singleflight_is_shielded_and_deep_copy_safe(
     assert loads == 1
     assert fresh[0]["nested"] == {"marker": 1}
     assert fresh[0] is not surviving[0]
+
+
+@pytest.mark.asyncio
+async def test_database_trend_uses_the_same_singleflight_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = cache_repository(FakeClock())
+    loads: list[tuple[str, int | None, int | None]] = []
+
+    async def load(
+        window: str,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        loads.append((window, server_id, database_id))
+        return [trend_row(1)]
+
+    monkeypatch.setattr(repository, "_load_global_trend_snapshot", load)
+
+    first = await repository.trend(
+        window="24h", server_id=7, database_id=16_384
+    )
+    second = await repository.trend(
+        window="24h", server_id=7, database_id=16_384
+    )
+
+    assert first == second
+    assert first is not second
+    assert loads == [("24h", 7, 16_384)]
+    assert ("24h", 7, 16_384) in repository._global_trend_cache
 
 
 @pytest.mark.asyncio
@@ -218,7 +253,7 @@ async def test_query_metrics_and_global_trend_share_repository_refresh_lock(
 
 
 @pytest.mark.asyncio
-async def test_scoped_trend_bypasses_global_cache(
+async def test_query_specific_trend_bypasses_aggregate_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Cursor:
@@ -368,10 +403,15 @@ async def test_close_cancels_running_and_queued_refresh_tasks(
 async def test_global_trend_cache_is_lru_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repository = cache_repository(FakeClock(), entries=2)
+    repository = cache_repository(FakeClock(), trend_entries=4)
     loads: list[str] = []
 
-    async def load(window: str) -> list[dict[str, Any]]:
+    async def load(
+        window: str,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         loads.append(window)
         return [trend_row(len(loads))]
 
@@ -380,6 +420,58 @@ async def test_global_trend_cache_is_lru_bounded(
     await repository.trend(window="24h")
     await repository.trend(window="1h")
     await repository.trend(window="7d")
+    await repository.trend(window="30d")
+    await repository.trend(
+        window="24h", server_id=7, database_id=16_384
+    )
 
-    assert list(repository._global_trend_cache) == ["1h", "7d"]
-    assert loads == ["1h", "24h", "7d"]
+    assert list(repository._global_trend_cache) == [
+        "1h",
+        "7d",
+        "30d",
+        ("24h", 7, 16_384),
+    ]
+    assert loads == ["1h", "24h", "7d", "30d", "24h"]
+
+
+@pytest.mark.asyncio
+async def test_global_trend_retry_backoff_is_lru_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = cache_repository(FakeClock(), trend_entries=4)
+
+    async def load(
+        _: str,
+        *,
+        server_id: int | None = None,
+        database_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError(f"unavailable scope {server_id}/{database_id}")
+
+    monkeypatch.setattr(repository, "_load_global_trend_snapshot", load)
+    for database_id in range(100, 104):
+        with pytest.raises(RuntimeError, match="unavailable scope"):
+            await repository.trend(
+                window="24h", server_id=7, database_id=database_id
+            )
+
+    assert list(repository._global_trend_retry) == [
+        ("24h", 7, 100),
+        ("24h", 7, 101),
+        ("24h", 7, 102),
+        ("24h", 7, 103),
+    ]
+
+    # A backoff hit is a real LRU access.  Touch the oldest key, then verify
+    # that the next distinct failure evicts the now-oldest untouched key.
+    with pytest.raises(GlobalTrendRefreshBackoff):
+        await repository.trend(window="24h", server_id=7, database_id=100)
+    with pytest.raises(RuntimeError, match="unavailable scope"):
+        await repository.trend(window="24h", server_id=7, database_id=104)
+
+    assert list(repository._global_trend_retry) == [
+        ("24h", 7, 102),
+        ("24h", 7, 103),
+        ("24h", 7, 100),
+        ("24h", 7, 104),
+    ]

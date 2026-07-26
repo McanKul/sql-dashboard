@@ -100,8 +100,26 @@ async def test_query_trend_pushes_complete_scope_into_five_argument_helper(
 
 
 @pytest.mark.asyncio
-async def test_trend_rejects_partial_scope_before_querying_repository() -> None:
+async def test_server_trend_uses_four_argument_scope_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cursor = FakeCursor()
+    monkeypatch.setattr(powa_module, "pool", FakePool(cursor))
     repository = PowaRepository()
 
-    with pytest.raises(ValueError, match="birlikte gerektirir"):
-        await repository.trend(window="1h", server_id=7)
+    await repository.trend(window="1h", server_id=7)
+
+    tag_query, tag_params = cursor.executions[0]
+    assert "advisor-global-trend-cache-refresh" in tag_query
+    assert tag_params == []
+    query, params = cursor.executions[1]
+    assert "now() - %s::interval, %s::interval, %s, %s)" in query
+    assert params == ["1 hour", "5 minutes", 7, None, 100_001]
+
+
+@pytest.mark.asyncio
+async def test_trend_rejects_database_without_server() -> None:
+    repository = PowaRepository()
+
+    with pytest.raises(ValueError, match="server_id"):
+        await repository.trend(window="1h", database_id=16_384)

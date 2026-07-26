@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import csv
 import datetime as dt
 import io
 import json
@@ -270,6 +271,45 @@ def thresholds() -> dict[str, object]:
         "maxOomKillEventsDelta": 0,
         "requireCgroupMetrics": True,
         "requireCgroupMemoryEvents": True,
+    }
+
+
+def full_acceptance_payload(
+    *, records: int = 205, scoped_total: int = 205
+) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "startedAt": "2026-07-26T10:00:00.000000Z",
+        "finishedAt": "2026-07-26T10:00:02.000000Z",
+        "parallelStartedAt": "2026-07-26T10:00:00.500000Z",
+        "parallelFinishedAt": "2026-07-26T10:00:01.500000Z",
+        "queryLookupSeconds": 0.1,
+        "scopedQueryTotalBeforeExport": scoped_total,
+        "web": {
+            "rootLatencySeconds": 0.1,
+            "assetsLatencySeconds": 0.2,
+            "healthLatencySeconds": 0.1,
+            "assetCount": 2,
+            "bytes": 1000,
+            "healthStatus": "healthy",
+        },
+        "sourceExplain": {
+            "startedAt": "2026-07-26T10:00:00.500000Z",
+            "finishedAt": "2026-07-26T10:00:01.000000Z",
+            "latencySeconds": 0.5,
+            "queryId": "-42",
+            "databaseId": 19,
+            "response": {"status": "RUNTIME_VALIDATED"},
+        },
+        "csvExport": {
+            "startedAt": "2026-07-26T10:00:00.500001Z",
+            "finishedAt": "2026-07-26T10:00:01.500000Z",
+            "firstByteSeconds": 0.1,
+            "latencySeconds": 1.0,
+            "bytes": 5000,
+            "records": records,
+            "databaseId": 19,
+        },
     }
 
 
@@ -620,6 +660,8 @@ class GuardrailTests(unittest.TestCase):
         *,
         workload=0,
         api_metrics=None,
+        full_acceptance=None,
+        full_required=False,
     ):
         before = before or snapshot()
         after = after or snapshot(after=True)
@@ -659,6 +701,10 @@ class GuardrailTests(unittest.TestCase):
             limits or thresholds(),
             elapsed_seconds=60.0,
             workload_exit_code=workload,
+            full_acceptance=full_acceptance,
+            full_acceptance_required=full_required,
+            measurement_started_at="2026-07-26T10:00:00.000000Z",
+            generator_finished_at="2026-07-26T10:01:00.000000Z",
         )
 
     def test_portable_defaults_pass_and_hardware_ceilings_skip(self) -> None:
@@ -704,6 +750,48 @@ class GuardrailTests(unittest.TestCase):
         self.assertEqual(statuses["api_query_p95"], "PASS")
         self.assertEqual(statuses["api_overview_p95"], "FAIL")
         self.assertEqual(statuses["api_query_detail_p95"], "PASS")
+
+    def test_full_acceptance_hard_gates_source_csv_web_and_overlap(self) -> None:
+        limits = thresholds()
+        limits.update({
+            "maxFullWebSeconds": 10.0,
+            "maxSourceExplainSeconds": 130.0,
+            "maxCsvExportSeconds": 180.0,
+            "maxCsvFirstByteSeconds": 30.0,
+            "minCsvExportRecords": 201,
+        })
+        full = {
+            "enabled": True,
+            "parallelStartedAt": "2026-07-26T10:00:10.000000Z",
+            "parallelFinishedAt": "2026-07-26T10:00:12.000000Z",
+            "scopedQueryTotalBeforeExport": 205,
+            "web": {"rootLatencySeconds": 0.1, "assetsLatencySeconds": 0.2, "healthLatencySeconds": 0.1, "assetCount": 2, "bytes": 1000, "healthStatus": "healthy"},
+            "sourceExplain": {"startedAt": "2026-07-26T10:00:10.000000Z", "finishedAt": "2026-07-26T10:00:11.000000Z", "latencySeconds": 1.0, "response": {"status": "RUNTIME_VALIDATED", "sourceExecuted": True, "sourceDdlExecuted": False, "transactionRolledBack": True, "validation": {"plan": {"Plan": {"Node Type": "Index Scan"}}}}},
+            "csvExport": {"startedAt": "2026-07-26T10:00:10.000001Z", "finishedAt": "2026-07-26T10:00:12.000000Z", "firstByteSeconds": 0.2, "latencySeconds": 2.0, "bytes": 5000, "records": 205},
+        }
+        checks = self.evaluate(limits=limits, full_acceptance=full, full_required=True)
+        statuses = {item["name"]: item["status"] for item in checks}
+        self.assertEqual(statuses["full_web_ingress"], "PASS")
+        self.assertEqual(statuses["full_source_explain"], "PASS")
+        self.assertEqual(statuses["full_csv_export"], "PASS")
+        self.assertEqual(statuses["full_acceptance_overlap"], "PASS")
+
+        full["csvExport"]["records"] = 204
+        truncated = {
+            item["name"]: item["status"]
+            for item in self.evaluate(
+                limits=limits,
+                full_acceptance=full,
+                full_required=True,
+            )
+        }
+        self.assertEqual(truncated["full_csv_export"], "FAIL")
+
+        full["csvExport"]["records"] = 200
+        full["sourceExplain"]["response"]["transactionRolledBack"] = False
+        failed = {item["name"] for item in self.evaluate(limits=limits, full_acceptance=full, full_required=True) if item["status"] == "FAIL"}
+        self.assertIn("full_source_explain", failed)
+        self.assertIn("full_csv_export", failed)
 
     def test_restart_reset_stale_collector_and_workload_failure_fail_closed(self) -> None:
         before = snapshot()
@@ -871,6 +959,34 @@ class GuardrailTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_command_runner_sanitizes_auth_from_run_and_start(self) -> None:
+        completed = subprocess.CompletedProcess(["safe-run"], 0, "", "")
+        process = mock.Mock()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ADVISOR_API_TOKEN": "raw-token",
+                "ADVISOR_AUTH_PRINCIPALS": "raw-registry",
+                "SAFE_ENV": "kept",
+            },
+            clear=True,
+        ), mock.patch.object(
+            subprocess, "run", return_value=completed
+        ) as run_mock, mock.patch.object(
+            subprocess, "Popen", return_value=process
+        ) as popen_mock:
+            runner = benchmark.CommandRunner()
+            runner.run(["safe-run"])
+            runner.start(["safe-start"])
+
+        for child_env in (
+            run_mock.call_args.kwargs["env"],
+            popen_mock.call_args.kwargs["env"],
+        ):
+            self.assertNotIn("ADVISOR_API_TOKEN", child_env)
+            self.assertNotIn("ADVISOR_AUTH_PRINCIPALS", child_env)
+            self.assertEqual(child_env["SAFE_ENV"], "kept")
+
     def test_full_verify_warms_query_list_before_strict_latency_gate(self) -> None:
         verifier_path = benchmark.ROOT / "scripts/verify.sh"
         verifier = verifier_path.read_text(encoding="utf-8")
@@ -880,9 +996,10 @@ class ConfigurationTests(unittest.TestCase):
         )
         timed_call = "http_seconds=\"$(curl -fsS"
         self.assertIn(
-            'verify_api_warmup_timeout_seconds="${VERIFY_API_WARMUP_TIMEOUT_SECONDS:-45}"',
+            'verify_api_warmup_timeout_seconds="${VERIFY_API_WARMUP_TIMEOUT_SECONDS:-120}"',
             verifier,
         )
+        self.assertEqual(benchmark.API_WARMUP_TIMEOUT_SECONDS, 120.0)
         self.assertLess(verifier.index(warmup_call), verifier.index(timed_call))
         self.assertIn("performance-warmup.json", verifier)
         self.assertIn("payload['total'] > 0", verifier)
@@ -1013,7 +1130,7 @@ class ConfigurationTests(unittest.TestCase):
             {
                 "REALISTIC_API_SAMPLES": "20",
                 "REALISTIC_API_WINDOW": "24h",
-                "REALISTIC_API_WARMUP_TIMEOUT_SECONDS": "45",
+                "REALISTIC_API_WARMUP_TIMEOUT_SECONDS": "120",
                 "REALISTIC_SERVER_ID": "7",
             },
             clear=False,
@@ -1024,7 +1141,7 @@ class ConfigurationTests(unittest.TestCase):
 
         self.assertEqual(len(requested), 22)
         self.assertEqual(requested[0][1], 5.0)
-        self.assertEqual(requested[1][1], 45.0)
+        self.assertEqual(requested[1][1], 120.0)
         self.assertTrue(all(timeout == 5.0 for _, timeout in requested[2:]))
         self.assertTrue(
             all("window=24h" in url for url, _ in requested[1:])
@@ -1034,7 +1151,7 @@ class ConfigurationTests(unittest.TestCase):
             'REALISTIC_API_WINDOW="${REALISTIC_API_WINDOW:-24h}"', verifier
         )
         self.assertIn(
-            'REALISTIC_API_WARMUP_TIMEOUT_SECONDS="${REALISTIC_API_WARMUP_TIMEOUT_SECONDS:-45}"',
+            'REALISTIC_API_WARMUP_TIMEOUT_SECONDS="${REALISTIC_API_WARMUP_TIMEOUT_SECONDS:-120}"',
             verifier,
         )
         self.assertIn("${REALISTIC_MAX_API_P95_SECONDS:-2.0}", verifier)
@@ -1237,6 +1354,103 @@ class ConfigurationTests(unittest.TestCase):
                 mock.Mock(), context, 1, endpoint="query-detail"
             )
 
+    def test_full_acceptance_helper_streams_web_explain_and_multiline_csv(self) -> None:
+        tag = "advisor-erp:erp_entity_0001:point-read"
+        output = io.StringIO()
+
+        class Response(io.BytesIO):
+            def __init__(self, body: bytes, content_type: str) -> None:
+                super().__init__(body)
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        csv_buffer = io.StringIO(newline="")
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["server_id", "database_id", "query_id", "sql"])
+        for index in range(205):
+            sql_text = "SELECT 'line one\nline two'" if index == 204 else f"SELECT {index}"
+            writer.writerow([7, 19, index, sql_text])
+        csv_body = csv_buffer.getvalue().encode()
+
+        def urlopen(request, *, timeout):
+            self.assertEqual(timeout, 30.0)
+            url = request if isinstance(request, str) else request.full_url
+            if url == "http://web/":
+                return Response(b'<div id="root"></div><script src="/assets/app-123456.js"></script><link href="/assets/app-123456.css">', "text/html")
+            if url.endswith(".js"):
+                return Response(b"console.log('ok')", "application/javascript")
+            if url.endswith(".css"):
+                return Response(b"body{}", "text/css")
+            if url.endswith("/api/v1/health"):
+                return Response(json.dumps({"status": "healthy", "repository": "healthy"}).encode(), "application/json")
+            if "/api/v1/queries?" in url:
+                if "search=" in url:
+                    item = {"queryId": "-42", "serverId": 7, "databaseId": 19, "sql": f"SELECT id WHERE id=$1 /* {tag} */"}
+                    return Response(json.dumps({"items": [item], "total": 1}).encode(), "application/json")
+                return Response(json.dumps({"items": [], "total": 205}).encode(), "application/json")
+            if "/explain-analyze?" in url:
+                return Response(json.dumps({"status": "RUNTIME_VALIDATED"}).encode(), "application/json")
+            if "/export/queries.csv?" in url:
+                self.assertEqual(request.headers.get("Authorization"), "Bearer adv_pat_v1_" + "a" * 43)
+                return Response(csv_body, "text/csv; charset=utf-8")
+            self.fail(f"unexpected URL: {url}")
+
+        with mock.patch.object(sys, "argv", ["full-probe", "7", "10", "30", "201"]), mock.patch.object(
+            sys, "stdin", io.StringIO(json.dumps({"token": "adv_pat_v1_" + "a" * 43}))
+        ), mock.patch("urllib.request.urlopen", side_effect=urlopen), contextlib.redirect_stdout(output):
+            exec(benchmark.FULL_ACCEPTANCE_PROBE_SCRIPT, {})
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["web"]["assetCount"], 2)
+        self.assertEqual(payload["sourceExplain"]["queryId"], "-42")
+        self.assertEqual(payload["scopedQueryTotalBeforeExport"], 205)
+        self.assertEqual(payload["csvExport"]["records"], 205)
+        self.assertEqual(payload["csvExport"]["bytes"], len(csv_body))
+
+    def test_full_acceptance_secret_uses_stdin_and_never_enters_result_or_argv(self) -> None:
+        token = "adv_pat_v1_" + "b" * 43
+        payload = full_acceptance_payload()
+        runner = mock.Mock()
+        runner.run.return_value = subprocess.CompletedProcess(["docker"], 0, json.dumps(payload), "")
+        context = benchmark.DockerContext("advisor-live", "/srv/compose.yaml", "a" * 12, "b" * 12, "c" * 12, "d" * 12, "erp-source", 7, 60, 30)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ADVISOR_API_TOKEN": token,
+                "ADVISOR_AUTH_PRINCIPALS": "raw-registry",
+                "SAFE_ENV": "kept",
+            },
+            clear=True,
+        ):
+            result = benchmark.capture_full_acceptance(runner, context, admin_token=token, query_wait_seconds=30, request_timeout_seconds=60, minimum_csv_records=201)
+        call = runner.run.call_args
+        self.assertNotIn(token, " ".join(call.args[0]))
+        self.assertEqual(json.loads(call.kwargs["input_text"]), {"token": token})
+        self.assertNotIn("ADVISOR_API_TOKEN", call.kwargs["env"])
+        self.assertNotIn("ADVISOR_AUTH_PRINCIPALS", call.kwargs["env"])
+        self.assertEqual(call.kwargs["env"]["SAFE_ENV"], "kept")
+        self.assertNotIn(token, json.dumps(result))
+
+    def test_full_acceptance_rejects_csv_truncated_below_scoped_inventory(self) -> None:
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "envanterinden eksik"):
+            benchmark.normalize_full_acceptance(
+                full_acceptance_payload(records=204, scoped_total=205)
+            )
+
+    def test_full_acceptance_rejects_malformed_unauthorized_or_interrupted_result(self) -> None:
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.normalize_full_acceptance({"enabled": True})
+        runner = mock.Mock()
+        runner.run.side_effect = benchmark.BenchmarkError("HTTP Error 401 / interrupted stream")
+        context = benchmark.DockerContext("advisor-live", "/srv/compose.yaml", "a" * 12, "b" * 12, "c" * 12, "d" * 12, "erp-source", 7, 60, 30)
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "401"):
+            benchmark.capture_full_acceptance(runner, context, admin_token="adv_pat_v1_" + "c" * 43, query_wait_seconds=30, request_timeout_seconds=60, minimum_csv_records=201)
+
     def test_threshold_defaults_are_relative_and_portable(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             result = benchmark.load_thresholds(
@@ -1282,6 +1496,13 @@ class ConfigurationTests(unittest.TestCase):
             os.environ, {"ERP_MIN_SOURCE_FREQUENCY_SECONDS": "0"}, clear=True
         ):
             self.assertEqual(benchmark.require_source_frequency(5), 0)
+
+    def test_full_acceptance_duration_reserves_cadence_probe_and_grace(self) -> None:
+        self.assertEqual(
+            benchmark.require_full_acceptance_duration(600, 60, 120.0, 180.0), 390
+        )
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "en az 390s"):
+            benchmark.require_full_acceptance_duration(389, 60, 120.0, 180.0)
 
     def test_baseline_must_be_healthy_and_backlog_free(self) -> None:
         clean = snapshot()
@@ -1460,7 +1681,13 @@ class ConfigurationTests(unittest.TestCase):
         runner = RecordingRunner()
         with mock.patch.dict(
             os.environ,
-            {"REALISTIC_SKIP_BUILD": "false", "REALISTIC_SKIP_PREPARE": "true"},
+            {
+                "REALISTIC_SKIP_BUILD": "false",
+                "REALISTIC_SKIP_PREPARE": "true",
+                "ADVISOR_API_TOKEN": "raw-token",
+                "ADVISOR_AUTH_PRINCIPALS": "raw-registry",
+                "SAFE_ENV": "kept",
+            },
             clear=True,
         ):
             workload_env = benchmark.prepare_benchmark_environment(
@@ -1484,6 +1711,12 @@ class ConfigurationTests(unittest.TestCase):
         for _, call_env in runner.calls:
             self.assertEqual(call_env["COMPOSE_PROJECT_NAME"], "advisor-live")
             self.assertEqual(call_env["COMPOSE_FILE"], context.compose_file)
+            self.assertNotIn("ADVISOR_API_TOKEN", call_env)
+            self.assertNotIn("ADVISOR_AUTH_PRINCIPALS", call_env)
+            self.assertEqual(call_env["SAFE_ENV"], "kept")
+        self.assertNotIn("ADVISOR_API_TOKEN", workload_env)
+        self.assertNotIn("ADVISOR_AUTH_PRINCIPALS", workload_env)
+        self.assertEqual(workload_env["SAFE_ENV"], "kept")
         self.assertEqual(workload_env["REALISTIC_SKIP_BUILD"], "true")
         self.assertEqual(workload_env["REALISTIC_SKIP_PREPARE"], "true")
 
@@ -1758,7 +1991,7 @@ class BoundaryHandshakeTests(unittest.TestCase):
         self.assertLess(timeline.index("generator-end"), timeline.index("after"))
         self.assertLess(timeline.index("after"), timeline.index("postlude"))
         self.assertEqual(captured_reports[0]["workloadExitCode"], 7)
-        self.assertEqual(captured_reports[0]["schemaVersion"], 4)
+        self.assertEqual(captured_reports[0]["schemaVersion"], 5)
         self.assertIn("derivedMetrics", captured_reports[0])
         self.assertEqual(
             captured_reports[0]["derivedMetrics"]["powaMaintenance"][

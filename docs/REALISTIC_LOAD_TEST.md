@@ -94,7 +94,7 @@ Script sırasıyla şunları yapar:
 
 Post-load query-list doğrulaması, kapasite harness'ıyla aynı `24h` pencereyi
 varsayılan olarak kullanır. Standalone doğrulamada cache gerçekten soğuk
-olabileceği için ilk, süreye dahil edilmeyen warmup isteğinin timeout'u `45s`'dir;
+olabileceği için ilk, süreye dahil edilmeyen warmup isteğinin timeout'u `120s`'dir;
 sonraki ölçümlü istekler `5s` sınırını ve `2s` p95 kapısını korur. Gerekirse bu
 iki davranış host shell'inde `REALISTIC_API_WINDOW` (`1h`, `24h`, `7d`, `30d`) ve
 `REALISTIC_API_WARMUP_TIMEOUT_SECONDS` (`5..120`) ile değiştirilir; warmup
@@ -196,6 +196,11 @@ eşzamanlılık list/detail için `2`, overview için `1`; p95 tavanları `2s`, 
 `api.matrixErrorCount` ve `api.probePlan` matrisi additive olarak açıklar.
 Harness kapanışta query-metrics ve global-trend refresh etiketlerinin ikisini de
 izleyip repository işi stabil idle olmadan ölçüm sınırını kapatmaz.
+Release kabulünde `ERP_FULL_ACCEPTANCE=true` ve kayıtlı admin
+`ADVISOR_API_TOKEN` ile aynı 600 saniyelik ERP penceresinde web ingress, tek
+source EXPLAIN ve tam streaming CSV de hard gate olur. Token host environment'ından
+okunur ve container'a yalnız stdin ile taşınır. Ayrıntılar
+[ERP benchmark runbook'undadır](ERP_STACK_BENCHMARK.md#tam-release-kabulü).
 Bu rapordaki source container deltası workload, observer SQL ve sampler toplamıdır;
 saf observer overhead'i değildir. Tracker'ın görebildiği `powa_collector` ve
 `advisor_join_reader` alt kümesi ayrıca `observerOwnedSql` alanında yer alır.

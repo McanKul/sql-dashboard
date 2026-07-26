@@ -40,6 +40,36 @@ cgroup sayaçlarından sonra çalışır; böylece harness'ın kendi metric SQL 
 container CPU/I/O deltasına tek taraflı sızmaz. END marker'ında halen çalışan
 probe'lar önce tamamlanır, ardından final sayaçları alınır.
 
+## Tam release kabulü
+
+Varsayılan benchmark geriye uyumludur. Aşağıdaki opt-in yalnız `erp` profilinde
+web, source EXPLAIN ve tam CSV hard gate'lerini açar:
+
+```bash
+ERP_FULL_ACCEPTANCE=true ADVISOR_API_TOKEN="$ADVISOR_API_TOKEN" \
+  bash scripts/benchmark-erp-stack.sh run erp 600 32
+```
+
+Admin principal API'de önceden kayıtlı olmalıdır. Raw token host benchmark
+process environment'ından okunur; container argv/environment, rapor veya
+dosyaya girmeden `docker exec -i` stdin'ine geçer.
+İlk collector snapshot ilerlemesinden sonra normal API ve resource monitorleri
+çalışmaya devam ederken web root, ilk hashed JS/CSS assetleri ve Nginx health
+yolu okunur. Sonra exact tagged `advisor-erp:erp_entity_0001:point-read` sorgusu
+`[1]` bind'iyle source üzerinde bir kez çalıştırılır ve aynı server/database
+kapsamındaki CSV tamamen stream edilip tüketilir. Source EXPLAIN fan-out yoktur.
+
+EXPLAIN ve CSV zamanlarının birbirleriyle ve workload penceresiyle çakışması
+raporda kanıtlanır. CSV `>200` veri satırına ek olarak export öncesi scoped
+query envanterinin tamamını içermeli; ilk-byte ve toplam süre sınırlarını da
+geçmelidir. EXPLAIN ise `sourceExecuted=true`, `sourceDdlExecuted=false`,
+rollback ve gerçek `Plan` kökü olmadan koşu geçmez. Web probe sunum ve
+reverse-proxy yolunu doğrular; browser render testi değildir.
+
+Bu mod gerçek kaynak yükü üretir. ERP seed'i fixture tabloları, milyonlarca
+satır, grant/index düzenlemeleri ve managed write/delete trafiği oluşturur.
+Üretim source'unda çalıştırmayın.
+
 ## Çalıştırma
 
 Ana stack sağlıklıyken önerilen kapasite kabulü 500 tablo ve tam 4.000 bounded
@@ -216,7 +246,7 @@ yükünün kabul edildiğini iddia etmeyin.
 
 ## Ölçülen alanlar
 
-Schema version `4` raporunda her hedef için `before`, `after` ve `delta`
+Schema version `5` raporunda her hedef için `before`, `after` ve `delta`
 bulunur:
 
 - `measurementBoundary` içinde start/end ready/continue ve wrapper bitiş
@@ -254,6 +284,8 @@ bulunur:
   additive `api.byEndpoint`, bütün matris hatalarını toplayan
   `api.matrixErrorCount` ve rotation/delay/detail-selection bilgisini taşıyan
   `api.probePlan`
+- Opt-in `fullAcceptance`: web, source EXPLAIN, tam CSV metrikleri ve zaman
+  çakışma kanıtı; kapalı modda `enabled=false`
 - Source JOIN outbox batch/row/oldest-age/largest-batch/storage backlog'u
 - Repository JOIN retention süresini aşmış batch/row purge borcu
 
@@ -267,8 +299,8 @@ kontrol edilir.
 
 ### Türetilmiş kapasite metrikleri ve PoWA bakım sınıfı
 
-Schema version `4` korunur; yeni okuyucular additive `derivedMetrics` alanını,
-eski okuyucular mevcut `before`/`after`/`delta` alanlarını kullanabilir.
+Schema version `5`, tam kabulün daha güçlü `PASSED` semantiğini sürümler. Eski
+okuyucular mevcut `before`/`after`/`delta` ve `api` alanlarını kullanabilir.
 `derivedMetrics.source.containerIo` ve
 `derivedMetrics.repository.containerIo` içinde şu hızlar bulunur:
 
@@ -354,7 +386,7 @@ Donanımdan bağımsız varsayılanlar şunları zorunlu tutar:
   `2s`; overview concurrency `1` ile p95 `8s` altında kalmalı. Herhangi bir
   endpoint'teki hata ortak matrix error tavanına dahil edilmeli.
 - Ölçüm başlamadan önce her kullanılabilir endpoint için yapılan tek soğuk
-  cache/connection ısındırma isteğinin 45 saniyelik ayrı timeout'u vardır; bu
+  cache/connection ısındırma isteğinin 120 saniyelik ayrı timeout'u vardır; bu
   süreler p95'e katılmaz. Ölçüm penceresindeki her istek 15 saniyede fail-closed
   olur. Query-metrics ve global-trend arka plan refresh'leri ile scoped detail
   trendi ve collector-health'in canlı repository maliyeti container CPU/I/O
@@ -401,6 +433,14 @@ gate uygulama şeklindedir. CI veya kapasite ortamında en az üç koşunun medy
 | `ERP_MAX_API_DETAIL_P95_SECONDS` | `2` | Yük altı seçilmiş query-detail/trend API p95 tavanı |
 | `ERP_MIN_API_SAMPLES` | `5` | Minimum başarılı query-list API örneği; endpoint p95 kapıları ayrıca gerçek overview/detail örneği ister |
 | `ERP_MAX_API_ERRORS` | `0` | Bütün endpoint matrisi için izin verilen toplam probe hatası |
+| `ERP_FULL_ACCEPTANCE` | `false` | Web + source EXPLAIN + tam CSV release kapılarını açar; yalnız `erp` |
+| `ERP_FULL_ACCEPTANCE_TIMEOUT_SECONDS` | `180` | Tam kabul toplam üst sınırı; `30..310` |
+| `ERP_FULL_QUERY_WAIT_SECONDS` | `120` | Persisted tagged sorguyu bekleme payı; `5..300` |
+| `ERP_MAX_FULL_WEB_SECONDS` | `10` | Root, ilk assetler ve proxied health toplam tavanı |
+| `ERP_MAX_SOURCE_EXPLAIN_SECONDS` | `130` | Tek source EXPLAIN HTTP tavanı |
+| `ERP_MAX_CSV_EXPORT_SECONDS` | `180` | Tam CSV tüketim tavanı |
+| `ERP_MAX_CSV_FIRST_BYTE_SECONDS` | `30` | CSV ilk-byte tavanı |
+| `ERP_MIN_CSV_EXPORT_RECORDS` | `201` | Export hazırlık tabanı; tamlık ayrıca export öncesi scoped envantere göre doğrulanır |
 | `ERP_MAX_JOIN_OUTBOX_BATCHES` | `100` | Source outbox batch tavanı |
 | `ERP_MAX_JOIN_OUTBOX_ROWS` | `1000000` | Source outbox toplam satır tavanı |
 | `ERP_MAX_JOIN_OUTBOX_LARGEST_BATCH_ROWS` | `250000` | En büyük outbox batch satır tavanı |

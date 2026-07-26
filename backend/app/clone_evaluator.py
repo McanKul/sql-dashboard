@@ -22,6 +22,8 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.version import APPLICATION_VERSION
+
 from app.conninfo import resolve_conninfo
 
 
@@ -2050,7 +2052,7 @@ def _authorized(token: str | None) -> None:
 
 app = FastAPI(
     title="PostgreSQL Advisor Disposable Clone Evaluator",
-    version="1.0.0-iteration-2.7",
+    version=APPLICATION_VERSION,
     description="Internal, isolated read-only query and real-index EXPLAIN ANALYZE evaluator.",
 )
 _evaluation_slots = asyncio.Semaphore(1)
@@ -2089,10 +2091,13 @@ async def _run_serialized_evaluation(
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    settings = get_clone_evaluator_settings()
     if _evaluation_slots.locked():
         return {
             "status": "healthy",
             "busy": True,
+            "sourceAlias": settings.clone_source_alias,
+            "sourceDatabaseName": settings.clone_template_database,
             "validationClone": True,
             "readOnlySelectOnly": True,
             "sourceDdlExecuted": False,

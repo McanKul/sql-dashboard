@@ -1,4 +1,6 @@
 import type {
+  CapabilityMatrixData,
+  DatabaseOptimizeData,
   OverviewStats,
   QueryDetail,
   QuerySummary,
@@ -219,6 +221,7 @@ export const demoOverview: OverviewStats = {
     { queryId: 'q-7f21a', title: 'Sipariş geçmişi ve müşteri özeti', averageMs: 428, loadPercent: 14.2 },
     { queryId: 'q-11b2f', title: 'Kampanya hedef kitle seçimi', averageMs: 2480, loadPercent: 9.8 },
   ],
+  topQueries: demoQueries.filter((query) => query.serverId === 1 && query.databaseId === 16384).slice(0, 4),
 }
 
 export const demoQueryDetails: Record<string, QueryDetail> = Object.fromEntries(
@@ -372,4 +375,31 @@ export const demoHealth: SystemHealth = {
     { key: 'deadTuple', label: 'Dead tuple', available: true, source: 'PoWA pg_stat_all_tables' },
     { key: 'autovacuum', label: 'Autovacuum', available: true, source: 'PoWA pg_stat_all_tables' },
   ],
+}
+
+const demoCapabilityItems: CapabilityMatrixData['items'][number]['capabilities'] = [
+  ['historicalMetrics', 'Historical metrics'], ['cpuMetrics', 'CPU metrics'], ['waitSampling', 'Wait sampling'],
+  ['predicateMetrics', 'Predicate metrics'], ['joinSnapshot', 'JOIN snapshot'], ['hypopg', 'HypoPG'],
+  ['sourceExplain', 'Source EXPLAIN'], ['cloneValidation', 'Clone validation'],
+].map(([key, label]) => ({ key: key as CapabilityMatrixData['items'][number]['capabilities'][number]['key'], label, status: 'AVAILABLE', configured: true, healthy: true, dataAvailable: true, available: true, reasonCode: 'AVAILABLE', reason: 'Kullanılabilir.' }))
+
+export const demoCapabilities: CapabilityMatrixData = {
+  window: '24h',
+  items: [{ serverId: 1, serverAlias: 'demo-source', databaseId: 16384, databaseName: 'commerce', capabilities: demoCapabilityItems }],
+}
+
+export const demoDatabaseOptimize: DatabaseOptimizeData = {
+  window: '24h',
+  scope: { serverId: 1, databaseId: 16384 },
+  summary: { candidateGroups: 1, affectedQueries: 1, affectedLoadMs: 7_883_760, validatedGroups: 0 },
+  items: [{
+    groupId: 'demo-orders-status-customer', serverId: 1, serverAlias: 'demo-source', databaseId: 16384, databaseName: 'commerce', relationId: 16400,
+    schemaName: 'public', tableName: 'orders', method: 'btree', columns: ['status', 'customer_id'], confidence: 'HIGH',
+    createIndexSql: 'CREATE INDEX CONCURRENTLY "idx_advisor_orders_demo" ON "public"."orders" USING btree ("status", "customer_id");',
+    representative: { candidateId: '11111111-1111-4111-8111-111111111111', queryId: '520730' }, affectedQueryCount: 1, affectedQueryIds: ['520730'], affectedLoadMs: 7_883_760,
+    evidence: { joinOccurrences: 1842, filterOccurrences: 1842, sampleCount: 120, observedFrom: '2026-07-22T09:43:00Z', observedTo: '2026-07-22T10:43:00Z' },
+    existingIndex: { status: 'NOT_CHECKED', reason: 'Canlı katalog kontrolü bekleniyor.' }, hypopg: { status: 'NOT_EVALUATED', reason: 'Henüz doğrulanmadı.' },
+    maintenanceCost: { writeRows: 9200, writesPerHour: 383, risk: 'MEDIUM', walBytesEstimate: null, reason: 'WAL tahmini mevcut değil.' },
+  }],
+  page: 1, pageSize: 50, total: 1,
 }

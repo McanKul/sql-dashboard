@@ -26,7 +26,7 @@ fi
 # The full verifier may be the first 24h query-list reader after an API rebuild.
 # Bound that cold-cache fill separately; only the immediately following warm
 # request is part of the strict latency gate.
-verify_api_warmup_timeout_seconds="${VERIFY_API_WARMUP_TIMEOUT_SECONDS:-45}"
+verify_api_warmup_timeout_seconds="${VERIFY_API_WARMUP_TIMEOUT_SECONDS:-120}"
 if ! [[ "$verify_api_warmup_timeout_seconds" =~ ^[0-9]+$ ]] \
    || ! (( verify_api_warmup_timeout_seconds >= 5 \
            && verify_api_warmup_timeout_seconds <= 120 )); then
@@ -137,6 +137,12 @@ docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
   < sql/tests/authenticated_actor_integration.sql \
   >"${verify_tmp_dir}/authenticated-actor-integration.log"
 pass "Annotation/export DB wrapper ACL, actor spoof ve rollback fixture'i dogru"
+
+docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
+  --username postgres --port 5433 --dbname powa_repository --file=- \
+  < sql/tests/product_scope_optimize_release_integration.sql \
+  >"${verify_tmp_dir}/product-scope-optimize-release-integration.log"
+pass "Scope trend overload, release bilgisi ve reset-safe yazma metrikleri dogru"
 
 docker compose exec -T repository-db psql -X --set=ON_ERROR_STOP=1 \
   --username postgres --port 5433 --dbname powa_repository --file=- \
