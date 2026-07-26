@@ -863,14 +863,18 @@ GRANT USAGE ON SCHEMA public
 
 REVOKE ALL PRIVILEGES ON SCHEMA advisor_erp
   FROM PUBLIC, advisor_workload_reader, advisor_workload_writer,
-       advisor_workload_reporter, advisor_workload_login;
+       advisor_workload_reporter, advisor_workload_login, advisor_evaluator;
 GRANT USAGE ON SCHEMA advisor_erp
-  TO advisor_workload_reader, advisor_workload_reporter;
+  TO advisor_workload_reader, advisor_workload_reporter, advisor_evaluator;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA advisor_erp
   FROM PUBLIC, advisor_workload_reader, advisor_workload_writer,
-       advisor_workload_reporter, advisor_workload_login;
+       advisor_workload_reporter, advisor_workload_login, advisor_evaluator;
 GRANT SELECT ON ALL TABLES IN SCHEMA advisor_erp
-  TO advisor_workload_reader, advisor_workload_reporter;
+  TO advisor_workload_reader, advisor_workload_reporter, advisor_evaluator;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA advisor_erp
+  REVOKE ALL ON TABLES FROM advisor_evaluator;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA advisor_erp
+  GRANT SELECT ON TABLES TO advisor_evaluator;
 
 -- Reconcile privilege drift on every idempotent seed before granting the exact
 -- read envelope.  Reader/reporter roles never need DML or sequence access.
@@ -1089,6 +1093,7 @@ BEGIN
 
     IF NOT has_schema_privilege('advisor_workload_reader', 'advisor_erp', 'USAGE')
        OR NOT has_schema_privilege('advisor_workload_reporter', 'advisor_erp', 'USAGE')
+       OR NOT has_schema_privilege('advisor_evaluator', 'advisor_erp', 'USAGE')
        OR has_schema_privilege('advisor_workload_writer', 'advisor_erp', 'USAGE') THEN
         RAISE EXCEPTION 'ERP schema role envelope is invalid';
     END IF;
@@ -1106,16 +1111,19 @@ BEGIN
               OR NOT has_table_privilege(
                   'advisor_workload_reporter', relation.oid, 'SELECT'
               )
+              OR NOT has_table_privilege(
+                  'advisor_evaluator', relation.oid, 'SELECT'
+              )
           )
     ) THEN
-        RAISE EXCEPTION 'ERP reader/reporter is missing SELECT privilege';
+        RAISE EXCEPTION 'ERP reader/reporter/evaluator is missing SELECT privilege';
     END IF;
 
     IF EXISTS (
         SELECT 1
         FROM unnest(ARRAY[
             'advisor_workload_reader', 'advisor_workload_reporter',
-            'advisor_workload_writer'
+            'advisor_workload_writer', 'advisor_evaluator'
         ]) AS role_name
         CROSS JOIN LATERAL (
             SELECT relation.oid

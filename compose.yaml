@@ -255,10 +255,12 @@ services:
       EVALUATOR_URL: http://evaluator:8010
       EVALUATOR_TOKEN: ${EVALUATOR_TOKEN:-advisor-dev-evaluator-token}
       EVALUATOR_TIMEOUT_SECONDS: ${EVALUATOR_TIMEOUT_SECONDS:-4}
+      SOURCE_EXPLAIN_TIMEOUT_SECONDS: ${SOURCE_EXPLAIN_TIMEOUT_SECONDS:-130}
       CLONE_EVALUATOR_URL: http://clone-evaluator:8020
       CLONE_EVALUATOR_TOKEN: ${CLONE_EVALUATOR_TOKEN:-advisor-dev-clone-evaluator-token}
       CLONE_EVALUATOR_TIMEOUT_SECONDS: ${CLONE_EVALUATOR_TIMEOUT_SECONDS:-90}
-      # Bos registry annotation/export/runtime endpointlerini fail-closed tutar.
+      # Bos registry annotation/export ve gercek-index clone runtime yolunu
+      # fail-closed tutar. Source EXPLAIN loopback tek-kullanici yoludur.
       # Yalniz token SHA-256 hashleri API ortaminda saklanir.
       ADVISOR_AUTH_PRINCIPALS: '${ADVISOR_AUTH_PRINCIPALS:-[]}'
     ports:
@@ -301,6 +303,9 @@ services:
       EVALUATOR_STATEMENT_TIMEOUT_MS: ${EVALUATOR_STATEMENT_TIMEOUT_MS:-2000}
       EVALUATOR_LOCK_TIMEOUT_MS: ${EVALUATOR_LOCK_TIMEOUT_MS:-250}
       EVALUATOR_MIN_IMPROVEMENT_PERCENT: ${EVALUATOR_MIN_IMPROVEMENT_PERCENT:-10}
+      EVALUATOR_RUNTIME_STATEMENT_TIMEOUT_MS: ${EVALUATOR_RUNTIME_STATEMENT_TIMEOUT_MS:-120000}
+      EVALUATOR_RUNTIME_LOCK_TIMEOUT_MS: ${EVALUATOR_RUNTIME_LOCK_TIMEOUT_MS:-5000}
+      EVALUATOR_RUNTIME_TRANSACTION_TIMEOUT_MS: ${EVALUATOR_RUNTIME_TRANSACTION_TIMEOUT_MS:-125000}
     depends_on:
       source-db:
         condition: service_healthy

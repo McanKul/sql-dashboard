@@ -175,7 +175,7 @@ describe('advisor API contracts', () => {
     expect(data).toMatchObject({ status: 'VALIDATED', ddlExecuted: false, candidate: { columns: ['status'], copyable: true } })
   })
 
-  it('requests disposable-clone EXPLAIN ANALYZE with identifiers and scalar binds only', async () => {
+  it('requests source-database EXPLAIN ANALYZE with identifiers and scalar binds only', async () => {
     const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit) => {
       expect(String(input)).toContain('/queries/-42/explain-analyze?window=7d')
       expect(init?.method).toBe('POST')
@@ -184,11 +184,11 @@ describe('advisor API contracts', () => {
         status: 'RUNTIME_VALIDATED', reasonCode: 'READ_ONLY_QUERY_ANALYZED', message: 'Clone üzerinde ölçüldü.', queryId: '-42',
         validation: {
           mode: 'EXPLAIN_ANALYZE', statementClass: 'READ_ONLY_SELECT', planPreflight: 'READ_ONLY', transactionReadOnly: true,
-          runnerPolicyRevision: 1, postgresVersion: '18.4', executionTimeMs: 4.2, planningTimeMs: .3,
+          safetyPolicyRevision: 1, postgresVersion: '18.4', executionRole: 'advisor_explain', databaseId: 2, executionTimeMs: 4.2, planningTimeMs: .3,
           sharedHitBlocks: 12, sharedReadBlocks: 1, tempReadBlocks: 0, tempWrittenBlocks: 0,
           walRecords: 0, walBytes: 0, plan: { Plan: { 'Node Type': 'Index Scan' } }, evaluatedAt: '2026-07-26T14:00:00Z',
         },
-        executionTarget: 'DISPOSABLE_CLONE', sourceDdlExecuted: false, cloneDdlExecuted: false, cloneDestroyed: true,
+        executionTarget: 'SOURCE_DATABASE', sourceExecuted: true, sourceDdlExecuted: false, transactionRolledBack: true,
       }))
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -196,8 +196,8 @@ describe('advisor API contracts', () => {
     const { data } = await advisorApi.explainAnalyzeQuery('1:2:-42', '7d', ['paid', 100, true, null])
 
     expect(data).toMatchObject({
-      status: 'RUNTIME_VALIDATED', queryId: '-42', executionTarget: 'DISPOSABLE_CLONE',
-      sourceDdlExecuted: false, cloneDdlExecuted: false, cloneDestroyed: true,
+      status: 'RUNTIME_VALIDATED', queryId: '-42', executionTarget: 'SOURCE_DATABASE',
+      sourceExecuted: true, sourceDdlExecuted: false, transactionRolledBack: true,
       validation: { executionTimeMs: 4.2, statementClass: 'READ_ONLY_SELECT', transactionReadOnly: true },
     })
   })
@@ -207,7 +207,7 @@ describe('advisor API contracts', () => {
       expect(JSON.parse(String(init?.body))).toEqual({ serverId: 1, databaseId: 2, bindValues: [] })
       return Promise.resolve(jsonResponse({
         status: 'UNAVAILABLE', reasonCode: 'CLONE_OFFLINE', message: 'Clone kapalı.', queryId: '-42', validation: null,
-        executionTarget: 'DISPOSABLE_CLONE', sourceDdlExecuted: false, cloneDdlExecuted: false, cloneDestroyed: true,
+        executionTarget: 'SOURCE_DATABASE', sourceExecuted: null, sourceDdlExecuted: false, transactionRolledBack: null,
       }))
     })
     vi.stubGlobal('fetch', fetchMock)

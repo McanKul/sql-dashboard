@@ -7,7 +7,7 @@ describe('browser privilege boundary', () => {
   it('launches query analysis without sending SQL or an index candidate', async () => {
     const fetchMock = vi.fn((_input: string | URL | Request, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({
       status: 'UNSAFE', reasonCode: 'SELECT_ONLY', message: 'Yalnız SELECT.', queryId: '-42', validation: null,
-      executionTarget: 'DISPOSABLE_CLONE', sourceDdlExecuted: false, cloneDdlExecuted: false, cloneDestroyed: true,
+      executionTarget: 'SOURCE_DATABASE', sourceExecuted: false, sourceDdlExecuted: false, transactionRolledBack: true,
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
     vi.stubGlobal('fetch', fetchMock)
 

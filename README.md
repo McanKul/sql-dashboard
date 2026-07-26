@@ -20,9 +20,11 @@ chmod 600 .env
 ```
 
 `.env` içindeki PostgreSQL ve iç servis secret örneklerini değiştirin. Annotation,
-CSV ve runtime endpoint'leri için raw token'ı secret manager'da tutup yalnız
-hash registry'sini `ADVISOR_AUTH_PRINCIPALS` olarak yapılandırın; raw token'ı
-frontend build/env dosyasına koymayın. Credential üretimi ve rol modeli
+CSV ve gerçek-index clone runtime endpoint'i için raw token'ı secret manager'da
+tutup yalnız hash registry'sini `ADVISOR_AUTH_PRINCIPALS` olarak yapılandırın;
+raw token'ı frontend build/env dosyasına koymayın. Dashboard source EXPLAIN yolu
+tek-kullanıcılı loopback kurulumda açıktır; web/API portunu dışa açmadan önce
+gerçek auth ve rate limit ekleyin. Credential üretimi ve rol modeli
 [kimlik doğrulama belgesindedir](docs/AUTHENTICATION.md). Ardından:
 
 ```bash
@@ -83,7 +85,7 @@ bash scripts/verify-real-validation.sh
 (demo varsayılanı `test-source`). Evaluator hem request kimliğini hem clone
 manifestindeki alias/database bağını doğrulamadan job database oluşturmaz.
 
-İkinci script dashboard'ın fixture'sız tek-sorgu EXPLAIN ANALYZE yolunu da çalıştırır; ardından demo eşitlik sorgusu için audit metadatalı sentetik replay fixture'ı kaydeder, gerçek indexin yalnız disposable candidate clone'da kullanıldığını, kaynağın değişmediğini ve bütün job database'lerin temizlendiğini doğrular.
+İkinci script dashboard'ın fixture'sız tek-sorgu EXPLAIN ANALYZE yolunu gerçek source üzerinde çalıştırıp read-only/OID/rol/rollback sözleşmesini doğrular; ardından demo eşitlik sorgusu için audit metadatalı sentetik replay fixture'ı kaydeder, gerçek indexin yalnız disposable candidate clone'da kullanıldığını, kaynak DDL/index durumunun değişmediğini ve bütün job database'lerin temizlendiğini kanıtlar.
 
 ## Erişim adresleri
 
@@ -199,7 +201,7 @@ Altyapı ve ilk ürün adımı tamamlandı: PostgreSQL 18 image'ı sabitlenmiş 
 
 HypoPG 1.4.3 kaynak PostgreSQL 18 image'ına sabitlendi ve ayrı, salt-okunur `evaluator` servisine bağlandı. Uygun tek kolonlu WHERE veya persisted iki kolonlu composite aday için aynı kaynak oturumunda önce normal, sonra sanal B-tree index ile plain `EXPLAIN` planı alınır. Sanal index seçilir ve planner-cost eşiği aşılırsa maliyet farkı, tahmini boyut, güven seviyesi ve kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı gösterilir.
 
-Kapsam tek statement `SELECT`/`WITH`, en fazla iki kolonlu B-tree adayı ve yapılandırılmış `test-source/appdb` hedefidir. HypoPG tarafında `EXPLAIN ANALYZE` veya gerçek DDL yoktur ve `ddlExecuted=false` kalır. Gerçek çalışma yalnız ayrı clone profilindedir. Collector'a dış kaynak eklemek o kaynağı otomatik evaluator kapsamına almaz. Temel güvenlik modeli [İterasyon 2.2](docs/ITERATION_2_2_HYPOPG.md), composite/clone uzantısı [2.5–2.7 belgesindedir](docs/ITERATIONS_2_5_TO_2_7.md).
+Kapsam tek statement `SELECT`/`WITH`, en fazla iki kolonlu B-tree adayı ve yapılandırılmış `test-source/appdb` hedefidir. HypoPG tarafında `EXPLAIN ANALYZE` veya gerçek DDL yoktur ve `ddlExecuted=false` kalır. HypoPG adayının gerçek-index baseline/candidate karşılaştırması yalnız ayrı clone profilindedir; bağımsız sorgu ölçümü ise aşağıda açıklanan read-only kaynak yolunu kullanır. Collector'a dış kaynak eklemek o kaynağı otomatik evaluator kapsamına almaz. Temel güvenlik modeli [İterasyon 2.2](docs/ITERATION_2_2_HYPOPG.md), composite/clone uzantısı [2.5–2.7 belgesindedir](docs/ITERATIONS_2_5_TO_2_7.md).
 
 ## İterasyon 2.3 — `pg_stat_kcache` gerçek CPU telemetrisi
 
@@ -215,11 +217,11 @@ PoWA'nın taşımadığı kolon-kolon JOIN kayıtları, `pg_qualstats` reset'iyl
 
 JOIN eşitliği ile aynı tablodaki WHERE equality/range kanıtı en az iki snapshot ve asgari occurrence eşiklerini geçtiğinde iki kolonlu B-tree adayı oluşur. Equality/range kuralı kolon sırasını açıklar; mevcut index prefix'i ve planner faydası canlı kaynakta salt-okunur HypoPG evaluator tarafından doğrulanır. Bu kanıt da ana inceleme skoruna katılmaz.
 
-Gerçek çalışma testi varsayılan olarak kapalıdır. `real-validation` profili tmpfs üzerinde clone template'ten ayrı baseline/candidate veritabanları üretir, gerçek indexi yalnız candidate clone'da kurar ve dönüşümlü `EXPLAIN ANALYZE` medianlarını karşılaştırır. Çalıştırılabilir kapsam tek bir salt-okunur `SELECT`tir; `WITH` yalnız final komutu `SELECT` olan ve DML/DDL token'ı taşımayan tek statement kapsamında kabul edilir. Yapısal lexical/statement kapısı multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row lock ve açık denylist'teki yan etkili routine adlarını ANALYZE'dan önce reddeder. Bu kapı bütün routine'leri volatility açısından sınıflandırmaz: aktif runner attestation'ı volatile/security-definer routine ve procedure'lere `EXECUTE` verilmediğini ayrıca kanıtlar. Ardından PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) plan preflight'ı `ModifyTable`, `LockRows`, `Foreign Scan` veya `Custom Scan` düğümü bulunmadığını doğrulamadan gerçek çalışma başlamaz; her runner transaction'ı koşulsuz rollback edilir.
+Gerçek-index baseline/candidate çalışma testi varsayılan olarak kapalıdır. `real-validation` profili tmpfs üzerinde clone template'ten ayrı baseline/candidate veritabanları üretir, gerçek indexi yalnız candidate clone'da kurar ve dönüşümlü `EXPLAIN ANALYZE` medianlarını karşılaştırır. Çalıştırılabilir kapsam tek bir salt-okunur `SELECT`tir; `WITH` yalnız final komutu `SELECT` olan ve DML/DDL token'ı taşımayan tek statement kapsamında kabul edilir. Yapısal lexical/statement kapısı multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row lock ve açık denylist'teki yan etkili routine adlarını ANALYZE'dan önce reddeder. Bu kapı bütün routine'leri volatility açısından sınıflandırmaz: aktif runner attestation'ı volatile/security-definer routine ve procedure'lere `EXECUTE` verilmediğini ayrıca kanıtlar. Ardından PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) plan preflight'ı `ModifyTable`, `LockRows`, `Foreign Scan` veya `Custom Scan` düğümü bulunmadığını doğrulamadan gerçek çalışma başlamaz; her runner transaction'ı koşulsuz rollback edilir.
 
-Sorgu detayındaki **Clone'da EXPLAIN ANALYZE** paneli, composite aday veya HypoPG şartı olmadan repository'deki herhangi bir persisted sorguyu tek disposable job database'de bir kez çalıştırır. Browser SQL gönderemez; backend exact sorguyu repository'den alır. Parametreli sorguda kullanıcı en fazla 16 JSON scalar bind değeri girer; değerler yalnız bu istek boyunca bellekte taşınır, repository'ye kaydedilmez ve kaynakta çalıştırılmaz. Gerçek index karşılaştırmasının parametreli replay yolu ise exact query/candidate kimliğine bağlı, süreli ve audit metadatalı server-side sentetik/anonim fixture kullanmaya devam eder.
+Sorgu detayındaki **Ana DB'de EXPLAIN ANALYZE** paneli, composite aday veya HypoPG şartı olmadan repository'deki herhangi bir persisted sorguyu gerçek kaynak verisi ve cache durumu üzerinde bir kez çalıştırır. Browser SQL gönderemez; backend exact sorguyu repository'den alır. Parametreli sorguda kullanıcı en fazla 128 JSON scalar bind değeri (`64 KiB`) girer; değerler yalnız bu istek boyunca bellekte taşınır ve repository'ye kaydedilmez. Çalışma ayrı `advisor_evaluator` rolüyle, plain-plan preflight sonrası explicit `READ ONLY` transaction içinde yapılır ve rollback edilir. PostgreSQL `EXPLAIN ANALYZE` sorguyu gerçekten yürüttüğü için kaynak yükü gerçektir; yalnız salt-okunur `SELECT` kabul edilir. Gerçek index karşılaştırmasının parametreli replay yolu ise exact query/candidate kimliğine bağlı, süreli ve audit metadatalı server-side sentetik/anonim fixture ile disposable clone kullanmaya devam eder.
 
-Clone template manifestinde beklenen runner policy revision'ı ve dangerous-routine hardening kanıtı doğrulanır; gerçek rol/ACL durumu job database'deki her runner transaction'ında yeniden ölçülür. Eksik, eski veya uyuşmayan herhangi bir kapı fail-closed sonuç üretir. Kaynak ağı/DSN'i clone evaluator'a verilmez, kaynakta hiçbir replay veya DDL çalışmaz ve her cevap `sourceDdlExecuted=false` ile clone cleanup durumunu taşır. Kurulum ve güvenlik sınırları [2.5–2.7 runbook'undadır](docs/ITERATIONS_2_5_TO_2_7.md).
+Clone template manifesti ve dangerous-routine hardening kanıtı yalnız gerçek-index baseline/candidate karşılaştırmasında geçerlidir; bu yol kaynakta hâlâ hiçbir replay veya DDL çalıştırmaz. Doğrudan sorgu ölçümünde ise source DSN yalnız `evaluator` servisindedir; API parolayı almaz, database OID/rol/ACL/read-only/timeout durumu her istekte doğrulanır ve cevap `executionTarget=SOURCE_DATABASE`, `sourceDdlExecuted=false` ile gerçek execution rolünü taşır. Görsel plan ve kaynak çalışma sınırları [source EXPLAIN ANALYZE belgesinde](docs/SOURCE_EXPLAIN_ANALYZE.md), clone kurulumu [2.5–2.7 runbook'unda](docs/ITERATIONS_2_5_TO_2_7.md) açıklanır.
 
 ## İterasyon 1 kapanış notu — 24 Temmuz 2026
 
@@ -315,10 +317,10 @@ external PG #N ──────┘                                      │
                                                             v
                                                    api:8000 ──> web:5173
 
-configured source/appdb ──salt-okunur──> evaluator:8010 ──iç API──> api:8000
+api:8000 ──iç token──> evaluator:8010 ──salt-okunur EXPLAIN/ANALYZE──> configured source/appdb
 
 source JOIN outbox ──fetch/ack──> join-snapshotter ──ingest──> repository-db
-api ──iç token──> clone-evaluator:8020 ──read-only replay / opsiyonel gerçek DDL──> disposable clone-db
+api ──admin + iç token──> clone-evaluator:8020 ──gerçek-index karşılaştırması──> disposable clone-db
 ```
 
 Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasına bakın.
@@ -328,7 +330,7 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 - Repository'deki kaynak kayıtlarında parola tutulmaz (`password = NULL`); collector Git dışında tutulan alias-bazlı `0600` pgpass secret'larını açılışta geçici `.pgpass` dosyasında birleştirir.
 - `powa_collector`, PostgreSQL'ün hazır PoWA rollerini ve kaynakta `pg_read_all_stats` yetkisini kullanır.
 - `advisor_api` yalnız repository DSN'i alır. Yapılandırma bilinen `source-db` hostunu reddeder; repository standart `5432` dahil herhangi bir geçerli port ve database adını kullanabilir. API health gate'i `advisor` repository şemasını pozitif olarak doğrulamadan container sağlıklı sayılmaz.
-- Kaynak DSN'i yalnız ayrı `evaluator` servisindedir. Bu servis `advisor_evaluator` rolü, read-only transaction, kısa timeout, connection limit, internal network ve token korumalı iç endpoint ile sınırlandırılır; ana API'ye kaynak parolası verilmez.
+- Kaynak DSN'i yalnız ayrı `evaluator` servisindedir. Bu servis `advisor_evaluator` rolü, read-only transaction, ayrı planner/runtime timeout'ları, tek runtime slotu, connection limit, internal network ve token korumalı iç endpoint ile sınırlandırılır; ana API'ye kaynak parolası verilmez.
 - HypoPG fonksiyonlarının PUBLIC yetkileri kaldırılmıştır. Evaluator yalnız sanal index oluşturur ve plain `EXPLAIN` çalıştırır; kopyalanabilir SQL'in kullanıcıya dönmesi gerçek DDL çalıştığı anlamına gelmez.
 - Header gönderilmeyen API isteği `viewer` sayılır ve tam SQL maskelenir. Referans web istemcisi analiz ekranları için demonstrasyon amaçlı `analyst` header'ı gönderir; bu gerçek kullanıcı kimliği değildir.
 - Annotation, CSV export ve gerçek-index karşılaştırmalı disposable-clone testi yalnız server-side
@@ -337,8 +339,8 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
   rolünün annotation/audit tablolarına doğrudan write yetkisi yoktur.
 - CSV export listeyle aynı filtrelerin tamamını uygular, 200 satır sayfa sınırına
   takılmaz ve server-side cursor ile sabit boyutlu partiler hâlinde akar.
-- Gerçek-index karşılaştırmasının bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar. Doğrudan dashboard EXPLAIN ANALYZE yolu ise SQL kabul etmeden, kullanıcının geçici JSON scalar bind dizisini yalnız disposable clone isteğine taşır ve saklamaz.
-- Runtime replay tek bir salt-okunur `SELECT` ile sınırlıdır. Yapısal kapı, plain-`EXPLAIN` plan preflight'ı, aktif read-only runner attestation'ı ve template policy revision kontrolünden biri başarısızsa `EXPLAIN ANALYZE` başlamaz; ölçüm transaction'ı daima rollback edilir.
+- Gerçek-index karşılaştırmasının bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar. Doğrudan dashboard EXPLAIN ANALYZE yolu ise SQL kabul etmeden, kullanıcının geçici JSON scalar bind dizisini token-korumalı source evaluator'a taşır ve saklamaz.
+- Doğrudan runtime replay tek bir salt-okunur `SELECT` ile sınırlıdır. Yapısal kapı, yan-etkili rutin denylist'i, plain-`EXPLAIN` plan preflight'ı ve aktif source rol/read-only/ACL attestation'ından biri başarısızsa `EXPLAIN ANALYZE` başlamaz; başlayan transaction daima rollback edilir. `EXPLAIN ANALYZE` sorguyu gerçekten çalıştırdığı için düşük yetkili rol ve SQL kapısı dışındaki kaynak yükü bilinçli olarak korunur.
 - Doğrudan dashboard çalıştırıcısı tek-kullanıcılı loopback kurulumda ek admin/Bearer kapısı olmadan açıktır. Referans UI tam SQL görünümü için demonstrasyon `analyst` header'ı gönderir. Web/API portunu başka makinelere açmadan önce bu endpoint'i gerçek kimlik doğrulama, rate limit ve kurum erişim politikası arkasına alın.
 - Yerel/operator PAT modeli server-side kimlik sağlar fakat SSO değildir.
   İnternet erişimi verilen bir kurulumda TLS, rate limit ve OIDC/BFF veya
@@ -380,7 +382,7 @@ docker compose --profile real-validation up -d --wait clone-db clone-evaluator
 bash scripts/verify-real-validation.sh
 ```
 
-Bu ikinci script dashboard'ın fixture'sız tek-sorgu yolunu, operator fixture kaydını, gerçek-index yolunun admin-token sınırını, manifest ile canlı runner rol/ACL/routine politikasını, runner'ın DML/DDL/`SELECT INTO`/`nextval` negatif problarını, güvenli bind adaptasyonuyla gerçek index kullanımını, kaynak değişmezliğini ve zorunlu clone cleanup'ını doğrular.
+Bu ikinci script dashboard'ın gerçek-source fixture'sız tek-sorgu yolunu, source read-only/OID/rol/rollback sözleşmesini, operator fixture kaydını, gerçek-index yolunun admin-token sınırını, manifest ile canlı runner rol/ACL/routine politikasını, runner'ın DML/DDL/`SELECT INTO`/`nextval` negatif problarını, güvenli bind adaptasyonuyla gerçek index kullanımını, kaynak DDL değişmezliğini ve zorunlu clone cleanup'ını doğrular.
 
 Backend unit testleri:
 

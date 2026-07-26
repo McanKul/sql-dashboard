@@ -21,9 +21,11 @@ from app.clone_evaluator import (
 from app.repositories.powa import repository
 from app.schemas import QueryExplainAnalyzeRequest
 import app.services.clone_evaluator as clone_client
+import app.services.evaluator as evaluator_client
+from app.schemas import InternalQueryExplainAnalyzeRequest
 
 
-def _runtime_result(query_id: str = "-42") -> dict[str, Any]:
+def _clone_runtime_result(query_id: str = "-42") -> dict[str, Any]:
     return {
         "status": "RUNTIME_VALIDATED",
         "reasonCode": "READ_ONLY_EXPLAIN_ANALYZE_COMPLETED",
@@ -54,6 +56,29 @@ def _runtime_result(query_id: str = "-42") -> dict[str, Any]:
     }
 
 
+def _source_runtime_result(query_id: str = "-42") -> dict[str, Any]:
+    clone = _clone_runtime_result(query_id)
+    raw_validation = dict(clone["validation"])
+    policy_revision = raw_validation.pop("runnerPolicyRevision")
+    validation = {
+        **raw_validation,
+        "safetyPolicyRevision": policy_revision,
+        "executionRole": "advisor_evaluator",
+        "databaseId": 16_384,
+    }
+    return {
+        "status": "RUNTIME_VALIDATED",
+        "reasonCode": "SOURCE_READ_ONLY_EXPLAIN_ANALYZE_COMPLETED",
+        "message": "Ana veritabaninda tamamlandi.",
+        "queryId": query_id,
+        "validation": validation,
+        "executionTarget": "SOURCE_DATABASE",
+        "sourceExecuted": True,
+        "sourceDdlExecuted": False,
+        "transactionRolledBack": True,
+    }
+
+
 @pytest.fixture
 def client() -> TestClient:
     application = FastAPI()
@@ -76,12 +101,12 @@ def test_query_explain_route_needs_no_admin_and_uses_only_persisted_sql(
             "sql_text": persisted_sql,
         }
 
-    async def explain(payload: InternalCloneQueryEvaluationRequest) -> dict[str, Any]:
-        captured["clone_request"] = payload
-        return _runtime_result(payload.queryId)
+    async def explain(payload: InternalQueryExplainAnalyzeRequest) -> dict[str, Any]:
+        captured["source_request"] = payload
+        return _source_runtime_result(payload.queryId)
 
     monkeypatch.setattr(repository, "query_by_id", query_by_id)
-    monkeypatch.setattr(router_module, "explain_query_on_clone", explain)
+    monkeypatch.setattr(router_module, "explain_query_on_source", explain)
 
     # No bearer/admin header: this route is intentionally available on the
     # single-user loopback dashboard deployment.
@@ -98,9 +123,11 @@ def test_query_explain_route_needs_no_admin_and_uses_only_persisted_sql(
         "server_id": 7,
         "database_id": 16_384,
     }
-    internal = captured["clone_request"]
+    internal = captured["source_request"]
     assert internal.normalizedSql == persisted_sql
+    assert internal.serverId == 7
     assert internal.serverAlias == "erp-primary"
+    assert internal.databaseId == 16_384
     assert internal.databaseName == "erp"
     assert internal.queryId == "-42"
     assert internal.bindValues == ["paid"]
@@ -143,7 +170,7 @@ def test_query_explain_route_returns_404_for_missing_persisted_query(
         raise AssertionError("missing query must not reach clone evaluator")
 
     monkeypatch.setattr(repository, "query_by_id", missing)
-    monkeypatch.setattr(router_module, "explain_query_on_clone", forbidden)
+    monkeypatch.setattr(router_module, "explain_query_on_source", forbidden)
 
     response = client.post(
         "/api/v1/queries/42/explain-analyze?window=24h",
@@ -156,10 +183,10 @@ def test_query_explain_route_returns_404_for_missing_persisted_query(
 @pytest.mark.parametrize(
     "bind_values",
     [
-        [0] * 17,
+        [0] * 129,
         ["x" * 2_049],
         [{"nested": "value"}],
-        ["x" * 2_048] * 4,
+        ["x" * 2_048] * 33,
         [float("nan")],
         [float("inf")],
     ],
@@ -192,6 +219,133 @@ class _IncompleteHttpResponse(_HttpResponse):
         raise IncompleteRead(self.body, len(self.body) + 1)
 
 
+def _internal_source_request() -> InternalQueryExplainAnalyzeRequest:
+    return InternalQueryExplainAnalyzeRequest(
+        serverId=1,
+        serverAlias="erp-primary",
+        databaseId=16_384,
+        databaseName="erp",
+        queryId="-42",
+        normalizedSql="SELECT count(*) FROM public.orders WHERE status = $1",
+        bindValues=["paid"],
+    )
+
+
+def test_source_query_explain_client_sends_token_and_validates_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        evaluator_client,
+        "get_settings",
+        lambda: SimpleNamespace(
+            evaluator_url="http://evaluator:8010/",
+            evaluator_token="internal-secret",
+            source_explain_timeout_seconds=130.0,
+        ),
+    )
+
+    def fake_urlopen(request: Request, timeout: float) -> _HttpResponse:
+        captured["url"] = request.full_url
+        captured["method"] = request.method
+        captured["token"] = request.get_header("X-evaluator-token")
+        captured["body"] = json.loads((request.data or b"").decode("utf-8"))
+        captured["timeout"] = timeout
+        return _HttpResponse(json.dumps(_source_runtime_result()).encode("utf-8"))
+
+    monkeypatch.setattr(evaluator_client, "urlopen", fake_urlopen)
+
+    result = evaluator_client._post_source_query_explain(_internal_source_request())
+
+    assert captured == {
+        "url": "http://evaluator:8010/internal/v1/query-explain-analyze",
+        "method": "POST",
+        "token": "internal-secret",
+        "body": _internal_source_request().model_dump(mode="json"),
+        "timeout": 130.0,
+    }
+    assert result["status"] == "RUNTIME_VALIDATED"
+    assert result["executionTarget"] == "SOURCE_DATABASE"
+    assert result["sourceExecuted"] is True
+    assert result["transactionRolledBack"] is True
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unreachable",
+        "query-mismatch",
+        "database-mismatch",
+        "missing-validation",
+        "malformed-plan",
+    ],
+)
+def test_source_query_explain_client_fails_closed_with_unknown_execution_state(
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        evaluator_client,
+        "get_settings",
+        lambda: SimpleNamespace(
+            evaluator_url="http://evaluator:8010",
+            evaluator_token="internal-secret",
+            source_explain_timeout_seconds=130.0,
+        ),
+    )
+
+    if failure == "unreachable":
+        monkeypatch.setattr(
+            evaluator_client,
+            "urlopen",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("offline")),
+        )
+    elif failure == "query-mismatch":
+        monkeypatch.setattr(
+            evaluator_client,
+            "urlopen",
+            lambda *_args, **_kwargs: _HttpResponse(
+                json.dumps(_source_runtime_result("999")).encode("utf-8")
+            ),
+        )
+    elif failure == "database-mismatch":
+        invalid = _source_runtime_result()
+        invalid["validation"] = {
+            **invalid["validation"],
+            "databaseId": 99_999,
+        }
+        monkeypatch.setattr(
+            evaluator_client,
+            "urlopen",
+            lambda *_args, **_kwargs: _HttpResponse(json.dumps(invalid).encode("utf-8")),
+        )
+    elif failure == "malformed-plan":
+        invalid = _source_runtime_result()
+        invalid["validation"] = {
+            **invalid["validation"],
+            "plan": {"Plan": "not-a-node-tree"},
+        }
+        monkeypatch.setattr(
+            evaluator_client,
+            "urlopen",
+            lambda *_args, **_kwargs: _HttpResponse(json.dumps(invalid).encode("utf-8")),
+        )
+    else:
+        invalid = {**_source_runtime_result(), "validation": None}
+        monkeypatch.setattr(
+            evaluator_client,
+            "urlopen",
+            lambda *_args, **_kwargs: _HttpResponse(json.dumps(invalid).encode("utf-8")),
+        )
+
+    result = evaluator_client._post_source_query_explain(_internal_source_request())
+
+    assert result["status"] == "UNAVAILABLE"
+    assert result["reasonCode"] == "SOURCE_EVALUATOR_UNREACHABLE"
+    assert result["sourceExecuted"] is None
+    assert result["transactionRolledBack"] is None
+
+
 def _internal_request() -> InternalCloneQueryEvaluationRequest:
     return InternalCloneQueryEvaluationRequest(
         serverAlias="erp-primary",
@@ -222,7 +376,7 @@ def test_query_explain_client_sends_internal_token_and_validates_response(
         captured["token"] = request.get_header("X-clone-evaluator-token")
         captured["body"] = json.loads((request.data or b"").decode("utf-8"))
         captured["timeout"] = timeout
-        return _HttpResponse(json.dumps(_runtime_result()).encode("utf-8"))
+        return _HttpResponse(json.dumps(_clone_runtime_result()).encode("utf-8"))
 
     monkeypatch.setattr(clone_client, "urlopen", fake_urlopen)
 
@@ -271,7 +425,7 @@ def test_query_explain_client_fails_closed(
             lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("offline")),
         )
     elif failure == "unsafe-response":
-        unsafe = {**_runtime_result(), "sourceDdlExecuted": True}
+        unsafe = {**_clone_runtime_result(), "sourceDdlExecuted": True}
         monkeypatch.setattr(
             clone_client,
             "urlopen",
@@ -282,11 +436,11 @@ def test_query_explain_client_fails_closed(
             clone_client,
             "urlopen",
             lambda *_args, **_kwargs: _HttpResponse(
-                json.dumps(_runtime_result("999")).encode("utf-8")
+                json.dumps(_clone_runtime_result("999")).encode("utf-8")
             ),
         )
     elif failure == "missing-validation":
-        incomplete = {**_runtime_result(), "validation": None}
+        incomplete = {**_clone_runtime_result(), "validation": None}
         monkeypatch.setattr(
             clone_client,
             "urlopen",
@@ -295,7 +449,7 @@ def test_query_explain_client_fails_closed(
             ),
         )
     elif failure == "cleanup-incomplete":
-        incomplete = {**_runtime_result(), "cloneDestroyed": False}
+        incomplete = {**_clone_runtime_result(), "cloneDestroyed": False}
         monkeypatch.setattr(
             clone_client,
             "urlopen",
@@ -328,8 +482,8 @@ def test_query_explain_client_fails_closed(
 @pytest.mark.parametrize(
     "invalid_result",
     [
-        {**_runtime_result(), "validation": None},
-        {**_runtime_result(), "cloneDestroyed": False},
+        {**_clone_runtime_result(), "validation": None},
+        {**_clone_runtime_result(), "cloneDestroyed": False},
     ],
 )
 def test_runtime_validated_response_requires_evidence_and_cleanup(

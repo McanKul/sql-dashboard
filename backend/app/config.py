@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     evaluator_url: str | None = None
     evaluator_token: str = "advisor-dev-evaluator-token"
     evaluator_timeout_seconds: float = Field(default=4.0, gt=0, le=15)
+    # Source EXPLAIN ANALYZE really executes the persisted SELECT.  It gets a
+    # separate, deliberately wider HTTP envelope than the cheap HypoPG plan
+    # endpoint so ERP-scale reads can complete without weakening that gate.
+    source_explain_timeout_seconds: float = Field(default=130.0, gt=0, le=310)
     clone_evaluator_url: str | None = None
     clone_evaluator_token: str = "advisor-dev-clone-evaluator-token"
     clone_evaluator_timeout_seconds: float = Field(default=90.0, gt=0, le=180)

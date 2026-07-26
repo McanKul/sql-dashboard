@@ -945,11 +945,14 @@ SELECT
     WHERE stats.n_live_tup >= 1900 AND coalesce(stats.last_analyze, stats.last_autoanalyze) IS NOT NULL),
   has_schema_privilege('advisor_workload_reader', 'advisor_erp', 'USAGE'),
   has_schema_privilege('advisor_workload_reporter', 'advisor_erp', 'USAGE'),
+  has_schema_privilege('advisor_evaluator', 'advisor_erp', 'USAGE'),
   has_schema_privilege('advisor_workload_writer', 'advisor_erp', 'USAGE'),
   coalesce((SELECT bool_and(has_table_privilege('advisor_workload_reader', oid, 'SELECT')) FROM managed_tables), false),
   coalesce((SELECT bool_and(has_table_privilege('advisor_workload_reporter', oid, 'SELECT')) FROM managed_tables), false),
+  coalesce((SELECT bool_and(has_table_privilege('advisor_evaluator', oid, 'SELECT')) FROM managed_tables), false),
   coalesce((SELECT bool_or(has_table_privilege('advisor_workload_reader', oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
   coalesce((SELECT bool_or(has_table_privilege('advisor_workload_reporter', oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
+  coalesce((SELECT bool_or(has_table_privilege('advisor_evaluator', oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
   coalesce((SELECT bool_or(has_table_privilege('advisor_workload_writer', oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) FROM managed_tables), true),
   EXISTS (
     SELECT 1
@@ -961,18 +964,19 @@ SELECT
   );")"
   IFS='|' read -r erp_catalog_tables erp_catalog_indexes erp_valid_indexes \
     erp_expected_composite_indexes erp_expected_primary_indexes erp_analyzed_tables \
-    erp_reader_usage erp_reporter_usage erp_writer_usage erp_reader_select \
-    erp_reporter_select erp_reader_write_acl erp_reporter_write_acl \
+    erp_reader_usage erp_reporter_usage erp_evaluator_usage erp_writer_usage \
+    erp_reader_select erp_reporter_select erp_evaluator_select \
+    erp_reader_write_acl erp_reporter_write_acl erp_evaluator_write_acl \
     erp_writer_any_acl erp_public_any_acl <<<"$erp_catalog_state"
   if [[ "$erp_catalog_tables|$erp_catalog_indexes|$erp_valid_indexes|$erp_expected_composite_indexes|$erp_expected_primary_indexes|$erp_analyzed_tables" == "500|1000|1000|500|500|500" ]]; then
     pass "ERP fiziksel kapsami: 500 tablo, 500 exact composite + 500 primary indeks ve 500 ANALYZE istatistigi"
   else
     reject "ERP fiziksel kapsami eksik: tables=${erp_catalog_tables}, indexes=${erp_catalog_indexes}, validIndexes=${erp_valid_indexes}, expectedComposite=${erp_expected_composite_indexes}, expectedPrimary=${erp_expected_primary_indexes}, analyzed=${erp_analyzed_tables}"
   fi
-  if [[ "$erp_reader_usage|$erp_reporter_usage|$erp_writer_usage|$erp_reader_select|$erp_reporter_select|$erp_reader_write_acl|$erp_reporter_write_acl|$erp_writer_any_acl|$erp_public_any_acl" == "t|t|f|t|t|f|f|f|f" ]]; then
-    pass "ERP ACL zarfi salt-okunur reader/reporter ve yetkisiz writer/PUBLIC olarak dogrulandi"
+  if [[ "$erp_reader_usage|$erp_reporter_usage|$erp_evaluator_usage|$erp_writer_usage|$erp_reader_select|$erp_reporter_select|$erp_evaluator_select|$erp_reader_write_acl|$erp_reporter_write_acl|$erp_evaluator_write_acl|$erp_writer_any_acl|$erp_public_any_acl" == "t|t|t|f|t|t|t|f|f|f|f|f" ]]; then
+    pass "ERP ACL zarfi salt-okunur reader/reporter/evaluator ve yetkisiz writer/PUBLIC olarak dogrulandi"
   else
-    reject "ERP ACL zarfi bozuk: readerUsage=${erp_reader_usage}, reporterUsage=${erp_reporter_usage}, writerUsage=${erp_writer_usage}, readerSelect=${erp_reader_select}, reporterSelect=${erp_reporter_select}, readerWrite=${erp_reader_write_acl}, reporterWrite=${erp_reporter_write_acl}, writerAny=${erp_writer_any_acl}, publicAny=${erp_public_any_acl}"
+    reject "ERP ACL zarfi bozuk: readerUsage=${erp_reader_usage}, reporterUsage=${erp_reporter_usage}, evaluatorUsage=${erp_evaluator_usage}, writerUsage=${erp_writer_usage}, readerSelect=${erp_reader_select}, reporterSelect=${erp_reporter_select}, evaluatorSelect=${erp_evaluator_select}, readerWrite=${erp_reader_write_acl}, reporterWrite=${erp_reporter_write_acl}, evaluatorWrite=${erp_evaluator_write_acl}, writerAny=${erp_writer_any_acl}, publicAny=${erp_public_any_acl}"
   fi
 fi
 

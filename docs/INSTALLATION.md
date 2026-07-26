@@ -216,6 +216,7 @@ POSTGRES_ADMIN_PASSWORD=GUCLU_ADMIN_PAROLASI
 POWA_COLLECTOR_PASSWORD=GUCLU_COLLECTOR_PAROLASI
 ADVISOR_API_PASSWORD=GUCLU_API_PAROLASI
 ADVISOR_EVALUATOR_PASSWORD=GUCLU_EVALUATOR_PAROLASI
+ADVISOR_EVALUATOR_READ_SCHEMAS=public
 EVALUATOR_TOKEN=GUCLU_RASTGELE_IC_SERVIS_TOKENI
 ADVISOR_JOIN_SOURCE_PASSWORD=GUCLU_JOIN_SOURCE_PAROLASI
 ADVISOR_JOIN_REPOSITORY_PASSWORD=GUCLU_JOIN_REPOSITORY_PAROLASI
@@ -272,8 +273,10 @@ Bu sayede DB, API ve web yalnız aynı hosttan erişilebilir. Registry girdisini
 ve raw token'ı `scripts/generate-auth-credential.py` ile üretin. Raw token
 frontend build/env değişkeni değildir; yalnız secret manager'da tutulur. API
 ortamı yalnız SHA-256 hashini alır. `.env` dosyasını Git'e eklemeyin. Registry
-boş bırakılırsa annotation/export/runtime endpoint'leri fail-closed kapalı
-kalır. Ayrıntılar [AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
+boş bırakılırsa annotation/export ve gerçek-index clone runtime endpoint'i
+fail-closed kapalı kalır. Dashboard source EXPLAIN yolu tek-kullanıcılı loopback
+kurulumda açıktır; portu dışa açmadan önce auth/rate-limit ekleyin. Ayrıntılar
+[AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
 
 İterasyon 2.1-B demo kaynağı için varsayılanlar:
 
@@ -379,6 +382,13 @@ Evaluator yanıtında `database_name=appdb`, `role_name=advisor_evaluator`,
 `hypopg_version=1.4.3`, `default_read_only=on` ve `ddlExecuted=false`
 bulunmalıdır.
 
+Dashboard'ın gerçek source `EXPLAIN ANALYZE` yolu HypoPG'nin kısa planlama
+limitini kullanmaz. Varsayılan `SOURCE_EXPLAIN_TIMEOUT_SECONDS=130`,
+`EVALUATOR_RUNTIME_STATEMENT_TIMEOUT_MS=120000`,
+`EVALUATOR_RUNTIME_LOCK_TIMEOUT_MS=5000` ve
+`EVALUATOR_RUNTIME_TRANSACTION_TIMEOUT_MS=125000` değerleri ERP sorguları için
+ayrı bir zarf oluşturur. Transaction limiti statement limitinden uzun kalmalıdır.
+
 Kimlik doğrulayan/TLS sonlandıran bir reverse proxy sınırı kurduktan sonra
 uzak web erişimini özellikle açmak isterseniz `.env` içinde
 `WEB_BIND=0.0.0.0` seçin. Sonra başka bir bilgisayardan yalnız web/proxy
@@ -452,7 +462,7 @@ docker compose --profile real-validation up -d --wait clone-db clone-evaluator
 bash scripts/verify-real-validation.sh
 ```
 
-Script dashboard'ın fixture'sız tek-query EXPLAIN ANALYZE yolunu ve gerçek-index karşılaştırma yolunu birlikte doğrular. Exact normalize eşitlik sorgusuna audit metadatalı `["paid"]` sentetik fixture'ı operator kayıt yoluyla bağlar; admin Bearer API çağrısını, manifest ile canlı runner rol/ACL/routine politikasını, doğrudan DML/DDL/`SELECT INTO`/`nextval` negatif problarını, gerçek index kullanımını, kaynak index fingerprint'inin değişmediğini ve bütün disposable database'lerin temizlendiğini assert eder. Dashboard yolu SQL kabul etmez; backend persisted SQL'i çözer ve request'teki scalar bind değerlerini saklamadan tek disposable clone'a taşır. Replay yalnız tek salt-okunur `SELECT`tir: yapısal lexical/statement kapısı multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row lock ve açık denylist'teki yan etkili routine adlarını reddeder; bütün routine'leri volatility açısından sınıflandırmaz. Template manifesti runner policy revision/dangerous-routine kanıtını doğrular; job database'deki aktif runner attestation'ı dangerous/volatile routine `EXECUTE` dahil rol, read-only ayar ve ACL sınırlarını ölçer. PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) preflight'ı `ModifyTable`, `LockRows`, `Foreign Scan` ve `Custom Scan` düğümlerinden hiçbirinin bulunmadığını doğrulamadan `EXPLAIN ANALYZE` başlamaz ve her runner transaction'ı koşulsuz rollback edilir. Herhangi bir fark fail-closed sonuç verir. Gerçek index yalnız disposable candidate clone'a kurulur; clone evaluator kaynak ağı/DSN'i almaz ve kaynak hiçbir zaman replay/DDL hedefi değildir. Archive restore bootstrap yetkileriyle kod çalıştırabileceği için yalnız güvenilir ve gerekiyorsa anonimleştirilmiş dump kullanın; `--no-owner`/`--no-privileges` bir güven sınırı değildir. Genel/manual fixture ve endpoint akışı [2.5–2.7 runbook'undadır](ITERATIONS_2_5_TO_2_7.md#27-disposable-clone-profili). Profil varsayılan stack için zorunlu değildir.
+Script dashboard'ın gerçek-source tek-query EXPLAIN ANALYZE yolunu ve disposable-clone gerçek-index karşılaştırma yolunu birlikte doğrular. Dashboard yolu SQL kabul etmez; backend persisted SQL'i çözer ve request'teki scalar bind değerlerini saklamadan düşük yetkili source evaluator'a taşır. Source database adı/OID'si, evaluator rol/ACL/read-only ayarları, plain-plan preflight, gerçek JSON plan ve rollback kanıtlanır; kaynak index fingerprint'i değişmez. Exact normalize eşitlik sorgusuna audit metadatalı `["paid"]` sentetik fixture ise yalnız gerçek-index karşılaştırması için operator kayıt yoluyla bağlanır. Clone template manifesti ve aktif runner attestation'ı bu ikinci yolun rol/ACL/routine politikasını ölçer; gerçek index yalnız disposable candidate clone'a kurulur ve bütün job database'leri silinir. Archive restore bootstrap yetkileriyle kod çalıştırabileceği için yalnız güvenilir ve gerekiyorsa anonimleştirilmiş dump kullanın; `--no-owner`/`--no-privileges` bir güven sınırı değildir. Source çalışma ayrıntıları [SOURCE_EXPLAIN_ANALYZE.md](SOURCE_EXPLAIN_ANALYZE.md), fixture ve clone endpoint akışı [2.5–2.7 runbook'unda](ITERATIONS_2_5_TO_2_7.md#27-disposable-clone-profili) bulunur. Profil yalnız gerçek-index kabulü için gerekir.
 
 ### Adım 9 — Analiz arayüzünü açın
 
@@ -1036,6 +1046,21 @@ docker compose exec -T source-db psql -U postgres -d appdb -c \
 ```
 
 Mevcut demo volume'ünde extension/rol yoksa `bash scripts/enable-hypopg.sh` çalıştırıp `evaluator api web` servislerini yeniden oluşturun. `UNSAFE`, evaluator arızası demek değildir: DML, birden çok statement, RLS, çözümlenemeyen veya ikiden fazla kolonlu aday, B-tree uyumsuz operator ya da eski repository OID'i güvenli biçimde reddedilir. `NO_IMPROVEMENT` eşdeğer index bulunduğunu ya da varsayılan `%10` planner-cost eşiğinin aşılmadığını gösterebilir. SQL yalnız `VALIDATED` durumda açılır; HypoPG yolunda hiçbir durumda gerçek DDL çalıştırılmaz.
+
+Evaluator'ın sorgulayacağı uygulama şemalarını virgülle ve basit identifier
+adlarıyla açıkça seçin; örneğin demo ERP yükü için:
+
+```bash
+ADVISOR_EVALUATOR_READ_SCHEMAS=public,advisor_erp \
+  bash scripts/enable-hypopg.sh
+```
+
+Script role yalnız bu şemalarda `USAGE` ve tablolarda `SELECT` verir, DML/DDL
+yetkilerini temizleyip doğrular ve bilinen object owner'ların gelecek tabloları
+için `SELECT` default privilege'ını kurar. Sonradan yeni bir owner devreye
+girecekse onun default privilege'ı DBA tarafından ayrıca verilmelidir. Uzak
+kaynaklar bu script'in hedefi değildir; aynı dar ACL zarfını hedef database DBA'sı
+uygulamalıdır.
 
 Dış alias yalnız collector'a kaydedildiyse `SOURCE_NOT_CONFIGURED` beklenir. Ana API'ye source DSN eklemeyin; [dış kaynak evaluator runbook'unu](ITERATION_2_2_HYPOPG.md#dış-kaynak-sınırı-ve-runbook) uygulayın.
 

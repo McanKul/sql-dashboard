@@ -1,7 +1,8 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
   ArrowDownRight,
   ArrowLeft,
   ArrowRight,
@@ -32,7 +33,6 @@ import {
 import { advisorApi, ApiClientError, demoModeEnabled } from './api'
 import type {
   ApiList,
-  CloneQueryEvaluationResult,
   CompositeIndexCandidate,
   DatabaseOption,
   OperationsData,
@@ -40,6 +40,7 @@ import type {
   PageId,
   QueryDetail,
   QueryBindValue,
+  QueryExplainAnalyzeResult,
   QueryIndexAdvice,
   QueryListParams,
   QueryPredicate,
@@ -66,7 +67,13 @@ import {
   severityLabels,
   windowLabels,
 } from './utils'
+import { ExplainPlanErrorBoundary } from './components/explain/ExplainPlanErrorBoundary'
 import './styles.css'
+
+const ExplainPlanGraph = lazy(async () => {
+  const module = await import('./components/explain/ExplainPlanGraph')
+  return { default: module.ExplainPlanGraph }
+})
 
 type LoadStatus = 'idle' | 'loading' | 'success' | 'error'
 interface Loadable<T> {
@@ -701,9 +708,12 @@ export function highestBindParameter(statement: string): number {
   return highest
 }
 
+const SOURCE_EXPLAIN_MAX_BIND_VALUES = 128
+const SOURCE_EXPLAIN_MAX_BIND_BYTES = 64 * 1024
+
 export function parseExplainBindValues(input: string, requiredCount: number): { values: QueryBindValue[] } | { error: string } {
   if (requiredCount === 0) return { values: [] }
-  if (requiredCount > 16) return { error: `Bu sorgu ${requiredCount} bind değeri istiyor; güvenli arayüz sınırı 16.` }
+  if (requiredCount > SOURCE_EXPLAIN_MAX_BIND_VALUES) return { error: `Bu sorgu ${requiredCount} bind değeri istiyor; kaynak EXPLAIN sınırı ${SOURCE_EXPLAIN_MAX_BIND_VALUES}.` }
   let parsed: unknown
   try {
     parsed = JSON.parse(input)
@@ -711,7 +721,7 @@ export function parseExplainBindValues(input: string, requiredCount: number): { 
     return { error: 'Bind değerlerini geçerli bir JSON array olarak girin.' }
   }
   if (!Array.isArray(parsed)) return { error: 'Bind değerleri bir JSON array olmalı.' }
-  if (parsed.length > 16) return { error: 'En fazla 16 bind değeri gönderebilirsiniz.' }
+  if (parsed.length > SOURCE_EXPLAIN_MAX_BIND_VALUES) return { error: `En fazla ${SOURCE_EXPLAIN_MAX_BIND_VALUES} bind değeri gönderebilirsiniz.` }
   if (parsed.length !== requiredCount) return { error: `Bu sorgu $1–$${requiredCount} için tam ${requiredCount} değer istiyor.` }
   const scalarValues: QueryBindValue[] = []
   for (const value of parsed) {
@@ -725,14 +735,14 @@ export function parseExplainBindValues(input: string, requiredCount: number): { 
     if (typeof value === 'string' && value.length > 2_048) return { error: 'Bir bind string değeri en fazla 2048 karakter olabilir.' }
     scalarValues.push(value as QueryBindValue)
   }
-  if (new TextEncoder().encode(JSON.stringify(scalarValues)).length > 8_192) return { error: 'Bind değerlerinin toplam boyutu 8 KB sınırını aşıyor.' }
+  if (new TextEncoder().encode(JSON.stringify(scalarValues)).length > SOURCE_EXPLAIN_MAX_BIND_BYTES) return { error: 'Bind değerlerinin toplam boyutu 64 KiB sınırını aşıyor.' }
   return { values: scalarValues }
 }
 
-function explainStatusLabel(status: CloneQueryEvaluationResult['status']): string {
+function explainStatusLabel(status: QueryExplainAnalyzeResult['status']): string {
   return {
     RUNTIME_VALIDATED: 'EXPLAIN ANALYZE tamamlandı',
-    UNAVAILABLE: 'Clone doğrulaması kullanılamıyor',
+    UNAVAILABLE: 'Kaynak doğrulaması kullanılamıyor',
     UNSAFE: 'Sorgu güvenlik kapısından geçmedi',
   }[status]
 }
@@ -748,6 +758,27 @@ function ExplainRawPlan({ plan, evaluatedAt }: { plan: Record<string, unknown>; 
   )
 }
 
+function ExplainExecutionAttestation({ result }: { result: QueryExplainAnalyzeResult }) {
+  const sourceFact = result.sourceExecuted === null
+    ? <span className="pending"><Clock3 size={13} /> Kaynak yürütme durumu doğrulanamadı</span>
+    : result.sourceExecuted
+      ? <span><Check size={13} /> Kaynak sorgu çalıştırıldı</span>
+      : <span className="neutral"><CircleDot size={13} /> Kaynak sorgu çalıştırılmadı</span>
+
+  let rollbackFact
+  if (result.transactionRolledBack === null || (result.transactionRolledBack === false && result.sourceExecuted === null)) {
+    rollbackFact = <span className="pending"><Clock3 size={13} /> Rollback durumu doğrulanamadı</span>
+  } else if (result.transactionRolledBack) {
+    rollbackFact = <span><Check size={13} /> Transaction geri alındı</span>
+  } else if (result.sourceExecuted === false) {
+    rollbackFact = <span className="neutral"><CircleDot size={13} /> Rollback gerekmedi</span>
+  } else {
+    rollbackFact = <span className="warning"><AlertCircle size={13} /> Rollback başarısız</span>
+  }
+
+  return <>{sourceFact}{rollbackFact}</>
+}
+
 export function ExplainAnalyzePanel({
   statement,
   state,
@@ -756,7 +787,7 @@ export function ExplainAnalyzePanel({
   onEvaluate,
 }: {
   statement: string
-  state: Loadable<CloneQueryEvaluationResult>
+  state: Loadable<QueryExplainAnalyzeResult>
   bindInput: string
   onBindInput: (value: string) => void
   onEvaluate: () => void
@@ -766,22 +797,22 @@ export function ExplainAnalyzePanel({
   return (
     <article className="detail-card explain-analyze-card" aria-live="polite">
       <div className="detail-card-heading">
-        <div><span className="panel-kicker">Disposable clone</span><h2>Clone’da EXPLAIN ANALYZE</h2></div>
-        <span className="simulation-label"><ShieldAlert size={14} /> Kaynak izole</span>
+        <div><span className="panel-kicker">Gerçek kaynak · read-only</span><h2>Ana DB'de EXPLAIN ANALYZE</h2></div>
+        <span className="simulation-label"><Database size={14} /> Ana veritabanı</span>
       </div>
-      <p className="explain-intro">Bu sorgunun gerçek planını ve çalışma metriklerini geçici clone üzerinde ölçer. Yalnız salt-okunur SELECT kabul edilir.</p>
+      <p className="explain-intro">Bu sorguyu gerçek veri ve cache koşullarıyla ana veritabanında ölçer. Yalnız salt-okunur SELECT kabul edilir; işlem read-only transaction içinde çalıştırılıp geri alınır.</p>
       {bindCount > 0 ? (
         <label className="explain-bind-field">
           <span>Bind değerleri · $1–${bindCount}</span>
           <textarea value={bindInput} onChange={(event) => onBindInput(event.target.value)} disabled={state.status === 'loading'} rows={3} spellCheck={false} aria-label="EXPLAIN ANALYZE bind değerleri" placeholder='["paid", 100, null]' />
-          <small className={bindCount > 16 ? 'explain-limit-warning' : ''}>{bindCount > 16 ? `Bu sorgu ${bindCount} değer istiyor; arayüz güvenlik sınırı 16 olduğu için çalıştırılamaz.` : `Sorgudaki sırayla tam ${bindCount} JSON scalar değer girin; en fazla 16 değer.`}</small>
+          <small className={bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES ? 'explain-limit-warning' : ''}>{bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES ? `Bu sorgu ${bindCount} değer istiyor; kaynak EXPLAIN sınırı ${SOURCE_EXPLAIN_MAX_BIND_VALUES} olduğu için çalıştırılamaz.` : `Sorgudaki sırayla tam ${bindCount} JSON scalar değer girin; en fazla ${SOURCE_EXPLAIN_MAX_BIND_VALUES} değer ve toplam 64 KiB.`}</small>
         </label>
       ) : <div className="explain-no-binds"><CheckCircle2 size={16} /><span>Bu sorguda bind parametresi yok; <code>bindValues: []</code> gönderilecek.</span></div>}
       <div className="explain-actions">
-        <div><strong>Read-only çalışma</strong><span>Değerler saklanmaz; normalize SQL sunucudan çözülür ve kaynak veritabanına dokunulmaz.</span></div>
-        <button type="button" className="hypopg-button explain-run-button" onClick={onEvaluate} disabled={state.status === 'loading' || bindCount > 16}>
+        <div><strong>Gerçek kaynakta read-only çalışma</strong><span>Gerçek sorgu yükü ana veritabanında oluşur. Bind değerleri advisor’a kaydedilmez; kaynak DB log/audit politikası geçerlidir. DDL ve yazma sorguları kabul edilmez.</span></div>
+        <button type="button" className="hypopg-button explain-run-button" onClick={onEvaluate} disabled={state.status === 'loading' || bindCount > SOURCE_EXPLAIN_MAX_BIND_VALUES}>
           {state.status === 'loading' ? <LoaderCircle className="spin" size={16} /> : <Zap size={16} />}
-          {state.status === 'loading' ? 'Clone hazırlanıyor…' : 'Clone’da EXPLAIN ANALYZE'}
+          {state.status === 'loading' ? 'Kaynakta çalışıyor…' : 'EXPLAIN ANALYZE çalıştır'}
         </button>
       </div>
       {state.status === 'error' && <div className="index-evaluation-error explain-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
@@ -799,17 +830,30 @@ export function ExplainAnalyzePanel({
                 <div><span>Shared hit / read</span><strong>{formatLargeNumber(result.validation.sharedHitBlocks)} / {formatLargeNumber(result.validation.sharedReadBlocks)}</strong></div>
                 <div><span>Temp read / write</span><strong>{formatLargeNumber(result.validation.tempReadBlocks)} / {formatLargeNumber(result.validation.tempWrittenBlocks)}</strong></div>
                 <div><span>WAL</span><strong>{formatLargeNumber(result.validation.walRecords)} kayıt · {formatBytes(result.validation.walBytes)}</strong></div>
-                <div><span>Runner policy</span><strong>rev. {result.validation.runnerPolicyRevision}</strong><small>PostgreSQL {result.validation.postgresVersion}</small></div>
+                <div><span>Safety policy</span><strong>rev. {result.validation.safetyPolicyRevision}</strong><small>PostgreSQL {result.validation.postgresVersion}</small></div>
+                <div><span>Çalışma kimliği</span><strong>{result.validation.executionRole}</strong><small>databaseId {result.validation.databaseId}</small></div>
               </div>
-              <ExplainRawPlan plan={result.validation.plan ?? result.validation.rawPlan ?? {}} evaluatedAt={result.validation.evaluatedAt} />
+              <ExplainPlanErrorBoundary
+                resetKey={result.validation.evaluatedAt}
+                fallback={(
+                  <div className="plan-visualizer-empty" role="alert">
+                    <AlertTriangle size={18} />
+                    <div><strong>Etkileşimli plan yüklenemedi</strong><span>Plan verisi kaybolmadı; ham JSON aşağıdan incelenebilir.</span></div>
+                  </div>
+                )}
+              >
+                <Suspense fallback={<div className="plan-visualizer-loading"><LoaderCircle className="spin" size={16} /> Etkileşimli yürütme planı yükleniyor…</div>}>
+                  <ExplainPlanGraph plan={result.validation.plan} />
+                </Suspense>
+              </ExplainPlanErrorBoundary>
+              <ExplainRawPlan plan={result.validation.plan} evaluatedAt={result.validation.evaluatedAt} />
             </>
           )}
           <div className="explain-safety-facts">
             <span><Check size={13} /> {result.executionTarget}</span>
             <span><Check size={13} /> sourceDdlExecuted=false</span>
-            <span><Check size={13} /> cloneDdlExecuted=false</span>
             {result.validation && <span><Check size={13} /> transactionReadOnly=true</span>}
-            <span className={result.cloneDestroyed ? '' : 'pending'}>{result.cloneDestroyed ? <Check size={13} /> : <Clock3 size={13} />} cloneDestroyed={String(result.cloneDestroyed)}</span>
+            <ExplainExecutionAttestation result={result} />
           </div>
         </div>
       )}
@@ -822,7 +866,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
   const [copied, setCopied] = useState(false)
   const [indexAdvice, setIndexAdvice] = useState<Record<string, Loadable<QueryIndexAdvice>>>({})
   const [copiedIndexKey, setCopiedIndexKey] = useState<string | null>(null)
-  const [explainState, setExplainState] = useState<Loadable<CloneQueryEvaluationResult>>({ status: 'idle' })
+  const [explainState, setExplainState] = useState<Loadable<QueryExplainAnalyzeResult>>({ status: 'idle' })
   const [bindInput, setBindInput] = useState('[]')
   const detailControllerRef = useRef<AbortController | null>(null)
   const explainControllerRef = useRef<AbortController | null>(null)
@@ -912,7 +956,7 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
       if (!controller.signal.aborted) setExplainState({ status: 'success', data })
     } catch (error: unknown) {
       if (controller.signal.aborted) return
-      setExplainState({ status: 'error', error: error instanceof Error ? error.message : 'Clone EXPLAIN ANALYZE çalıştırılamadı.' })
+      setExplainState({ status: 'error', error: error instanceof Error ? error.message : 'Kaynak EXPLAIN ANALYZE çalıştırılamadı.' })
     }
   }
 

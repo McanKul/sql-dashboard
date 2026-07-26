@@ -230,6 +230,17 @@ class SeedSecurityTests(unittest.TestCase):
         self.assertIn("index_record.indoption::text <> '0 0 3'", SEED_SQL)
         self.assertIn("pg_get_indexdef(index_record.indexrelid, 3, true)", SEED_SQL)
         self.assertIn("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA advisor_erp", SEED_SQL)
+        self.assertIn(
+            "TO advisor_workload_reader, advisor_workload_reporter, advisor_evaluator",
+            SEED_SQL,
+        )
+        self.assertIn(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA advisor_erp",
+            SEED_SQL,
+        )
+        self.assertIn(
+            "'advisor_workload_writer', 'advisor_evaluator'", SEED_SQL
+        )
 
     def test_event_retention_has_a_validated_partial_cleanup_index(self) -> None:
         self.assertIn("idx_events_advisor_realistic_id_desc", SEED_SQL)

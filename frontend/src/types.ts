@@ -309,7 +309,79 @@ export interface QueryRuntimeValidation {
 
 export type QueryBindValue = string | number | boolean | null
 
-export interface CloneQueryEvaluationResult {
+/**
+ * PostgreSQL's JSON EXPLAIN schema is intentionally open ended: new server
+ * versions and extensions may add fields without changing the tree shape.
+ * Known fields are typed for the visualizer and unknown fields are preserved
+ * for the raw-plan fallback.
+ */
+export interface PostgresExplainPlanNode {
+  'Node Type': string
+  'Parent Relationship'?: string
+  'Parallel Aware'?: boolean
+  'Async Capable'?: boolean
+  'Startup Cost'?: number
+  'Total Cost'?: number
+  'Plan Rows'?: number
+  'Plan Width'?: number
+  'Actual Startup Time'?: number
+  'Actual Total Time'?: number
+  'Actual Rows'?: number
+  'Actual Loops'?: number
+  'Schema'?: string
+  'Relation Name'?: string
+  'Alias'?: string
+  'Index Name'?: string
+  'Join Type'?: string
+  'Scan Direction'?: string
+  'Filter'?: string
+  'Index Cond'?: string
+  'Recheck Cond'?: string
+  'Hash Cond'?: string
+  'Merge Cond'?: string
+  'Join Filter'?: string
+  'Rows Removed by Filter'?: number
+  'Rows Removed by Join Filter'?: number
+  'Rows Removed by Index Recheck'?: number
+  'Shared Hit Blocks'?: number
+  'Shared Read Blocks'?: number
+  'Shared Dirtied Blocks'?: number
+  'Shared Written Blocks'?: number
+  'Local Hit Blocks'?: number
+  'Local Read Blocks'?: number
+  'Local Dirtied Blocks'?: number
+  'Local Written Blocks'?: number
+  'Temp Read Blocks'?: number
+  'Temp Written Blocks'?: number
+  'I/O Read Time'?: number
+  'I/O Write Time'?: number
+  'WAL Records'?: number
+  'WAL FPI'?: number
+  'WAL Bytes'?: number
+  'Sort Key'?: string[]
+  'Sort Method'?: string
+  'Sort Space Used'?: number
+  'Sort Space Type'?: string
+  'Hash Buckets'?: number
+  'Original Hash Buckets'?: number
+  'Hash Batches'?: number
+  'Original Hash Batches'?: number
+  'Peak Memory Usage'?: number
+  Plans?: PostgresExplainPlanNode[]
+  [key: string]: unknown
+}
+
+export interface PostgresExplainDocument {
+  Plan: PostgresExplainPlanNode
+  'Planning Time'?: number
+  'Execution Time'?: number
+  Settings?: Record<string, string>
+  Triggers?: Array<Record<string, unknown>>
+  JIT?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+export interface QueryExplainAnalyzeResult {
   status: 'RUNTIME_VALIDATED' | 'UNAVAILABLE' | 'UNSAFE'
   reasonCode: string
   message: string
@@ -319,8 +391,10 @@ export interface CloneQueryEvaluationResult {
     statementClass: 'READ_ONLY_SELECT'
     planPreflight: 'READ_ONLY'
     transactionReadOnly: true
-    runnerPolicyRevision: number
+    safetyPolicyRevision: number
     postgresVersion: string
+    executionRole: string
+    databaseId: number
     executionTimeMs: number
     planningTimeMs: number
     sharedHitBlocks: number
@@ -329,15 +403,13 @@ export interface CloneQueryEvaluationResult {
     tempWrittenBlocks: number
     walRecords: number
     walBytes: number
-    plan: Record<string, unknown>
-    /** Backward-compatible fallback for an evaluator rolling upgrade. */
-    rawPlan?: Record<string, unknown>
+    plan: PostgresExplainDocument
     evaluatedAt: string
   } | null
-  executionTarget: 'DISPOSABLE_CLONE'
+  executionTarget: 'SOURCE_DATABASE'
+  sourceExecuted: boolean | null
   sourceDdlExecuted: false
-  cloneDdlExecuted: false
-  cloneDestroyed: boolean
+  transactionRolledBack: boolean | null
 }
 
 export interface QueryDetail extends QuerySummary {

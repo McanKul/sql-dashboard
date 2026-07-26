@@ -796,7 +796,7 @@ clone_index_after_query="$(target_index_state clone-db clone_admin appdb 5432)"
 [[ "$query_endpoint_ok" == true ]] \
   || fail "Dashboard query EXPLAIN ANALYZE endpoint cagrisi basarisiz"
 
-query_runtime_summary="$("$python_bin" - "$query_response_file" "$query_id" <<'PY'
+query_runtime_summary="$("$python_bin" - "$query_response_file" "$query_id" "$database_id" <<'PY'
 import json
 import sys
 
@@ -813,16 +813,20 @@ checks = {
     and validation.get("planPreflight") == "READ_ONLY",
     "transactionReadOnly=true": isinstance(validation, dict)
     and validation.get("transactionReadOnly") is True,
-    "runnerPolicyRevision=1": isinstance(validation, dict)
-    and validation.get("runnerPolicyRevision") == 1,
+    "safetyPolicyRevision=1": isinstance(validation, dict)
+    and validation.get("safetyPolicyRevision") == 1,
+    "executionRole=advisor_evaluator": isinstance(validation, dict)
+    and validation.get("executionRole") == "advisor_evaluator",
+    "databaseId": isinstance(validation, dict)
+    and int(validation.get("databaseId", 0)) == int(sys.argv[3]),
     "plan": isinstance(validation, dict)
     and isinstance(validation.get("plan"), dict)
     and isinstance(validation["plan"].get("Plan"), dict),
-    "executionTarget=DISPOSABLE_CLONE": result.get("executionTarget")
-    == "DISPOSABLE_CLONE",
+    "executionTarget=SOURCE_DATABASE": result.get("executionTarget")
+    == "SOURCE_DATABASE",
+    "sourceExecuted=true": result.get("sourceExecuted") is True,
     "sourceDdlExecuted=false": result.get("sourceDdlExecuted") is False,
-    "cloneDdlExecuted=false": result.get("cloneDdlExecuted") is False,
-    "cloneDestroyed=true": result.get("cloneDestroyed") is True,
+    "transactionRolledBack=true": result.get("transactionRolledBack") is True,
 }
 failed = [name for name, accepted in checks.items() if not accepted]
 if failed:
@@ -835,7 +839,7 @@ print(
 PY
 )" || fail "Dashboard query runtime yaniti kabul sozlesmesini karsilamadi"
 pass "${query_runtime_summary}"
-pass "Dashboard sorgusu tek disposable clone'da, index/DDL olmadan calisti ve temizlendi"
+pass "Dashboard sorgusu ana veritabaninda gercek veri/cache ile salt-okunur calisti ve rollback edildi"
 
 unset ADVISOR_RUNTIME_ACCEPTANCE_SCALAR fixture_value
 

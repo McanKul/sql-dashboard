@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import secrets
 import statistics
 import uuid
@@ -366,12 +367,146 @@ _ROW_LOCK_SUFFIXES = {
 }
 
 
+def _is_side_effect_routine_token(token: str) -> bool:
+    # dblink() and its async/control family can execute arbitrary SQL through a
+    # second connection, outside the local READ ONLY transaction.  Prefix
+    # matching also fails closed for extension additions not yet enumerated.
+    return (
+        token in _SIDE_EFFECT_ROUTINE_TOKENS
+        or token == "DBLINK"
+        or token.startswith("DBLINK_")
+    )
+
+
 def _is_identifier_start(character: str) -> bool:
     return character == "_" or character.isalpha() or ord(character) >= 128
 
 
 def _is_identifier_continuation(character: str) -> bool:
     return _is_identifier_start(character) or character.isdigit() or character == "$"
+
+
+_PGSS_TYPED_PARAMETER = re.compile(
+    r"(?<![\w$.\"])(?P<type>(?:pg_catalog\.)?(?:"
+    r"timestamp(?:\s*\(\s*\d+\s*\))?(?:\s+(?:with|without)\s+time\s+zone)?|"
+    r"time(?:\s*\(\s*\d+\s*\))?(?:\s+(?:with|without)\s+time\s+zone)?|"
+    r"timestamptz(?:\s*\(\s*\d+\s*\))?|"
+    r"timetz(?:\s*\(\s*\d+\s*\))?|"
+    r"interval(?:\s*\(\s*\d+\s*\))?|date|"
+    r"numeric(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?|"
+    r"decimal(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?|"
+    r"double\s+precision|real|float4|float8|"
+    r"smallint|integer|bigint|int2|int4|int8|boolean|bool|"
+    r"character\s+varying(?:\s*\(\s*\d+\s*\))?|"
+    r"varchar(?:\s*\(\s*\d+\s*\))?|"
+    r"character(?:\s*\(\s*\d+\s*\))?|char(?:\s*\(\s*\d+\s*\))?|text|"
+    r"bit\s+varying(?:\s*\(\s*\d+\s*\))?|"
+    r"varbit(?:\s*\(\s*\d+\s*\))?|bit(?:\s*\(\s*\d+\s*\))?|"
+    r"uuid|jsonb|json|inet|cidr|macaddr8|macaddr|bytea|xml|money|oid"
+    r"))\s+(?P<parameter>\$[1-9]\d*)\b",
+    re.IGNORECASE,
+)
+
+
+def _rewrite_pgss_typed_parameters(query: str) -> str:
+    """Restore typed string literals normalized by pg_stat_statements.
+
+    PostgreSQL records ``INTERVAL '30 days'`` as ``interval $1``.  That text is
+    valid as a pg_stat_statements fingerprint but cannot be PREPAREd because a
+    parameter is not a string-literal token.  The equivalent ``$1::interval``
+    is replayable.  Rewriting is limited to unquoted SQL spans so comments,
+    string data, dollar-quoted values and quoted identifiers remain byte-for-
+    byte unchanged.
+    """
+
+    def rewrite_plain(segment: str) -> str:
+        def typed_cast(match: re.Match[str]) -> str:
+            type_name = re.sub(r"\s+", " ", match.group("type").strip())
+            type_name = re.sub(
+                r"\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)",
+                lambda typmod: (
+                    f"({typmod.group(1)},{typmod.group(2)})"
+                    if typmod.group(2) is not None
+                    else f"({typmod.group(1)})"
+                ),
+                type_name,
+            )
+            return f"{match.group('parameter')}::{type_name.lower()}"
+
+        return _PGSS_TYPED_PARAMETER.sub(typed_cast, segment)
+
+    output: list[str] = []
+    plain_start = 0
+    index = 0
+    length = len(query)
+
+    while index < length:
+        protected_end: int | None = None
+
+        if query.startswith("--", index):
+            line_feed = query.find("\n", index + 2)
+            carriage_return = query.find("\r", index + 2)
+            endings = [position for position in (line_feed, carriage_return) if position >= 0]
+            protected_end = min(endings) if endings else length
+        elif query.startswith("/*", index):
+            depth = 1
+            cursor = index + 2
+            while cursor < length and depth:
+                if query.startswith("/*", cursor):
+                    depth += 1
+                    cursor += 2
+                elif query.startswith("*/", cursor):
+                    depth -= 1
+                    cursor += 2
+                else:
+                    cursor += 1
+            protected_end = cursor
+        elif query[index] in {"'", '"'}:
+            delimiter = query[index]
+            escape_backslash = delimiter == "'" and index >= 1 and query[index - 1] in {"e", "E"} and (
+                index < 2 or not _is_identifier_continuation(query[index - 2])
+            )
+            cursor = index + 1
+            while cursor < length:
+                if escape_backslash and query[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if query[cursor] != delimiter:
+                    cursor += 1
+                    continue
+                if cursor + 1 < length and query[cursor + 1] == delimiter:
+                    cursor += 2
+                    continue
+                cursor += 1
+                break
+            protected_end = min(cursor, length)
+        elif query[index] == "$":
+            dollar_delimiter: str | None = None
+            if query.startswith("$$", index):
+                dollar_delimiter = "$$"
+            elif index + 1 < length and _is_identifier_start(query[index + 1]):
+                tag_end = index + 2
+                while tag_end < length and (
+                    _is_identifier_start(query[tag_end]) or query[tag_end].isdigit()
+                ):
+                    tag_end += 1
+                if tag_end < length and query[tag_end] == "$":
+                    dollar_delimiter = query[index : tag_end + 1]
+            if dollar_delimiter is not None:
+                closing = query.find(dollar_delimiter, index + len(dollar_delimiter))
+                protected_end = length if closing < 0 else closing + len(dollar_delimiter)
+
+        if protected_end is None:
+            index += 1
+            continue
+
+        output.append(rewrite_plain(query[plain_start:index]))
+        output.append(query[index:protected_end])
+        index = protected_end
+        plain_start = protected_end
+
+    output.append(rewrite_plain(query[plain_start:]))
+    return "".join(output)
 
 
 def _scan_replay_sql(query: str) -> tuple[str, list[tuple[str, int]], list[int]]:
@@ -433,8 +568,17 @@ def _scan_replay_sql(query: str) -> tuple[str, list[tuple[str, int]], list[int]]
                 raise ValueError("unterminated block comment")
             continue
 
+        # Fully decoding PostgreSQL's U&"..." + optional UESCAPE identifier
+        # grammar would duplicate the server parser and could hide a quoted
+        # side-effect routine from the denylist.  Runtime replay does not need
+        # this uncommon spelling, so fail closed before any database call.
+        if character in {"u", "U"} and query.startswith('&"', index + 1):
+            raise ValueError("unicode-escaped quoted identifiers are not replayable")
+
         if character in {"'", '"'}:
             delimiter = character
+            quoted_identifier_start = index + 1 if delimiter == '"' else None
+            quoted_identifier_end: int | None = None
             escape_backslash = False
             if index >= 1 and character == "'":
                 escape_backslash = query[index - 1] in {"e", "E"} and (
@@ -454,10 +598,24 @@ def _scan_replay_sql(query: str) -> tuple[str, list[tuple[str, int]], list[int]]
                     index += 2
                     continue
                 significant_positions.append(index)
+                quoted_identifier_end = index
                 index += 1
                 break
             else:
                 raise ValueError("unterminated quoted value")
+            if (
+                quoted_identifier_start is not None
+                and quoted_identifier_end is not None
+            ):
+                quoted_identifier = query[
+                    quoted_identifier_start:quoted_identifier_end
+                ].replace('""', '"').upper()
+                # Quoting changes identifier case rules, not a routine's side
+                # effects.  Keep the narrow denylist effective for calls such
+                # as public."dblink_exec"(...) without treating every quoted
+                # SQL keyword as a command token.
+                if _is_side_effect_routine_token(quoted_identifier):
+                    tokens.append((quoted_identifier, depth))
             continue
 
         if character == "$":
@@ -577,7 +735,7 @@ def _assert_read_only_select(
 
     tokens = [token for token, _depth in tokens_with_depth]
     if any(token in _NON_READ_TOKENS for token in tokens) or any(
-        token in _SIDE_EFFECT_ROUTINE_TOKENS for token in tokens
+        _is_side_effect_routine_token(token) for token in tokens
     ):
         raise CloneEvaluationStop(
             "UNSAFE",
@@ -618,6 +776,7 @@ def _replay_query(
             "Yalniz tek bir SELECT sorgusu calistirilabilir.",
         )
     query, parameter_numbers = _assert_read_only_select(normalized_sql)
+    query = _rewrite_pgss_typed_parameters(query)
     if not parameter_numbers:
         if values:
             raise CloneEvaluationStop(

@@ -225,11 +225,14 @@ def test_sql_scanner_only_counts_real_parameters_and_delimiters() -> None:
     assert ("DELETE", 0) not in tokens
     assert ("UPDATE", 0) not in tokens
 
-    escaped_query = r'''SELECT E'quote\\\'; $9 DELETE', U&"name\0021" FROM orders'''
+    escaped_query = r'''SELECT E'quote\\\'; $9 DELETE', "name" FROM orders'''
     scanned, escaped_tokens, escaped_parameters = _scan_replay_sql(escaped_query)
     assert scanned == escaped_query
     assert escaped_parameters == []
     assert ("DELETE", 0) not in escaped_tokens
+
+    with pytest.raises(ValueError, match="unicode-escaped quoted identifiers"):
+        _scan_replay_sql(r'SELECT U&"name\0021" FROM orders')
 
 
 def test_parameterized_replay_requires_exact_approved_scalar_fixture() -> None:
@@ -248,6 +251,14 @@ def test_parameterized_replay_requires_exact_approved_scalar_fixture() -> None:
     with pytest.raises(CloneEvaluationStop) as captured:
         _replay_query("SELECT * FROM orders WHERE status = $2", ["unused", "paid"])
     assert captured.value.reason_code == "INVALID_PARAMETER_LAYOUT"
+
+    assert _replay_query(
+        "SELECT uuid $1, interval $2, jsonb $3",
+        ["00000000-0000-0000-0000-000000000001", "1 day", "{}"],
+    ) == (
+        "SELECT $1::uuid, $2::interval, $3::jsonb",
+        ("00000000-0000-0000-0000-000000000001", "1 day", "{}"),
+    )
 
 
 @pytest.mark.parametrize(

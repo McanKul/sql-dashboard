@@ -206,6 +206,23 @@ def test_evaluator_database_url_override_remains_supported() -> None:
     assert connection["password"] == SPECIAL_PASSWORD
 
 
+def test_source_explain_timeouts_are_separate_and_transaction_is_longer() -> None:
+    settings = Settings()
+    evaluator = EvaluatorSettings()
+
+    assert settings.evaluator_timeout_seconds == 4
+    assert settings.source_explain_timeout_seconds == 130
+    assert evaluator.evaluator_statement_timeout_ms == 2_000
+    assert evaluator.evaluator_runtime_statement_timeout_ms == 120_000
+    assert evaluator.evaluator_runtime_transaction_timeout_ms == 125_000
+
+    with pytest.raises(ValidationError):
+        EvaluatorSettings(
+            evaluator_runtime_statement_timeout_ms=120_000,
+            evaluator_runtime_transaction_timeout_ms=120_000,
+        )
+
+
 def test_clone_evaluator_builds_safe_conninfo_from_separate_fields() -> None:
     settings = CloneEvaluatorSettings(
         clone_database_url=None,

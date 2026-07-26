@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import math
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 ALLOWED_STATUSES = {"NEW", "IN_REVIEW", "COMPLETED", "REJECTED"}
+SOURCE_EXPLAIN_MAX_BIND_VALUES = 128
+SOURCE_EXPLAIN_MAX_BIND_BYTES = 64 * 1024
 
 
 class AnnotationUpdate(BaseModel):
@@ -175,11 +177,11 @@ class RuntimeIndexValidationRequest(CompositeIndexEvaluationRequest):
 
 
 class QueryExplainAnalyzeRequest(BaseModel):
-    """Caller-controlled scope and bind values for clone-only query replay.
+    """Caller-controlled scope and bind values for source query replay.
 
     SQL is deliberately absent from this public contract.  The API resolves
     the statement text from its persisted query telemetry before contacting
-    the isolated clone evaluator.
+    the token-protected, read-only source evaluator.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -188,7 +190,7 @@ class QueryExplainAnalyzeRequest(BaseModel):
     databaseId: int = Field(ge=1, strict=True)
     bindValues: list[str | int | float | bool | None] = Field(
         default_factory=list,
-        max_length=16,
+        max_length=SOURCE_EXPLAIN_MAX_BIND_VALUES,
     )
 
     @field_validator("bindValues", mode="before")
@@ -212,9 +214,89 @@ class QueryExplainAnalyzeRequest(BaseModel):
                 ensure_ascii=False,
                 allow_nan=False,
             ).encode("utf-8")
-        ) > 8_192:
-            raise ValueError("bindValues UTF-8 JSON boyutu en fazla 8 KiB olabilir")
+        ) > SOURCE_EXPLAIN_MAX_BIND_BYTES:
+            raise ValueError("bindValues UTF-8 JSON boyutu en fazla 64 KiB olabilir")
         return values
+
+
+class InternalQueryExplainAnalyzeRequest(BaseModel):
+    """Server-resolved statement passed only to the source evaluator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    serverId: int = Field(ge=1, strict=True)
+    serverAlias: str = Field(min_length=1, max_length=120)
+    databaseId: int = Field(ge=1, strict=True)
+    databaseName: str = Field(min_length=1, max_length=63)
+    queryId: str = Field(min_length=1, max_length=32, pattern=r"^-?\d+$")
+    normalizedSql: str = Field(min_length=1, max_length=100_000)
+    bindValues: list[str | int | float | bool | None] = Field(
+        default_factory=list,
+        max_length=SOURCE_EXPLAIN_MAX_BIND_VALUES,
+    )
+
+    @field_validator("bindValues", mode="before")
+    @classmethod
+    def bind_values_are_bounded_json_scalars(
+        cls,
+        values: object,
+    ) -> object:
+        return QueryExplainAnalyzeRequest.bind_values_are_bounded_json_scalars(values)
+
+
+class QueryExplainAnalyzeValidation(BaseModel):
+    mode: Literal["EXPLAIN_ANALYZE"] = "EXPLAIN_ANALYZE"
+    statementClass: Literal["READ_ONLY_SELECT"] = "READ_ONLY_SELECT"
+    planPreflight: Literal["READ_ONLY"] = "READ_ONLY"
+    transactionReadOnly: Literal[True] = True
+    safetyPolicyRevision: int = Field(ge=1)
+    postgresVersion: str = Field(min_length=1)
+    executionRole: str = Field(min_length=1)
+    databaseId: int = Field(ge=1)
+    executionTimeMs: float = Field(ge=0)
+    planningTimeMs: float = Field(ge=0)
+    sharedHitBlocks: int = Field(ge=0)
+    sharedReadBlocks: int = Field(ge=0)
+    tempReadBlocks: int = Field(ge=0)
+    tempWrittenBlocks: int = Field(ge=0)
+    walRecords: int = Field(ge=0)
+    walBytes: int = Field(ge=0)
+    plan: dict[str, Any]
+    evaluatedAt: datetime
+
+    @field_validator("plan")
+    @classmethod
+    def plan_has_a_postgresql_node_tree(cls, value: dict[str, Any]) -> dict[str, Any]:
+        root = value.get("Plan")
+        if not isinstance(root, dict) or not isinstance(root.get("Node Type"), str):
+            raise ValueError("plan must contain a PostgreSQL Plan node tree")
+        return value
+
+
+class QueryExplainAnalyzeResult(BaseModel):
+    status: Literal["RUNTIME_VALIDATED", "UNAVAILABLE", "UNSAFE"]
+    reasonCode: str
+    message: str
+    queryId: str
+    validation: QueryExplainAnalyzeValidation | None = None
+    executionTarget: Literal["SOURCE_DATABASE"] = "SOURCE_DATABASE"
+    sourceExecuted: bool | None
+    sourceDdlExecuted: Literal[False] = False
+    transactionRolledBack: bool | None
+
+    @model_validator(mode="after")
+    def successful_result_is_measured_and_rolled_back(
+        self,
+    ) -> "QueryExplainAnalyzeResult":
+        if self.status == "RUNTIME_VALIDATED" and (
+            self.validation is None
+            or not self.sourceExecuted
+            or not self.transactionRolledBack
+        ):
+            raise ValueError(
+                "RUNTIME_VALIDATED requires source execution, validation and rollback"
+            )
+        return self
 
 
 class IndexCandidateSql(BaseModel):

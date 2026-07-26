@@ -115,12 +115,14 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 - Sorgu detayı WHERE, JOIN ve persisted composite aday kanıtlarını gösterir. Endpoint güvenli SQL taslağı üretebilir ama DDL çalıştırmaz.
 - `POST /api/v1/queries/{query_id}/index-evaluations`, analyst yetkisi ve repository'deki seçili predicate kimliğiyle ayrı evaluator'a kontrollü istek gönderir. İstemciden SQL veya identifier kabul edilmez.
 
-### HypoPG evaluator
+### Source evaluator: HypoPG + gerçek read-only plan
 
 - Ana API ile aynı image'dan, ayrı `uvicorn app.evaluator:app` süreci olarak çalışır ve host portu yayınlamaz.
 - Bir `EVALUATOR_DATABASE_URL`, bir izinli server alias ve bir izinli database ile sınırlandırılmıştır; referans hedef `test-source/appdb`'dir.
-- Kaynağa `advisor_evaluator` rolüyle bağlanır; read-only transaction, kısa statement/lock/transaction timeout ve connection limit uygular.
+- Kaynağa `advisor_evaluator` rolüyle bağlanır; read-only transaction, ayrı planner/runtime timeout'ları ve connection limit uygular.
 - Baseline ve sanal-index plain `EXPLAIN` planlarını aynı bağlantıda alır. Normalize parametre varsa PostgreSQL 18 `GENERIC_PLAN` kullanır; `EXPLAIN ANALYZE` çalıştırmaz.
+- Dashboard sorgu yolu exact persisted SQL'i source üzerinde gerçekten çalıştırır. Tek read-only SELECT kapısı, plain-plan preflight, canlı database OID ve rol/ACL attestation'ı geçmeden `EXPLAIN ANALYZE` başlamaz; çalışma tek slotta yürür ve transaction rollback edilir.
+- Source sonucu `executionRole=advisor_evaluator` taşır. Bu rol özgün uygulama rolü/session GUC'leri değildir; RLS, search path veya session-context bağımlı planlarda ölçüm birebir uygulama oturumu sayılmaz.
 - Yalnız uygun SELECT, en fazla iki kolonlu B-tree adayı ve mevcut eşdeğer index prefix'i bulunmayan adayları değerlendirir. RLS etkin tabloyu ve repository/canlı katalog OID uyuşmazlığını reddeder.
 - Sanal index planda kullanılır ve varsayılan `%10` planner-cost düşüşü aşılırsa `VALIDATED` döner. Yalnız bu durumda kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı bulunur; `ddlExecuted` daima `false` kalır.
 - Container salt-okunur filesystem, düşürülmüş Linux capability'leri ve ayrı internal control/source network'leriyle sınırlandırılır. API–evaluator isteği ayrı token kullanır.
@@ -131,8 +133,7 @@ Mevcut dağıtım topolojiyi tek hostta doğrular. Gerçek üretim dağıtımın
 - Varsayılan stack'te çalışmaz; yalnız `real-validation` profili açıldığında tmpfs `clone-db` ve ayrı evaluator başlar.
 - Ana API yalnız token korumalı control ağına bağlıdır ve clone DB credential'ı almaz. Clone evaluator source/repository ağı veya DSN'i almaz.
 - Restore archive'ı güvenilir girdi kabul edilir: `--no-owner`/`--no-privileges` arbitrary restore kodunu sanitize etmez. Bootstrap tmpfs, düşürülmüş capability'ler ve dış egress'i olmayan internal clone ağı içinde kalır; bilinmeyen veya doğrulanmamış dump kullanılmaz.
-- Sorgu detayındaki doğrudan yol exact persisted SQL'i backend'de çözer, browser'dan SQL kabul etmez ve tek disposable database'de gerçek index/DDL oluşturmadan bir kez `EXPLAIN ANALYZE` çalıştırır. İsteğe eklenen scalar bind değerleri kalıcılaştırılmaz. Bu kolaylık tek-kullanıcılı loopback kurulum sınırıdır; uzaktan erişimde ayrıca kimlik doğrulama ve rate limit gerekir.
-- Gerçek-index karşılaştırma işi için aynı template'ten ayrı baseline/candidate database üretilir; gerçek index yalnız candidate clone'da kurulur ve iş sonunda iki database zorunlu olarak silinir. Doğrudan sorgu planı işi ise tek `advisor_query_*` database kullanır ve DDL çalıştırmaz. Kaynak hiçbir zaman DDL veya replay hedefi değildir.
+- Gerçek-index karşılaştırma işi için aynı template'ten ayrı baseline/candidate database üretilir; gerçek index yalnız candidate clone'da kurulur ve iş sonunda iki database zorunlu olarak silinir. Bu karşılaştırma yolunda kaynak hiçbir zaman DDL veya replay hedefi değildir; dashboard'ın doğrudan sorgu ölçümü clone evaluator'dan değil source evaluator'dan geçer.
 - DDL veya replay öncesinde cluster marker'ı, beklenen admin kimliği, `datistemplate` ve template manifesti doğrulanır. Request source alias/database kimliği yapılandırılmış clone kaynağı ve manifestteki source bağıyla birebir eşleşmezse ya da manifest beklenen runner policy revision'ını ve dangerous-routine hardening kanıtını taşımazsa job fail-closed durur.
 - Replay yalnız tek bir salt-okunur `SELECT` kabul eder. Yapısal lexical/statement kapısı multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row lock ve açık denylist'teki yan etkili routine adlarını reddeder; bütün routine'ler için genel bir volatility sınıflandırıcısı değildir.
 - Runner `pg_read_all_data` taşısa da yalnız egress'siz internal clone ağına erişir. Her aktif transaction'da runner kimliği/rol bayrakları ve üyeliği, read-only ayarları/timeout'lar, TEMP/CREATE yokluğu, dangerous/volatile routine `EXECUTE` yokluğu ve foreign-server `USAGE` yokluğu yeniden atteste edilir. PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) plan preflight'ı ayrıca `ModifyTable`, `LockRows`, `Foreign Scan` ve `Custom Scan` düğümlerini reddeder; bir uyuşmazlıkta `EXPLAIN ANALYZE` başlamaz ve transaction koşulsuz rollback edilir.
@@ -218,7 +219,7 @@ Sorgu analiz listesi `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE` ve `MERGE` i
 |---|---|---|---|
 | `postgres` | Yönetici | Yönetici | Yalnız bootstrap/test |
 | `powa_collector` | Etkin `CONNECT`, `pg_read_all_stats`, PoWA snapshot/execute ve yalnız atomik `capture_and_reset()` wrapper'ı | PoWA read/write/snapshot | Snapshot taşıma |
-| `advisor_evaluator` | Yalnız yapılandırılmış DB/schema/table SELECT ve üç HypoPG fonksiyonu; read-only, connection limit 2 | Yok | İsteğe bağlı plain-EXPLAIN plan doğrulaması |
+| `advisor_evaluator` | Yalnız yapılandırılmış DB/schema/table SELECT ve üç HypoPG fonksiyonu; read-only, connection limit 2 | Yok | HypoPG plain planı ve kullanıcı başlattığında source `EXPLAIN ANALYZE` |
 | `advisor_join_reader` | Yalnız JOIN outbox `fetch/ack` fonksiyonları | Yok | Source batch okuma ve teslim sonrası ack |
 | `advisor_join_ingest` | Yok | Tek server kimliğine bağlı private ingest/status/source-purge wrapper'ları; tablo ve global purge erişimi yok | JOIN batch yazımı |
 | `advisor_workload_login` | Yalnız opt-in realistic test rollerine `SET ROLE` ve stats okuma; admin yetkisi yok | Yok | İzole source üzerinde karma yük oturumlarını açma |
@@ -244,7 +245,7 @@ sabit subject'tir; `X-Advisor-Actor`, `X-Advisor-Admin-Token` ve body
 - Predicate/index-adayı gözlem paneli ve dar kapsamlı HypoPG doğrulaması vardır. Yalnız `VALIDATED` sonuç kopyalanabilir `CREATE INDEX CONCURRENTLY` taslağı taşır; otomatik DDL, index silme veya SQL rewrite yoktur.
 - HypoPG kapsamı SELECT/tek statement, en fazla iki kolonlu B-tree adayı ve yapılandırılmış tek alias/database ile sınırlıdır. DML, expression/partial/covering index ve çoklu evaluator routing desteklenmez.
 - Planner cost düşüşü gerçek süre garantisi değildir; gösterilen SQL üretimde ayrıca DBA incelemesi gerektirir.
-- Doğrudan query runtime sonucu yalnız seçilen clone template verisi, istatistikleri ve o istekte girilen geçici bind değerleri için geçerlidir. Gerçek-index karşılaştırma sonucu ayrıca operator onaylı sentetik/anonim fixture ve seçilen cache profiline bağlıdır. Her iki yol da tek-read-only-statement kapısı, plain-plan preflight'ı, aktif runner attestation'ı ve template policy revision kontrolünden biri geçmezse `EXPLAIN ANALYZE` başlamadan fail-closed durur.
+- Doğrudan query runtime sonucu gerçek source verisi/cache'i ve o istekte girilen geçici bind değerleri için geçerlidir; fakat `advisor_evaluator` özgün uygulama rolü/session GUC'leri değildir ve sonuç istemciye satır serialize/network aktarım süresini ölçmez. Gerçek-index karşılaştırma sonucu operator onaylı sentetik/anonim fixture, clone verisi ve seçilen cache profiline bağlıdır. Source yolu rol/OID/read-only attestation, clone yolu runner/template attestation kapılarından biri geçmezse `EXPLAIN ANALYZE` başlamadan fail-closed durur.
 - PostgreSQL 18.x + PoWA 5.2 ile geçmiş lock/blocker zinciri sunulmaz. PoWA'nın `pg_stat_lock` veri kaynağı PostgreSQL 19 gerektirir; UI bunu unavailable capability olarak açıklar.
 - Fresh demo snapshot frekansı üretim-temsili olarak 60 saniyedir. Yalnız kısa yerel acceptance için yeni volume'de 5 saniyeye indirilebilir; canlıda ölçülen yük ve ihtiyaç doğrultusunda seçilmelidir.
 - Kaynakta PoWA ile `pg_stat_statements`, `pg_qualstats`, `pg_stat_kcache` ve `pg_wait_sampling` binary/preload hazırlığı gerekir; salt bağlantı parolası vanilla PostgreSQL'ü izlenebilir hale getirmez.
