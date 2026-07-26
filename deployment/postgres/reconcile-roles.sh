@@ -14,7 +14,7 @@ port="${PGPORT:-5432}"
 # Bump when the desired role policy changes even if the secret set and marker
 # file format do not. Existing volumes must run the new reconciliation once
 # instead of accepting a state produced by an older image.
-policy_revision="3"
+policy_revision="4"
 
 fail() {
   printf 'Role reconciliation error: %s\n' "$1" >&2
@@ -170,6 +170,22 @@ role_state_fingerprint() {
       'rolreplication', CASE WHEN auth.rolname = CURRENT_USER THEN NULL ELSE auth.rolreplication END,
       'rolbypassrls', CASE WHEN auth.rolname = CURRENT_USER THEN NULL ELSE auth.rolbypassrls END,
       'rolconnlimit', CASE WHEN auth.rolname = CURRENT_USER THEN NULL ELSE auth.rolconnlimit END,
+      'rolmemberships', CASE WHEN auth.rolname <> 'clone_runner' THEN NULL ELSE (
+        SELECT pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'role', granted_role.rolname,
+            'grantor', grantor.rolname,
+            'admin_option', membership.admin_option,
+            'inherit_option', membership.inherit_option,
+            'set_option', membership.set_option
+          )
+          ORDER BY granted_role.rolname, grantor.rolname
+        )
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_authid AS granted_role ON granted_role.oid = membership.roleid
+        JOIN pg_catalog.pg_authid AS grantor ON grantor.oid = membership.grantor
+        WHERE membership.member = auth.oid
+      ) END,
       'rolconfig', CASE WHEN auth.rolname = CURRENT_USER THEN NULL ELSE (
         SELECT pg_catalog.jsonb_object_agg(
           COALESCE(db.datname, '*'), setting.setconfig
@@ -338,7 +354,19 @@ SELECT format('ALTER ROLE %I PASSWORD %L VALID UNTIL ''infinity''', CURRENT_USER
 ALTER ROLE powa_collector LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD :'collector_password' VALID UNTIL 'infinity';
 ALTER ROLE advisor_evaluator LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2 PASSWORD :'evaluator_password' VALID UNTIL 'infinity';
 ALTER ROLE advisor_join_reader LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2 PASSWORD :'join_password' VALID UNTIL 'infinity';
-ALTER ROLE clone_runner LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'runner_password' VALID UNTIL 'infinity';
+ALTER ROLE clone_runner LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'runner_password' VALID UNTIL 'infinity';
+SELECT format(
+    'REVOKE %I FROM clone_runner GRANTED BY %I CASCADE',
+    granted_role.rolname,
+    grantor.rolname
+)
+FROM pg_catalog.pg_auth_members AS membership
+JOIN pg_catalog.pg_roles AS granted_role ON granted_role.oid = membership.roleid
+JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = membership.grantor
+WHERE membership.member = 'clone_runner'::pg_catalog.regrole
+\gexec
+GRANT pg_read_all_data TO clone_runner
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
 SELECT format('ALTER ROLE %I IN DATABASE %I RESET ALL', auth.rolname, db.datname)
 FROM pg_catalog.pg_db_role_setting AS setting
 JOIN pg_catalog.pg_authid AS auth ON auth.oid = setting.setrole
@@ -371,6 +399,7 @@ ALTER ROLE clone_runner SET idle_in_transaction_session_timeout = '15s';
 ALTER ROLE clone_runner SET temp_file_limit = '256MB';
 ALTER ROLE clone_runner SET row_security = on;
 ALTER ROLE clone_runner SET jit = off;
+ALTER ROLE clone_runner SET search_path = pg_catalog, public;
 COMMIT;
 \else
 ROLLBACK;

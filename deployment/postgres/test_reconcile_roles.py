@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("reconcile-roles.sh")
+CLONE_INIT_SCRIPT = SCRIPT.parents[1] / "clone" / "init-clone.sh"
 
 
 class RoleReconcilerTest(unittest.TestCase):
@@ -115,7 +116,7 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
         self.assertIn("'rolvaliduntil', auth.rolvaliduntil", capture_after_first)
         self.assertIn("\\getenv api_password ADVISOR_API_PASSWORD", capture_after_first)
         self.assertIn("-c pg_stat_statements.track=none", capture_after_first)
-        self.assertIn('policy_revision="3"', SCRIPT.read_text())
+        self.assertIn('policy_revision="4"', SCRIPT.read_text())
         self.assertIn("advisor-role-reconciler-policy-v${policy_revision}", SCRIPT.read_text())
         self.assertIn("app=advisor-role-reconciler", capture_after_first)
         self.assertIn("SET LOCAL log_statement = 'none'", capture_after_first)
@@ -239,6 +240,10 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
         self.assertIn("'rolconnlimit'", capture)
         self.assertIn("'rolvaliduntil'", capture)
         self.assertIn("'rolconfig'", capture)
+        self.assertIn("'rolmemberships'", capture)
+        self.assertIn("'admin_option', membership.admin_option", capture)
+        self.assertIn("'inherit_option', membership.inherit_option", capture)
+        self.assertIn("'set_option', membership.set_option", capture)
 
     def test_source_and_clone_profiles_keep_fixed_roles_least_privileged(self) -> None:
         source = self.run_reconciler("source")
@@ -298,8 +303,18 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
                 2,
             )
         self.assertIn(
-            "ALTER ROLE clone_runner LOGIN NOINHERIT NOSUPERUSER NOCREATEDB "
+            "ALTER ROLE clone_runner LOGIN INHERIT NOSUPERUSER NOCREATEDB "
             "NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4",
+            capture,
+        )
+        self.assertNotIn("ALTER ROLE clone_runner LOGIN NOINHERIT", capture)
+        self.assertIn(
+            "REVOKE %I FROM clone_runner GRANTED BY %I CASCADE",
+            capture,
+        )
+        self.assertIn(
+            "GRANT pg_read_all_data TO clone_runner\n"
+            "  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;",
             capture,
         )
         self.assertIn("ALTER ROLE advisor_evaluator RESET ALL", capture)
@@ -309,7 +324,86 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
         )
         self.assertIn("ALTER ROLE clone_runner RESET ALL", capture)
         self.assertIn("ALTER ROLE clone_runner SET row_security = on", capture)
+        self.assertIn(
+            "ALTER ROLE clone_runner SET search_path = pg_catalog, public",
+            capture,
+        )
         self.assert_secrets_absent(source.stdout, source.stderr, clone.stdout, clone.stderr, capture)
+
+    def test_clone_init_hardens_restored_runner_capabilities_and_manifest(self) -> None:
+        script = CLONE_INIT_SCRIPT.read_text()
+
+        self.assertIn(
+            "CREATE ROLE clone_runner LOGIN INHERIT PASSWORD %L NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4",
+            script,
+        )
+        self.assertIn(
+            "ALTER ROLE clone_runner LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE",
+            script,
+        )
+        self.assertIn("ALTER ROLE clone_runner RESET ALL;", script)
+        self.assertIn(
+            "ALTER ROLE clone_runner SET search_path = pg_catalog, public;",
+            script,
+        )
+        self.assertIn(
+            "GRANT pg_read_all_data TO clone_runner\n"
+            "  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;",
+            script,
+        )
+        self.assertIn(
+            'REVOKE CONNECT, TEMPORARY ON DATABASE :"clone_database" FROM PUBLIC;',
+            script,
+        )
+        self.assertIn(
+            'REVOKE CONNECT, TEMPORARY ON DATABASE :"clone_database" FROM clone_runner;',
+            script,
+        )
+        self.assertIn(
+            "REVOKE CREATE ON SCHEMA %I FROM PUBLIC, clone_runner",
+            script,
+        )
+        self.assertIn("namespace.nspname NOT LIKE 'pg_temp_%'", script)
+        self.assertIn("namespace.nspname NOT LIKE 'pg_toast_temp_%'", script)
+        self.assertEqual(script.count("routine.provolatile = 'v'"), 2)
+        self.assertEqual(script.count("routine.prosecdef"), 2)
+        self.assertEqual(script.count("routine.prokind = 'p'"), 2)
+        self.assertEqual(
+            script.count("namespace.nspname <> 'pg_catalog'"),
+            2,
+        )
+        self.assertEqual(
+            script.count("namespace.nspname <> 'information_schema'"),
+            2,
+        )
+        self.assertEqual(
+            script.count("language.lanname NOT IN ('sql', 'plpgsql')"),
+            2,
+        )
+        self.assertIn(
+            "REVOKE EXECUTE ON ROUTINE %I.%I(%s) FROM PUBLIC, clone_runner",
+            script,
+        )
+        self.assertIn(
+            "REVOKE USAGE ON FOREIGN SERVER %I FROM PUBLIC, clone_runner",
+            script,
+        )
+        self.assertIn(
+            "pg_catalog.has_function_privilege('clone_runner', routine.oid, 'EXECUTE')",
+            script,
+        )
+        self.assertIn("runner_policy_revision integer NOT NULL DEFAULT 1", script)
+        self.assertIn("dangerous_routines_revoked boolean NOT NULL DEFAULT true", script)
+        self.assertIn("VALUES (true, :'template_restored'::boolean, 1, true)", script)
+        self.assertIn(
+            "runner_policy_revision = EXCLUDED.runner_policy_revision",
+            script,
+        )
+        self.assertIn(
+            "dangerous_routines_revoked = EXCLUDED.dangerous_routines_revoked",
+            script,
+        )
 
 
 if __name__ == "__main__":

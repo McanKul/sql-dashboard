@@ -4,6 +4,51 @@ set -Eeuo pipefail
 pass() { printf '[OK] %s\n' "$1"; }
 fail() { printf '[HATA] %s\n' "$1" >&2; exit 1; }
 
+policy_probe_database=""
+response_file=""
+
+cleanup_policy_probe() {
+  local target_database="${policy_probe_database:-}"
+  [[ -n "$target_database" ]] || return 0
+  [[ "$target_database" =~ ^advisor_policy_probe_[0-9]+_[0-9]+$ ]] || return 1
+
+  docker compose --profile real-validation exec -T clone-db \
+    psql -X --set=ON_ERROR_STOP=1 \
+      --username clone_admin --port 5432 --dbname postgres \
+      --set=probe_database="$target_database" >/dev/null 2>&1 <<'SQL'
+SELECT pg_catalog.pg_terminate_backend(activity.pid)
+FROM pg_catalog.pg_stat_activity AS activity
+WHERE activity.datname = :'probe_database'
+  AND activity.pid <> pg_catalog.pg_backend_pid();
+SELECT pg_catalog.format(
+    'DROP DATABASE IF EXISTS %I WITH (FORCE)',
+    :'probe_database'
+)
+\gexec
+SQL
+
+  local remaining
+  remaining="$(
+    docker compose --profile real-validation exec -T clone-db \
+      psql -X --set=ON_ERROR_STOP=1 \
+        --username clone_admin --port 5432 --dbname postgres \
+        --tuples-only --no-align --set=probe_database="$target_database" <<'SQL'
+SELECT count(*)
+FROM pg_catalog.pg_database
+WHERE datname = :'probe_database';
+SQL
+  )" || return 1
+  [[ "$remaining" == "0" ]] || return 1
+  policy_probe_database=""
+}
+
+cleanup_artifacts() {
+  set +e
+  cleanup_policy_probe >/dev/null 2>&1
+  [[ -n "${response_file:-}" ]] && rm -f -- "$response_file"
+}
+trap cleanup_artifacts EXIT
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_dir="$(cd -- "${script_dir}/.." && pwd -P)"
 cd "$project_dir"
@@ -210,9 +255,199 @@ clone_manifest_state() {
       --tuples-only --no-align --field-separator='|' <<'SQL'
 SELECT
     count(*) = 1,
-    coalesce(bool_and(NOT source_ddl_executed), false)
+    coalesce(bool_and(NOT source_ddl_executed), false),
+    coalesce(bool_and(runner_policy_revision = 1), false),
+    coalesce(bool_and(dangerous_routines_revoked), false)
 FROM advisor_clone_meta.template_manifest
 WHERE singleton;
+SQL
+}
+
+clone_runner_policy_state() {
+  docker compose --profile real-validation exec -T clone-db \
+    psql -X --set=ON_ERROR_STOP=1 \
+      --username clone_admin --port 5432 --dbname appdb \
+      --tuples-only --no-align --field-separator='|' <<'SQL'
+WITH runner AS (
+    SELECT role.*
+    FROM pg_catalog.pg_roles AS role
+    WHERE role.rolname = 'clone_runner'
+), role_policy AS (
+    SELECT count(*) = 1
+       AND coalesce(bool_and(
+               role.rolcanlogin
+           AND role.rolinherit
+           AND NOT role.rolsuper
+           AND NOT role.rolcreatedb
+           AND NOT role.rolcreaterole
+           AND NOT role.rolreplication
+           AND NOT role.rolbypassrls
+           AND role.rolconnlimit = 4
+           AND role.rolvaliduntil = 'infinity'::timestamptz
+           AND 'default_transaction_read_only=on' = ANY(
+                   coalesce(role.rolconfig, ARRAY[]::text[])
+               )
+           AND 'search_path=pg_catalog, public' = ANY(
+                   coalesce(role.rolconfig, ARRAY[]::text[])
+               )
+       ), false) AS exact
+    FROM runner AS role
+), membership_policy AS (
+    SELECT count(*) = 1
+       AND coalesce(bool_and(
+               granted_role.rolname = 'pg_read_all_data'
+           AND membership.inherit_option
+           AND NOT membership.set_option
+           AND NOT membership.admin_option
+           AND NOT EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_auth_members AS inherited_membership
+                   WHERE inherited_membership.member = granted_role.oid
+               )
+       ), false) AS exact
+    FROM pg_catalog.pg_auth_members AS membership
+    JOIN pg_catalog.pg_roles AS granted_role
+      ON granted_role.oid = membership.roleid
+    WHERE membership.member = 'clone_runner'::pg_catalog.regrole
+), template_acl_policy AS (
+    SELECT
+        NOT pg_catalog.has_database_privilege(
+            'clone_runner', pg_catalog.current_database(), 'CONNECT'
+        )
+        AND NOT pg_catalog.has_database_privilege(
+            'clone_runner', pg_catalog.current_database(), 'TEMPORARY'
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_database AS database
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                coalesce(
+                    database.datacl,
+                    pg_catalog.acldefault('d', database.datdba)
+                )
+            ) AS privilege
+            WHERE database.datname = pg_catalog.current_database()
+              AND privilege.grantee = 0
+              AND privilege.privilege_type IN ('CONNECT', 'TEMPORARY')
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_namespace AS namespace
+            WHERE namespace.nspname NOT LIKE 'pg_temp\_%' ESCAPE '\'
+              AND namespace.nspname NOT LIKE 'pg_toast_temp\_%' ESCAPE '\'
+              AND pg_catalog.has_schema_privilege(
+                  'clone_runner', namespace.oid, 'CREATE'
+              )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_namespace AS namespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                coalesce(
+                    namespace.nspacl,
+                    pg_catalog.acldefault('n', namespace.nspowner)
+                )
+            ) AS privilege
+            WHERE namespace.nspname NOT LIKE 'pg_temp\_%' ESCAPE '\'
+              AND namespace.nspname NOT LIKE 'pg_toast_temp\_%' ESCAPE '\'
+              AND privilege.grantee = 0
+              AND privilege.privilege_type = 'CREATE'
+        ) AS exact
+), dangerous_routines AS (
+    SELECT routine.oid
+    FROM pg_catalog.pg_proc AS routine
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = routine.pronamespace
+    JOIN pg_catalog.pg_language AS language
+      ON language.oid = routine.prolang
+    WHERE routine.provolatile = 'v'
+       OR routine.prosecdef
+       OR routine.prokind = 'p'
+       OR (
+              namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND namespace.nspname NOT LIKE 'pg_toast%'
+          AND namespace.nspname NOT LIKE 'pg_temp\_%' ESCAPE '\'
+          AND language.lanname NOT IN ('sql', 'plpgsql')
+       )
+), routine_policy AS (
+    SELECT NOT EXISTS (
+        SELECT 1
+        FROM dangerous_routines AS routine
+        WHERE pg_catalog.has_function_privilege(
+            'clone_runner', routine.oid, 'EXECUTE'
+        )
+    ) AS exact
+), foreign_server_policy AS (
+    SELECT NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_foreign_server AS server
+        WHERE pg_catalog.has_server_privilege(
+            'clone_runner', server.oid, 'USAGE'
+        )
+    ) AS exact
+)
+SELECT role_policy.exact,
+       membership_policy.exact,
+       template_acl_policy.exact,
+       routine_policy.exact,
+       foreign_server_policy.exact
+FROM role_policy
+CROSS JOIN membership_policy
+CROSS JOIN template_acl_policy
+CROSS JOIN routine_policy
+CROSS JOIN foreign_server_policy;
+SQL
+}
+
+policy_probe_state() {
+  local target_database="$1"
+  [[ "$target_database" =~ ^advisor_policy_probe_[0-9]+_[0-9]+$ ]] \
+    || return 1
+  docker compose --profile real-validation exec -T clone-db \
+    psql -X --set=ON_ERROR_STOP=1 \
+      --username clone_admin --port 5432 --dbname "$target_database" \
+      --tuples-only --no-align --field-separator='|' <<'SQL'
+WITH schema_objects AS (
+    SELECT relation.relkind::text || ':' || relation.relname || ':'
+           || relation.relpersistence::text || ':' || owner.rolname AS identity
+    FROM pg_catalog.pg_class AS relation
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles AS owner ON owner.oid = relation.relowner
+    WHERE namespace.nspname = 'advisor_policy_probe'
+), object_fingerprint AS (
+    SELECT pg_catalog.md5(
+        coalesce(pg_catalog.string_agg(identity, ',' ORDER BY identity), '')
+    ) AS value
+    FROM schema_objects
+)
+SELECT (
+           SELECT count(*)
+           FROM advisor_policy_probe.sentinel
+       ),
+       (
+           SELECT pg_catalog.string_agg(
+               id::text || ':' || marker,
+               ',' ORDER BY id
+           )
+           FROM advisor_policy_probe.sentinel
+       ),
+       sequence.last_value,
+       sequence.is_called,
+       namespace_owner.rolname,
+       object_fingerprint.value,
+       pg_catalog.to_regclass(
+           'advisor_policy_probe.forbidden_ddl'
+       ) IS NULL,
+       pg_catalog.to_regclass(
+           'advisor_policy_probe.forbidden_select_into'
+       ) IS NULL
+FROM advisor_policy_probe.sentinel_sequence AS sequence
+CROSS JOIN pg_catalog.pg_namespace AS namespace
+JOIN pg_catalog.pg_roles AS namespace_owner
+  ON namespace_owner.oid = namespace.nspowner
+CROSS JOIN object_fingerprint
+WHERE namespace.nspname = 'advisor_policy_probe';
 SQL
 }
 
@@ -233,8 +468,13 @@ clone_cluster_before="$(clone_cluster_state)"
   || fail "Clone cluster/template preflight'i beklenmiyor: ${clone_cluster_before:-bos}"
 
 clone_manifest_before="$(clone_manifest_state)"
-[[ "$clone_manifest_before" == "t|t" ]] \
-  || fail "Clone template manifest'i source DDL'siz degil: ${clone_manifest_before:-bos}"
+[[ "$clone_manifest_before" == "t|t|t|t" ]] \
+  || fail "Clone template manifest/policy kaniti gecersiz: ${clone_manifest_before:-bos}"
+
+clone_runner_policy_before="$(clone_runner_policy_state)"
+[[ "$clone_runner_policy_before" == "t|t|t|t|t" ]] \
+  || fail "Clone runner rol/uyelik/ACL/routine/foreign-server policy'si gecersiz: ${clone_runner_policy_before:-bos}"
+pass "Clone manifest revision=1 ve runner rol/ACL/routine policy'si fail-closed"
 
 clone_index_before="$(target_index_state clone-db clone_admin appdb 5432)"
 IFS='|' read -r clone_relation_before clone_candidate_indexes_before clone_fingerprint_before \
@@ -244,6 +484,223 @@ IFS='|' read -r clone_relation_before clone_candidate_indexes_before clone_finge
    && "$clone_fingerprint_before" =~ ^[0-9a-f]{32}$ ]] \
   || fail "Clone template index preflight'i beklenmiyor: ${clone_index_before:-bos}"
 pass "Kaynak, repository ve clone template DDL/kalinti preflight'i temiz"
+
+policy_probe_database="advisor_policy_probe_$$_${RANDOM}"
+[[ "$policy_probe_database" =~ ^advisor_policy_probe_[0-9]+_[0-9]+$ ]] \
+  || fail "Disposable policy probe database adi guvenli uretilmedi"
+
+policy_probe_exists="$(
+  docker compose --profile real-validation exec -T clone-db \
+    psql -X --set=ON_ERROR_STOP=1 \
+      --username clone_admin --port 5432 --dbname postgres \
+      --tuples-only --no-align --set=probe_database="$policy_probe_database" <<'SQL'
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_database
+    WHERE datname = :'probe_database'
+);
+SQL
+)"
+[[ "$policy_probe_exists" == "f" ]] \
+  || fail "Disposable policy probe database adi zaten kullanimda"
+
+policy_probe_created=false
+for attempt in $(seq 1 10); do
+  if docker compose --profile real-validation exec -T clone-db \
+    psql -X --set=ON_ERROR_STOP=1 \
+      --username clone_admin --port 5432 --dbname postgres \
+      --set=probe_database="$policy_probe_database" >/dev/null 2>&1 <<'SQL'
+SELECT pg_catalog.pg_terminate_backend(activity.pid)
+FROM pg_catalog.pg_stat_activity AS activity
+WHERE activity.datname = 'appdb'
+  AND activity.pid <> pg_catalog.pg_backend_pid();
+SELECT pg_catalog.format(
+    'CREATE DATABASE %I WITH TEMPLATE %I OWNER %I',
+    :'probe_database',
+    'appdb',
+    'clone_admin'
+)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_database
+    WHERE datname = :'probe_database'
+)
+\gexec
+SQL
+  then
+    policy_probe_created=true
+    break
+  fi
+  [[ "$attempt" == "10" ]] || sleep 1
+done
+[[ "$policy_probe_created" == true ]] \
+  || fail "Disposable policy probe database template'ten olusturulamadi"
+
+docker compose --profile real-validation exec -T clone-db \
+  psql -X --set=ON_ERROR_STOP=1 \
+    --username clone_admin --port 5432 --dbname postgres \
+    --set=probe_database="$policy_probe_database" >/dev/null <<'SQL'
+SELECT pg_catalog.format(
+    'REVOKE ALL PRIVILEGES ON DATABASE %I FROM PUBLIC, clone_runner',
+    :'probe_database'
+)
+\gexec
+SELECT pg_catalog.format(
+    'GRANT CONNECT ON DATABASE %I TO clone_runner',
+    :'probe_database'
+)
+\gexec
+SQL
+
+docker compose --profile real-validation exec -T clone-db \
+  psql -X --set=ON_ERROR_STOP=1 \
+    --username clone_admin --port 5432 --dbname "$policy_probe_database" \
+    >/dev/null <<'SQL'
+CREATE SCHEMA advisor_policy_probe AUTHORIZATION clone_admin;
+REVOKE ALL ON SCHEMA advisor_policy_probe FROM PUBLIC, clone_runner;
+CREATE TABLE advisor_policy_probe.sentinel (
+    id integer PRIMARY KEY,
+    marker text NOT NULL
+);
+INSERT INTO advisor_policy_probe.sentinel(id, marker)
+VALUES (1, 'original');
+CREATE SEQUENCE advisor_policy_probe.sentinel_sequence START WITH 41;
+REVOKE ALL ON ALL TABLES IN SCHEMA advisor_policy_probe FROM PUBLIC, clone_runner;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA advisor_policy_probe FROM PUBLIC, clone_runner;
+SQL
+
+policy_probe_before="$(policy_probe_state "$policy_probe_database")"
+IFS='|' read -r \
+  probe_row_count probe_rows probe_sequence_value probe_sequence_called \
+  probe_schema_owner probe_object_fingerprint probe_ddl_absent \
+  probe_select_into_absent probe_state_extra \
+  <<<"$policy_probe_before"
+[[ "$probe_row_count" == "1" \
+   && "$probe_rows" == "1:original" \
+   && "$probe_sequence_value" == "41" \
+   && "$probe_sequence_called" == "f" \
+   && "$probe_schema_owner" == "clone_admin" \
+   && "$probe_object_fingerprint" =~ ^[0-9a-f]{32}$ \
+   && "$probe_ddl_absent" == "t" \
+   && "$probe_select_into_absent" == "t" \
+   && -z "${probe_state_extra:-}" ]] \
+  || fail "Disposable policy sentinel preflight'i gecersiz: ${policy_probe_before:-bos}"
+
+docker compose --profile real-validation exec -T \
+  -e POLICY_PROBE_DATABASE="$policy_probe_database" \
+  clone-evaluator python - <<'PY'
+import os
+
+import psycopg
+
+
+database_name = os.environ["POLICY_PROBE_DATABASE"]
+if not database_name.startswith("advisor_policy_probe_"):
+    raise SystemExit("invalid policy probe database")
+
+connection_kwargs = {
+    "host": os.environ.get("CLONE_DATABASE_HOST", "clone-db"),
+    "port": int(os.environ.get("CLONE_DATABASE_PORT", "5432")),
+    "dbname": database_name,
+    "user": os.environ.get("CLONE_RUNNER_ROLE", "clone_runner"),
+    "password": os.environ["CLONE_RUNNER_PASSWORD"],
+    "connect_timeout": 5,
+    "application_name": "postgresql-advisor-policy-probe",
+}
+sslmode = os.environ.get("CLONE_DATABASE_SSLMODE")
+if sslmode:
+    connection_kwargs["sslmode"] = sslmode
+
+
+def expect_policy_rejection(cursor, label: str, statement: str) -> None:
+    cursor.execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
+    read_only = cursor.execute(
+        "SELECT current_setting('transaction_read_only')"
+    ).fetchone()
+    if read_only != ("on",):
+        cursor.execute("ROLLBACK")
+        raise SystemExit(f"{label}: transaction is not read-only")
+    try:
+        cursor.execute(statement, prepare=True)
+    except psycopg.Error as error:
+        sqlstate = error.sqlstate
+        cursor.execute("ROLLBACK")
+        if sqlstate not in {"25006", "42501"}:
+            raise SystemExit(f"{label}: unexpected SQLSTATE {sqlstate}") from error
+        return
+    cursor.execute("ROLLBACK")
+    raise SystemExit(f"{label}: statement unexpectedly succeeded")
+
+
+with psycopg.connect(**connection_kwargs, autocommit=True) as connection:
+    with connection.cursor() as cursor:
+        runner_state = cursor.execute(
+            "SELECT current_user, "
+            "current_setting('default_transaction_read_only'), "
+            "replace(current_setting('search_path'), ' ', ''), "
+            "NOT has_database_privilege(current_user, current_database(), 'TEMPORARY'), "
+            "NOT EXISTS ("
+            "  SELECT 1 FROM pg_namespace AS namespace "
+            "  WHERE namespace.nspname NOT LIKE 'pg_temp_%' "
+            "    AND namespace.nspname NOT LIKE 'pg_toast_temp_%' "
+            "    AND has_schema_privilege(current_user, namespace.oid, 'CREATE')"
+            ")"
+        ).fetchone()
+        if runner_state != ("clone_runner", "on", "pg_catalog,public", True, True):
+            raise SystemExit("active clone runner policy mismatch")
+
+        sentinel = cursor.execute(
+            "SELECT id, marker FROM advisor_policy_probe.sentinel ORDER BY id",
+            prepare=True,
+        ).fetchall()
+        if sentinel != [(1, "original")]:
+            raise SystemExit("clone runner cannot read the sentinel deterministically")
+
+        expect_policy_rejection(
+            cursor,
+            "DML",
+            "UPDATE advisor_policy_probe.sentinel "
+            "SET marker = 'changed' WHERE id = 1",
+        )
+        expect_policy_rejection(
+            cursor,
+            "DDL",
+            "CREATE TABLE advisor_policy_probe.forbidden_ddl(id integer)",
+        )
+        expect_policy_rejection(
+            cursor,
+            "SELECT INTO",
+            "SELECT * INTO advisor_policy_probe.forbidden_select_into "
+            "FROM advisor_policy_probe.sentinel",
+        )
+        expect_policy_rejection(
+            cursor,
+            "nextval",
+            "SELECT pg_catalog.nextval("
+            "'advisor_policy_probe.sentinel_sequence'::pg_catalog.regclass)",
+        )
+
+        try:
+            cursor.execute("SELECT 1; SELECT 2", prepare=True)
+        except psycopg.Error as error:
+            if error.sqlstate != "42601":
+                raise SystemExit(
+                    f"multi-statement prepare returned SQLSTATE {error.sqlstate}"
+                ) from error
+        else:
+            raise SystemExit("prepare=True accepted multiple statements")
+
+        single_statement = cursor.execute("SELECT 1", prepare=True).fetchone()
+        if single_statement != (1,):
+            raise SystemExit("prepare=True single-statement control failed")
+PY
+
+policy_probe_after="$(policy_probe_state "$policy_probe_database")"
+[[ "$policy_probe_after" == "$policy_probe_before" ]] \
+  || fail "READ ONLY policy probe sentinel tablo/sequence/sema durumunu degistirdi"
+cleanup_policy_probe \
+  || fail "Disposable policy probe database temizlenemedi"
+pass "Runner READ ONLY DML/DDL/SELECT INTO/nextval'i reddetti; prepare=True tek statement ve sentinel degismezligi dogrulandi"
 
 fixture_value="${RUNTIME_VALIDATION_BIND_VALUE:-paid}"
 export ADVISOR_RUNTIME_ACCEPTANCE_SCALAR="$fixture_value"
@@ -270,10 +727,6 @@ unset fixture_json
 pass "Tek sentetik scalar replay fixture operator kayit yoluyla hazirlandi"
 
 response_file="$(mktemp "${TMPDIR:-/tmp}/advisor-real-validation.XXXXXX")"
-cleanup_response() {
-  [[ -n "${response_file:-}" ]] && rm -f -- "$response_file"
-}
-trap cleanup_response EXIT
 
 endpoint_call_ok=false
 if docker compose --profile real-validation exec -T \
@@ -363,6 +816,14 @@ validation = result.get("validation")
 checks = {
     "candidateId": str(result.get("candidateId", "")).lower() == sys.argv[2].lower(),
     "status=RUNTIME_VALIDATED": result.get("status") == "RUNTIME_VALIDATED",
+    "statementClass=READ_ONLY_SELECT": isinstance(validation, dict)
+    and validation.get("statementClass") == "READ_ONLY_SELECT",
+    "planPreflight=READ_ONLY": isinstance(validation, dict)
+    and validation.get("planPreflight") == "READ_ONLY",
+    "transactionReadOnly=true": isinstance(validation, dict)
+    and validation.get("transactionReadOnly") is True,
+    "runnerPolicyRevision=1": isinstance(validation, dict)
+    and validation.get("runnerPolicyRevision") == 1,
     "candidateIndexUsed=true": isinstance(validation, dict)
     and validation.get("candidateIndexUsed") is True,
     "ddlTarget=DISPOSABLE_CLONE": result.get("ddlTarget") == "DISPOSABLE_CLONE",

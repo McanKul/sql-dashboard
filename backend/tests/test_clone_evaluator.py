@@ -17,11 +17,18 @@ from app.clone_evaluator import (
     ValidatedCloneIndexCandidate,
     _access_method,
     _aggregate_plan_samples,
+    _assert_read_only_plan,
+    _assert_runner_policy,
     _authorized,
+    _begin_read_only_runner_transaction,
+    _decode_explain_row,
     _evaluate,
     _guard_clone_connection,
     _production_index_sql,
+    _plain_explain_preflight,
     _replay_query,
+    _runtime_statement,
+    _scan_replay_sql,
     _uses_index,
     _validated_request,
 )
@@ -98,6 +105,10 @@ def _runtime_validation(
     }
     return {
         "mode": "EXPLAIN_ANALYZE",
+        "statementClass": "READ_ONLY_SELECT",
+        "planPreflight": "READ_ONLY",
+        "transactionReadOnly": True,
+        "runnerPolicyRevision": 1,
         "cacheProfile": "ALTERNATING_WARM",
         "measuredRuns": 3,
         "warmupRuns": 0,
@@ -130,6 +141,33 @@ def test_read_only_select_is_the_only_runtime_replay_scope() -> None:
     assert query.startswith("WITH recent")
     assert values == ()
 
+    literal_query = (
+        "/* DELETE is data here */ SELECT 'UPDATE; DROP' AS note, "
+        "$$INSERT; CALL$$ AS body; -- trailing comment"
+    )
+    assert _replay_query(literal_query) == (
+        literal_query.split("; --", 1)[0],
+        (),
+    )
+
+
+def test_sql_scanner_only_counts_real_parameters_and_delimiters() -> None:
+    query, tokens, parameters = _scan_replay_sql(
+        "SELECT '$1; DELETE', $$ $2; UPDATE $$, value FROM orders "
+        "WHERE status = $1 /* $3; DROP */; -- harmless"
+    )
+
+    assert query.endswith("WHERE status = $1 /* $3; DROP */")
+    assert parameters == [1]
+    assert ("DELETE", 0) not in tokens
+    assert ("UPDATE", 0) not in tokens
+
+    escaped_query = r'''SELECT E'quote\\\'; $9 DELETE', U&"name\0021" FROM orders'''
+    scanned, escaped_tokens, escaped_parameters = _scan_replay_sql(escaped_query)
+    assert scanned == escaped_query
+    assert escaped_parameters == []
+    assert ("DELETE", 0) not in escaped_tokens
+
 
 def test_parameterized_replay_requires_exact_approved_scalar_fixture() -> None:
     query = "SELECT count(*) FROM orders WHERE status = $1 AND customer_id > $2"
@@ -156,7 +194,22 @@ def test_parameterized_replay_requires_exact_approved_scalar_fixture() -> None:
         ("UPDATE orders SET status = 'paid'", "SELECT_ONLY"),
         ("WITH changed AS (DELETE FROM orders RETURNING *) SELECT * FROM changed", "SELECT_ONLY"),
         ("SELECT * FROM orders FOR UPDATE", "SELECT_ONLY"),
+        ("SELECT * FROM orders FOR NO KEY UPDATE", "SELECT_ONLY"),
+        ("SELECT * FROM orders FOR SHARE", "SELECT_ONLY"),
+        ("SELECT * FROM orders FOR KEY SHARE SKIP LOCKED", "SELECT_ONLY"),
+        ("SELECT status INTO TEMP replay_copy FROM orders", "SELECT_ONLY"),
+        ("WITH recent AS (SELECT * FROM orders) TABLE recent", "SELECT_ONLY"),
+        ("SELECT pg_catalog.pg_notify('channel', 'payload')", "SELECT_ONLY"),
+        ("SELECT pg_advisory_lock(42)", "SELECT_ONLY"),
+        ("SELECT 1 -- comment\r, pg_notify('channel', 'payload')", "SELECT_ONLY"),
+        (
+            r"SELECT U&'safe\' UESCAPE '!', pg_notify('channel', 'payload')",
+            "SELECT_ONLY",
+        ),
         ("SELECT '\x00'", "MULTI_STATEMENT_OR_INVALID_SQL"),
+        ("SELECT 'unterminated", "MULTI_STATEMENT_OR_INVALID_SQL"),
+        ("SELECT 1 /* unterminated", "MULTI_STATEMENT_OR_INVALID_SQL"),
+        ("SELECT $tag$unterminated", "MULTI_STATEMENT_OR_INVALID_SQL"),
     ],
 )
 def test_runtime_replay_rejects_parameters_multiple_statements_and_writes(
@@ -168,6 +221,154 @@ def test_runtime_replay_rejects_parameters_multiple_statements_and_writes(
 
     assert captured.value.result_status == "UNSAFE"
     assert captured.value.reason_code == reason_code
+
+
+def test_plan_preflight_accepts_only_well_formed_read_plans() -> None:
+    safe = {
+        "Plan": {
+            "Node Type": "Aggregate",
+            "Plans": [{"Node Type": "Seq Scan", "Relation Name": "orders"}],
+        }
+    }
+    _assert_read_only_plan(safe)
+    assert _decode_explain_row(({"QUERY PLAN": [safe]})) == safe
+
+    unsafe_plans = (
+        {"Plan": {"Node Type": "ModifyTable", "Operation": "Insert"}},
+        {
+            "Plan": {
+                "Node Type": "CTE Scan",
+                "Plans": [{"Node Type": "ModifyTable", "Operation": "Delete"}],
+            }
+        },
+        {
+            "Plan": {
+                "Node Type": "Limit",
+                "Plans": [{"Node Type": "LockRows"}],
+            }
+        },
+        {"Plan": {"Node Type": "Foreign Scan", "Relation Name": "remote_orders"}},
+        {"Plan": {"Node Type": "Custom Scan", "Custom Plan Provider": "extension"}},
+    )
+    for plan in unsafe_plans:
+        with pytest.raises(CloneEvaluationStop) as captured:
+            _assert_read_only_plan(plan)
+        assert captured.value.reason_code == "READ_ONLY_PLAN_REQUIRED"
+
+    for malformed in (None, {}, {"QUERY PLAN": []}, {"QUERY PLAN": [{}]}):
+        with pytest.raises(CloneEvaluationStop) as captured:
+            _decode_explain_row(malformed)  # type: ignore[arg-type]
+        assert captured.value.reason_code in {
+            "EMPTY_RUNTIME_PLAN",
+            "INVALID_RUNTIME_PLAN",
+        }
+
+
+def test_runner_policy_requires_active_read_only_acl_attestation() -> None:
+    healthy = {
+        "transaction_read_only": True,
+        "default_read_only": True,
+        "row_security": True,
+        "statement_timeout_exact": True,
+        "lock_timeout_exact": True,
+        "transaction_timeout_exact": True,
+        "idle_timeout_exact": True,
+        "jit_disabled": True,
+        "standard_strings": True,
+        "search_path": "pg_catalog, public",
+        "role_can_login": True,
+        "role_inherit": True,
+        "role_connection_limit_exact": True,
+        "role_superuser": False,
+        "role_createdb": False,
+        "role_createrole": False,
+        "role_replication": False,
+        "role_bypassrls": False,
+        "read_all_data_membership_exact": True,
+        "temp_revoked": True,
+        "schema_create_revoked": True,
+        "dangerous_routines_revoked": True,
+        "foreign_server_usage_revoked": True,
+    }
+    _assert_runner_policy(healthy)
+
+    for key in (
+        "transaction_read_only",
+        "default_read_only",
+        "read_all_data_membership_exact",
+        "temp_revoked",
+        "schema_create_revoked",
+        "dangerous_routines_revoked",
+        "foreign_server_usage_revoked",
+    ):
+        with pytest.raises(CloneEvaluationStop) as captured:
+            _assert_runner_policy({**healthy, key: False})
+        assert captured.value.reason_code == "RUNNER_POLICY_MISMATCH"
+
+    with pytest.raises(CloneEvaluationStop):
+        _assert_runner_policy({**healthy, "role_superuser": True})
+
+
+class _RecordingCursor:
+    def __init__(self, rows: list[dict[str, Any]]):
+        self.rows = rows
+        self.executions: list[tuple[object, bool]] = []
+
+    def execute(
+        self,
+        statement: object,
+        _parameters: object = None,
+        *,
+        prepare: bool = False,
+    ) -> None:
+        self.executions.append((statement, prepare))
+
+    def fetchone(self) -> dict[str, Any]:
+        return self.rows.pop(0)
+
+
+def test_runner_transaction_is_attested_and_runtime_sql_forces_prepare() -> None:
+    policy_row = {
+        "transaction_read_only": True,
+        "default_read_only": True,
+        "row_security": True,
+        "statement_timeout_exact": True,
+        "lock_timeout_exact": True,
+        "transaction_timeout_exact": True,
+        "idle_timeout_exact": True,
+        "jit_disabled": True,
+        "standard_strings": True,
+        "search_path": "pg_catalog, public",
+        "role_can_login": True,
+        "role_inherit": True,
+        "role_connection_limit_exact": True,
+        "role_superuser": False,
+        "role_createdb": False,
+        "role_createrole": False,
+        "role_replication": False,
+        "role_bypassrls": False,
+        "read_all_data_membership_exact": True,
+        "temp_revoked": True,
+        "schema_create_revoked": True,
+        "dangerous_routines_revoked": True,
+        "foreign_server_usage_revoked": True,
+    }
+    safe_plan = {"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders"}}
+    cursor = _RecordingCursor([policy_row, {"QUERY PLAN": [safe_plan]}])
+
+    _begin_read_only_runner_transaction(cursor, _settings())  # type: ignore[arg-type]
+    runtime_statement = _runtime_statement(
+        cursor,  # type: ignore[arg-type]
+        "SELECT * FROM orders WHERE status = $1",
+        ("paid",),
+    )
+    _plain_explain_preflight(cursor, runtime_statement)  # type: ignore[arg-type]
+
+    assert "BEGIN TRANSACTION" in str(cursor.executions[0][0])
+    # Both statements containing replay-derived SQL are forced through the
+    # extended/prepared protocol, independently of the lexical gate.
+    assert cursor.executions[-2][1] is True
+    assert cursor.executions[-1][1] is True
 
 
 def test_candidate_sql_must_exactly_match_safely_quoted_identifiers() -> None:
@@ -334,6 +535,7 @@ def test_successful_evaluation_uses_two_disposable_databases_and_cleans_both(
 
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
     monkeypatch.setattr(
         clone_module,
         "_create_job_database",
@@ -383,6 +585,7 @@ def test_failure_after_real_index_still_cleans_every_created_database(
     cleaned: list[str] = []
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
     monkeypatch.setattr(clone_module, "_create_job_database", lambda *_args: None)
     monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
     monkeypatch.setattr(
@@ -417,6 +620,52 @@ def test_failure_after_real_index_still_cleans_every_created_database(
     assert len(cleaned) == 2
 
 
+def test_unsafe_database_preflight_stops_before_candidate_clone_or_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    created: list[str] = []
+    cleaned: list[str] = []
+    index_started = False
+
+    monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
+    monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        lambda _settings, database_name: created.append(database_name),
+    )
+    monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
+
+    def reject_preflight(*_args: object) -> None:
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "READ_ONLY_PLAN_REQUIRED",
+            "unsafe plan",
+        )
+
+    def create_index(*_args: object) -> dict[str, Any]:
+        nonlocal index_started
+        index_started = True
+        return {}
+
+    def cleanup(_settings: CloneEvaluatorSettings, names: list[str]) -> bool:
+        cleaned.extend(names)
+        return True
+
+    monkeypatch.setattr(clone_module, "_preflight_read_only_query", reject_preflight)
+    monkeypatch.setattr(clone_module, "_create_candidate_index", create_index)
+    monkeypatch.setattr(clone_module, "_destroy_job_databases", cleanup)
+
+    result = CloneIndexEvaluationResult.model_validate(_evaluate(_request()))
+
+    assert result.status == "UNSAFE"
+    assert result.reasonCode == "READ_ONLY_PLAN_REQUIRED"
+    assert index_started is False
+    assert len(created) == 1
+    assert cleaned == created
+
+
 def test_failure_while_granting_runner_tracks_and_drops_the_created_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,6 +673,7 @@ def test_failure_while_granting_runner_tracks_and_drops_the_created_database(
     cleaned: list[str] = []
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
     monkeypatch.setattr(clone_module, "_create_job_database", lambda *_args: None)
     monkeypatch.setattr(
         clone_module,
@@ -453,6 +703,7 @@ def test_cleanup_failure_overrides_an_otherwise_validated_result(
     settings = _settings()
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
     monkeypatch.setattr(clone_module, "_create_job_database", lambda *_args: None)
     monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
     monkeypatch.setattr(

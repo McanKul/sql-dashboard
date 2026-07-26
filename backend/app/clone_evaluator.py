@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import re
 import secrets
 import statistics
 import uuid
@@ -174,6 +173,10 @@ class RuntimePlanMetrics(BaseModel):
 
 class RuntimeCloneValidation(BaseModel):
     mode: Literal["EXPLAIN_ANALYZE"] = "EXPLAIN_ANALYZE"
+    statementClass: Literal["READ_ONLY_SELECT"] = "READ_ONLY_SELECT"
+    planPreflight: Literal["READ_ONLY"] = "READ_ONLY"
+    transactionReadOnly: Literal[True] = True
+    runnerPolicyRevision: int = Field(ge=1)
     cacheProfile: Literal["ALTERNATING_WARM"] = "ALTERNATING_WARM"
     measuredRuns: int
     warmupRuns: int
@@ -208,14 +211,312 @@ class CloneEvaluationStop(Exception):
         self.message = message
 
 
-_PARAMETER = re.compile(r"\$\d+\b")
-_SAFE_START = re.compile(r"^(SELECT|WITH)\b", re.IGNORECASE)
-_WRITE_KEYWORD = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|MERGE|COPY|CALL|DO|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|"
-    r"VACUUM|ANALYZE|REFRESH|REINDEX|CLUSTER)\b",
-    re.IGNORECASE,
-)
-_ROW_LOCK = re.compile(r"\bFOR\s+(UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)\b", re.IGNORECASE)
+READ_ONLY_RUNNER_POLICY_REVISION = 1
+
+_STATEMENT_COMMAND_TOKENS = {
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "VALUES",
+    "TABLE",
+}
+_NON_READ_TOKENS = {
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "COPY",
+    "CALL",
+    "DO",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "GRANT",
+    "REVOKE",
+    "COMMENT",
+    "SECURITY",
+    "VACUUM",
+    "ANALYZE",
+    "REFRESH",
+    "REINDEX",
+    "CLUSTER",
+    # PostgreSQL SELECT INTO creates a table.  Plain EXPLAIN reports it as a
+    # normal SELECT plan, so it must be rejected before any database call.
+    "INTO",
+}
+_SIDE_EFFECT_ROUTINE_TOKENS = {
+    "NEXTVAL",
+    "SETVAL",
+    "SET_CONFIG",
+    "PG_NOTIFY",
+    "PG_CANCEL_BACKEND",
+    "PG_TERMINATE_BACKEND",
+    "PG_RELOAD_CONF",
+    "PG_ROTATE_LOGFILE",
+    "PG_SWITCH_WAL",
+    "PG_CREATE_RESTORE_POINT",
+    "PG_LOGICAL_EMIT_MESSAGE",
+    "PG_ADVISORY_LOCK",
+    "PG_ADVISORY_LOCK_SHARED",
+    "PG_ADVISORY_XACT_LOCK",
+    "PG_ADVISORY_XACT_LOCK_SHARED",
+    "PG_TRY_ADVISORY_LOCK",
+    "PG_TRY_ADVISORY_LOCK_SHARED",
+    "PG_TRY_ADVISORY_XACT_LOCK",
+    "PG_TRY_ADVISORY_XACT_LOCK_SHARED",
+    "PG_ADVISORY_UNLOCK",
+    "PG_ADVISORY_UNLOCK_ALL",
+    "PG_ADVISORY_UNLOCK_SHARED",
+    "DBLINK_EXEC",
+    "LO_CREATE",
+    "LO_FROM_BYTEA",
+    "LO_IMPORT",
+    "LO_PUT",
+    "LO_UNLINK",
+    "LO_WRITE",
+    "LOWRITE",
+}
+_ROW_LOCK_SUFFIXES = {
+    ("UPDATE",),
+    ("NO", "KEY", "UPDATE"),
+    ("SHARE",),
+    ("KEY", "SHARE"),
+}
+
+
+def _is_identifier_start(character: str) -> bool:
+    return character == "_" or character.isalpha() or ord(character) >= 128
+
+
+def _is_identifier_continuation(character: str) -> bool:
+    return _is_identifier_start(character) or character.isdigit() or character == "$"
+
+
+def _scan_replay_sql(query: str) -> tuple[str, list[tuple[str, int]], list[int]]:
+    """Tokenize the security-relevant PostgreSQL surface without decoding values.
+
+    Literals, quoted identifiers and nested comments are skipped, so words or
+    semicolons inside data cannot change the policy decision.  Ambiguous or
+    unterminated lexical constructs fail closed.  PostgreSQL still performs
+    the authoritative parse during the non-ANALYZE plan preflight.
+    """
+
+    tokens: list[tuple[str, int]] = []
+    parameter_numbers: list[int] = []
+    semicolons: list[int] = []
+    significant_positions: list[int] = []
+    depth = 0
+    index = 0
+    length = len(query)
+
+    while index < length:
+        character = query[index]
+        if character.isspace():
+            index += 1
+            continue
+
+        if query.startswith("--", index):
+            line_feed = query.find("\n", index + 2)
+            carriage_return = query.find("\r", index + 2)
+            line_endings = tuple(
+                position
+                for position in (line_feed, carriage_return)
+                if position >= 0
+            )
+            if not line_endings:
+                index = length
+            else:
+                index = min(line_endings) + 1
+                if (
+                    query[index - 1] == "\r"
+                    and index < length
+                    and query[index] == "\n"
+                ):
+                    index += 1
+            continue
+
+        if query.startswith("/*", index):
+            comment_depth = 1
+            index += 2
+            while index < length and comment_depth:
+                if query.startswith("/*", index):
+                    comment_depth += 1
+                    index += 2
+                elif query.startswith("*/", index):
+                    comment_depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if comment_depth:
+                raise ValueError("unterminated block comment")
+            continue
+
+        if character in {"'", '"'}:
+            delimiter = character
+            escape_backslash = False
+            if index >= 1 and character == "'":
+                escape_backslash = query[index - 1] in {"e", "E"} and (
+                    index < 2
+                    or not _is_identifier_continuation(query[index - 2])
+                )
+            significant_positions.append(index)
+            index += 1
+            while index < length:
+                if escape_backslash and query[index] == "\\":
+                    index += 2
+                    continue
+                if query[index] != delimiter:
+                    index += 1
+                    continue
+                if index + 1 < length and query[index + 1] == delimiter:
+                    index += 2
+                    continue
+                significant_positions.append(index)
+                index += 1
+                break
+            else:
+                raise ValueError("unterminated quoted value")
+            continue
+
+        if character == "$":
+            dollar_delimiter: str | None = None
+            if query.startswith("$$", index):
+                dollar_delimiter = "$$"
+            elif index + 1 < length and _is_identifier_start(query[index + 1]):
+                tag_end = index + 2
+                # Dollar-quote tags follow unquoted identifier characters but
+                # the closing '$' is the delimiter, not part of the tag.
+                while tag_end < length and (
+                    _is_identifier_start(query[tag_end])
+                    or query[tag_end].isdigit()
+                ):
+                    tag_end += 1
+                if tag_end < length and query[tag_end] == "$":
+                    dollar_delimiter = query[index : tag_end + 1]
+
+            if dollar_delimiter is not None:
+                significant_positions.append(index)
+                closing = query.find(dollar_delimiter, index + len(dollar_delimiter))
+                if closing < 0:
+                    raise ValueError("unterminated dollar-quoted value")
+                index = closing + len(dollar_delimiter)
+                significant_positions.append(index - 1)
+                continue
+
+            if index + 1 < length and query[index + 1].isdigit():
+                parameter_end = index + 2
+                while parameter_end < length and query[parameter_end].isdigit():
+                    parameter_end += 1
+                parameter_numbers.append(int(query[index + 1 : parameter_end]))
+                significant_positions.append(parameter_end - 1)
+                index = parameter_end
+                continue
+
+        if _is_identifier_start(character):
+            token_end = index + 1
+            while token_end < length and _is_identifier_continuation(query[token_end]):
+                token_end += 1
+            tokens.append((query[index:token_end].upper(), depth))
+            significant_positions.append(token_end - 1)
+            index = token_end
+            continue
+
+        if character == "(":
+            significant_positions.append(index)
+            depth += 1
+            index += 1
+            continue
+        if character == ")":
+            significant_positions.append(index)
+            depth -= 1
+            if depth < 0:
+                raise ValueError("unbalanced closing parenthesis")
+            index += 1
+            continue
+        if character == ";":
+            semicolons.append(index)
+            index += 1
+            continue
+
+        significant_positions.append(index)
+        index += 1
+
+    if depth:
+        raise ValueError("unbalanced opening parenthesis")
+    if len(semicolons) > 1:
+        raise ValueError("multiple statement delimiters")
+    if semicolons:
+        terminator = semicolons[0]
+        if any(position > terminator for position in significant_positions):
+            raise ValueError("content after statement delimiter")
+        query = query[:terminator].rstrip()
+    return query, tokens, parameter_numbers
+
+
+def _assert_read_only_select(
+    normalized_sql: str,
+) -> tuple[str, list[int]]:
+    try:
+        query, tokens_with_depth, parameter_numbers = _scan_replay_sql(
+            normalized_sql.strip()
+        )
+    except ValueError as exc:
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "MULTI_STATEMENT_OR_INVALID_SQL",
+            "Yalniz tek ve gecerli bir salt-okunur SELECT sorgusu calistirilabilir.",
+        ) from exc
+
+    top_level_tokens = [token for token, depth in tokens_with_depth if depth == 0]
+    if not query or not top_level_tokens:
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "SELECT_ONLY",
+            "Disposable clone dogrulamasi yalniz salt-okunur SELECT sorgularini calistirir.",
+        )
+
+    first_token = top_level_tokens[0]
+    statement_command = first_token
+    if first_token == "WITH":
+        statement_command = next(
+            (
+                token
+                for token in top_level_tokens[1:]
+                if token in _STATEMENT_COMMAND_TOKENS
+            ),
+            "",
+        )
+    if statement_command != "SELECT":
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "SELECT_ONLY",
+            "Disposable clone dogrulamasi yalniz salt-okunur SELECT sorgularini calistirir.",
+        )
+
+    tokens = [token for token, _depth in tokens_with_depth]
+    if any(token in _NON_READ_TOKENS for token in tokens) or any(
+        token in _SIDE_EFFECT_ROUTINE_TOKENS for token in tokens
+    ):
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "SELECT_ONLY",
+            "Yazma, DDL, SELECT INTO veya yan etkili rutin iceren sorgular calistirilamaz.",
+        )
+    for position, token in enumerate(tokens):
+        if token != "FOR":
+            continue
+        for suffix in _ROW_LOCK_SUFFIXES:
+            if tuple(tokens[position + 1 : position + 1 + len(suffix)]) == suffix:
+                raise CloneEvaluationStop(
+                    "UNSAFE",
+                    "SELECT_ONLY",
+                    "Satir kilidi alan SELECT sorgulari EXPLAIN ANALYZE kapsaminda degildir.",
+                )
+
+    return query, parameter_numbers
 
 
 def _replay_query(
@@ -224,31 +525,20 @@ def _replay_query(
 ) -> tuple[str, tuple[str | int | float | bool | None, ...]]:
     """Return a narrow SELECT and operator-approved replay parameters.
 
-    This is fail-closed rather than a general SQL parser. A semicolon inside a
-    string is rejected too. Values arrive only over the internal channel after
-    an exact repository fixture lookup. They are never concatenated as raw
-    SQL; psycopg's type-aware Literal adapter renders EXECUTE arguments only
-    after the prepared statement has passed the fail-closed checks.
+    Values arrive only over the internal channel after an exact repository
+    fixture lookup. They are never concatenated as raw SQL; psycopg's
+    type-aware Literal adapter renders EXECUTE arguments only after the
+    statement gate and PostgreSQL plan preflight have passed.
     """
 
     values = list(bind_values or [])
-    query = normalized_sql.strip()
-    if query.endswith(";"):
-        query = query[:-1].rstrip()
-    if not query or ";" in query or "\x00" in query:
+    if "\x00" in normalized_sql:
         raise CloneEvaluationStop(
             "UNSAFE",
             "MULTI_STATEMENT_OR_INVALID_SQL",
             "Yalniz tek bir SELECT sorgusu calistirilabilir.",
         )
-    if not _SAFE_START.match(query) or _WRITE_KEYWORD.search(query) or _ROW_LOCK.search(query):
-        raise CloneEvaluationStop(
-            "UNSAFE",
-            "SELECT_ONLY",
-            "Disposable clone dogrulamasi yalniz salt-okunur SELECT/WITH sorgularini calistirir.",
-        )
-
-    parameter_numbers = [int(match.group()[1:]) for match in _PARAMETER.finditer(query)]
+    query, parameter_numbers = _assert_read_only_select(normalized_sql)
     if not parameter_numbers:
         if values:
             raise CloneEvaluationStop(
@@ -429,17 +719,27 @@ def _assert_clone_ready(settings: CloneEvaluatorSettings) -> dict[str, Any]:
                 expected_role=settings.clone_admin_role,
             )
             cursor.execute(
-                "SELECT archive_restored, source_ddl_executed "
+                "SELECT archive_restored, source_ddl_executed, "
+                "runner_policy_revision, dangerous_routines_revoked "
                 "FROM advisor_clone_meta.template_manifest WHERE singleton"
             )
             manifest = cursor.fetchone()
-            if not manifest or manifest["source_ddl_executed"]:
+            if (
+                not manifest
+                or manifest["source_ddl_executed"]
+                or int(manifest["runner_policy_revision"] or 0)
+                != READ_ONLY_RUNNER_POLICY_REVISION
+                or not manifest["dangerous_routines_revoked"]
+            ):
                 raise CloneEvaluationStop(
                     "UNSAFE",
                     "CLONE_TEMPLATE_MANIFEST_INVALID",
-                    "Disposable clone template manifesti eksik veya kaynak DDL guvencesi gecersiz.",
+                    "Disposable clone template manifesti veya salt-okunur runner policy kaniti gecersiz.",
                 )
             guard["archive_restored"] = bool(manifest["archive_restored"])
+            guard["runner_policy_revision"] = int(
+                manifest["runner_policy_revision"]
+            )
     return guard
 
 
@@ -471,6 +771,17 @@ def _grant_runner_connect(settings: CloneEvaluatorSettings, database_name: str) 
     with _connect(settings, admin_database) as connection:
         with connection.cursor() as cursor:
             _guard_clone_connection(cursor, settings, expected_role=settings.clone_admin_role)
+            cursor.execute(
+                sql.SQL("REVOKE CONNECT, TEMPORARY ON DATABASE {} FROM PUBLIC").format(
+                    sql.Identifier(database_name)
+                )
+            )
+            cursor.execute(
+                sql.SQL("REVOKE TEMPORARY ON DATABASE {} FROM {}").format(
+                    sql.Identifier(database_name),
+                    sql.Identifier(settings.clone_runner_role),
+                )
+            )
             cursor.execute(
                 sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
                     sql.Identifier(database_name),
@@ -615,6 +926,307 @@ def _walk_plan(node: dict[str, Any]):
         yield from _walk_plan(child)
 
 
+def _decode_explain_row(row: Mapping[str, Any] | tuple[Any, ...] | None) -> dict[str, Any]:
+    if row is None:
+        raise CloneEvaluationStop(
+            "UNAVAILABLE",
+            "EMPTY_RUNTIME_PLAN",
+            "Clone PostgreSQL plan sonucu dondurmedi.",
+        )
+    if isinstance(row, Mapping):
+        if not row:
+            raise CloneEvaluationStop(
+                "UNSAFE",
+                "INVALID_RUNTIME_PLAN",
+                "Clone PostgreSQL plan yapisi salt-okunur olarak dogrulanamadi.",
+            )
+        raw = next(iter(row.values()))
+    else:
+        if not row:
+            raise CloneEvaluationStop(
+                "UNSAFE",
+                "INVALID_RUNTIME_PLAN",
+                "Clone PostgreSQL plan yapisi salt-okunur olarak dogrulanamadi.",
+            )
+        raw = row[0]
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CloneEvaluationStop(
+                "UNSAFE",
+                "INVALID_RUNTIME_PLAN",
+                "Clone PostgreSQL plan sonucu guvenli JSON biciminde degil.",
+            ) from exc
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 1
+        or not isinstance(raw[0], dict)
+        or not isinstance(raw[0].get("Plan"), dict)
+    ):
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "INVALID_RUNTIME_PLAN",
+            "Clone PostgreSQL plan yapisi salt-okunur olarak dogrulanamadi.",
+        )
+    return raw[0]
+
+
+def _assert_read_only_plan(plan: dict[str, Any]) -> None:
+    unsafe_node_types = {
+        "ModifyTable",
+        "LockRows",
+        "Foreign Scan",
+        "Custom Scan",
+    }
+    unsafe_operations = {"INSERT", "UPDATE", "DELETE", "MERGE"}
+    for node in _walk_plan(plan["Plan"]):
+        node_type = str(node.get("Node Type") or "")
+        operation = str(node.get("Operation") or "").upper()
+        if node_type in unsafe_node_types or operation in unsafe_operations:
+            raise CloneEvaluationStop(
+                "UNSAFE",
+                "READ_ONLY_PLAN_REQUIRED",
+                "PostgreSQL plan preflight'i yazma, satir kilidi veya izole olmayan plan dugumu tespit etti.",
+            )
+
+
+def _assert_runner_policy(row: Mapping[str, Any] | None) -> None:
+    if not row:
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "RUNNER_POLICY_MISMATCH",
+            "Clone runner salt-okunur policy durumu okunamadi.",
+        )
+    search_path = str(row.get("search_path") or "").replace(" ", "")
+    required_true = (
+        "transaction_read_only",
+        "default_read_only",
+        "row_security",
+        "statement_timeout_exact",
+        "lock_timeout_exact",
+        "transaction_timeout_exact",
+        "idle_timeout_exact",
+        "jit_disabled",
+        "standard_strings",
+        "role_can_login",
+        "role_inherit",
+        "role_connection_limit_exact",
+        "read_all_data_membership_exact",
+        "temp_revoked",
+        "schema_create_revoked",
+        "dangerous_routines_revoked",
+        "foreign_server_usage_revoked",
+    )
+    if (
+        any(str(row.get(key)).lower() not in {"true", "on", "t", "1"} for key in required_true)
+        or any(
+            bool(row.get(key))
+            for key in (
+                "role_superuser",
+                "role_createdb",
+                "role_createrole",
+                "role_replication",
+                "role_bypassrls",
+            )
+        )
+        or search_path != "pg_catalog,public"
+    ):
+        raise CloneEvaluationStop(
+            "UNSAFE",
+            "RUNNER_POLICY_MISMATCH",
+            "Clone runner aktif transaction, rol veya ACL policy'si salt-okunur degil.",
+        )
+
+
+def _begin_read_only_runner_transaction(
+    cursor: psycopg.Cursor[Any],
+    settings: CloneEvaluatorSettings,
+) -> None:
+    cursor.execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
+    for setting_name, setting_value in (
+        ("statement_timeout", f"{settings.clone_statement_timeout_ms}ms"),
+        ("lock_timeout", f"{settings.clone_lock_timeout_ms}ms"),
+        ("transaction_timeout", f"{settings.clone_transaction_timeout_ms}ms"),
+        (
+            "idle_in_transaction_session_timeout",
+            f"{settings.clone_transaction_timeout_ms}ms",
+        ),
+        ("row_security", "on"),
+        ("jit", "off"),
+        ("standard_conforming_strings", "on"),
+    ):
+        cursor.execute(
+            sql.SQL("SET LOCAL {} = {}").format(
+                sql.Identifier(setting_name),
+                sql.Literal(setting_value),
+            )
+        )
+    cursor.execute("SET LOCAL search_path = pg_catalog, public")
+    cursor.execute(
+        """
+        SELECT current_setting('transaction_read_only') = 'on'
+                   AS transaction_read_only,
+               current_setting('default_transaction_read_only') = 'on'
+                   AS default_read_only,
+               current_setting('row_security') = 'on' AS row_security,
+               extract(
+                   epoch FROM current_setting('statement_timeout')::interval
+               ) * 1000 = %s AS statement_timeout_exact,
+               extract(
+                   epoch FROM current_setting('lock_timeout')::interval
+               ) * 1000 = %s AS lock_timeout_exact,
+               extract(
+                   epoch FROM current_setting('transaction_timeout')::interval
+               ) * 1000 = %s AS transaction_timeout_exact,
+               extract(
+                   epoch FROM current_setting(
+                       'idle_in_transaction_session_timeout'
+                   )::interval
+               ) * 1000 = %s AS idle_timeout_exact,
+               current_setting('jit') = 'off' AS jit_disabled,
+               current_setting('standard_conforming_strings') = 'on'
+                   AS standard_strings,
+               current_setting('search_path') AS search_path,
+               role.rolcanlogin AS role_can_login,
+               role.rolinherit AS role_inherit,
+               role.rolconnlimit = 4 AS role_connection_limit_exact,
+               role.rolsuper AS role_superuser,
+               role.rolcreatedb AS role_createdb,
+               role.rolcreaterole AS role_createrole,
+               role.rolreplication AS role_replication,
+               role.rolbypassrls AS role_bypassrls,
+               (
+                   SELECT count(*) = 1
+                      AND coalesce(bool_and(
+                              granted_role.rolname = 'pg_read_all_data'
+                          AND membership.inherit_option
+                          AND NOT membership.set_option
+                          AND NOT membership.admin_option
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM pg_auth_members inherited_membership
+                               WHERE inherited_membership.member =
+                                     granted_role.oid
+                          )
+                      ), false)
+                     FROM pg_auth_members membership
+                     JOIN pg_roles granted_role
+                       ON granted_role.oid = membership.roleid
+                    WHERE membership.member = role.oid
+               ) AS read_all_data_membership_exact,
+               NOT has_database_privilege(
+                   current_user, current_database(), 'TEMPORARY'
+               ) AS temp_revoked,
+               NOT EXISTS (
+                   SELECT 1
+                     FROM pg_namespace namespace
+                    WHERE namespace.nspname NOT LIKE 'pg_temp_%%'
+                      AND namespace.nspname NOT LIKE 'pg_toast_temp_%%'
+                      AND has_schema_privilege(
+                          current_user, namespace.oid, 'CREATE'
+                      )
+               ) AS schema_create_revoked,
+               NOT EXISTS (
+                   SELECT 1
+                     FROM pg_proc routine
+                     JOIN pg_namespace routine_namespace
+                       ON routine_namespace.oid = routine.pronamespace
+                     JOIN pg_language routine_language
+                       ON routine_language.oid = routine.prolang
+                    WHERE (
+                              routine.provolatile = 'v'
+                           OR routine.prosecdef
+                           OR routine.prokind = 'p'
+                           OR (
+                                  routine_namespace.nspname NOT IN (
+                                      'pg_catalog', 'information_schema'
+                                  )
+                              AND routine_language.lanname NOT IN (
+                                      'sql', 'plpgsql'
+                                  )
+                              )
+                          )
+                      AND has_function_privilege(
+                          current_user, routine.oid, 'EXECUTE'
+                      )
+               ) AS dangerous_routines_revoked,
+               NOT EXISTS (
+                   SELECT 1
+                     FROM pg_foreign_server server
+                    WHERE has_server_privilege(
+                        current_user, server.oid, 'USAGE'
+                    )
+               ) AS foreign_server_usage_revoked
+         FROM pg_roles role
+         WHERE role.rolname = current_user
+        """,
+        (
+            settings.clone_statement_timeout_ms,
+            settings.clone_lock_timeout_ms,
+            settings.clone_transaction_timeout_ms,
+            settings.clone_transaction_timeout_ms,
+        ),
+    )
+    _assert_runner_policy(cursor.fetchone())
+
+
+def _runtime_statement(
+    cursor: psycopg.Cursor[Any],
+    query: str,
+    bind_values: tuple[str | int | float | bool | None, ...],
+) -> sql.Composable:
+    if not bind_values:
+        return sql.SQL(query)
+    cursor.execute(
+        sql.SQL("PREPARE advisor_runtime_replay AS ") + sql.SQL(query),
+        prepare=True,
+    )
+    # EXPLAIN EXECUTE cannot accept extended-protocol bind placeholders in its
+    # utility-command argument list. Literal applies connection-aware quoting
+    # only after the exact fixture and statement policy checks have passed.
+    arguments = sql.SQL(", ").join(sql.Literal(value) for value in bind_values)
+    return sql.SQL("EXECUTE advisor_runtime_replay ({})").format(arguments)
+
+
+def _plain_explain_preflight(
+    cursor: psycopg.Cursor[Any],
+    runtime_statement: sql.Composable,
+) -> dict[str, Any]:
+    cursor.execute(
+        sql.SQL("EXPLAIN (ANALYZE FALSE, VERBOSE TRUE, FORMAT JSON) ")
+        + runtime_statement,
+        prepare=True,
+    )
+    plan = _decode_explain_row(cursor.fetchone())
+    _assert_read_only_plan(plan)
+    return plan
+
+
+def _preflight_read_only_query(
+    settings: CloneEvaluatorSettings,
+    database_name: str,
+    query: str,
+    bind_values: tuple[str | int | float | bool | None, ...],
+) -> None:
+    with _connect(settings, database_name, runner=True) as connection:
+        with connection.cursor() as cursor:
+            _guard_clone_connection(
+                cursor,
+                settings,
+                expected_role=settings.clone_runner_role,
+            )
+            try:
+                _begin_read_only_runner_transaction(cursor, settings)
+                runtime_statement = _runtime_statement(cursor, query, bind_values)
+                _plain_explain_preflight(cursor, runtime_statement)
+            finally:
+                try:
+                    cursor.execute("ROLLBACK")
+                except psycopg.Error:
+                    pass
+
+
 def _access_method(plan: dict[str, Any], table_name: str) -> str | None:
     for node in _walk_plan(plan["Plan"]):
         if node.get("Relation Name") == table_name:
@@ -641,54 +1253,20 @@ def _explain_analyze_once(
                 settings,
                 expected_role=settings.clone_runner_role,
             )
-            cursor.execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
             try:
-                cursor.execute(
-                    "SELECT set_config('statement_timeout', %s, true), "
-                    "set_config('lock_timeout', %s, true), "
-                    "set_config('transaction_timeout', %s, true), "
-                    "set_config('idle_in_transaction_session_timeout', %s, true), "
-                    "set_config('row_security', 'on', true), "
-                    "set_config('jit', 'off', true)",
-                    (
-                        f"{settings.clone_statement_timeout_ms}ms",
-                        f"{settings.clone_lock_timeout_ms}ms",
-                        f"{settings.clone_transaction_timeout_ms}ms",
-                        f"{settings.clone_transaction_timeout_ms}ms",
-                    ),
-                )
+                _begin_read_only_runner_transaction(cursor, settings)
+                runtime_statement = _runtime_statement(cursor, query, bind_values)
+                _plain_explain_preflight(cursor, runtime_statement)
                 explain_prefix = sql.SQL(
                     "EXPLAIN (ANALYZE TRUE, BUFFERS TRUE, WAL TRUE, TIMING TRUE, "
                     "SUMMARY TRUE, FORMAT JSON) "
                 )
-                if bind_values:
-                    cursor.execute(
-                        sql.SQL("PREPARE advisor_runtime_replay AS ") + sql.SQL(query)
-                    )
-                    # EXPLAIN EXECUTE cannot accept extended-protocol bind
-                    # placeholders in its utility-command argument list.
-                    # Literal performs connection-aware quoting/adaptation;
-                    # fixture text is never concatenated into this command.
-                    arguments = sql.SQL(", ").join(
-                        sql.Literal(value) for value in bind_values
-                    )
-                    cursor.execute(
-                        explain_prefix
-                        + sql.SQL("EXECUTE advisor_runtime_replay ({})").format(arguments)
-                    )
-                else:
-                    cursor.execute(explain_prefix + sql.SQL(query))
-                row = cursor.fetchone()
-                if row is None:
-                    raise CloneEvaluationStop(
-                        "UNAVAILABLE",
-                        "EMPTY_RUNTIME_PLAN",
-                        "Clone PostgreSQL EXPLAIN ANALYZE sonucu dondurmedi.",
-                    )
-                raw = next(iter(row.values())) if isinstance(row, Mapping) else row[0]
-                if isinstance(raw, str):
-                    raw = json.loads(raw)
-                plan = raw[0]
+                cursor.execute(
+                    explain_prefix + runtime_statement,
+                    prepare=True,
+                )
+                plan = _decode_explain_row(cursor.fetchone())
+                _assert_read_only_plan(plan)
             finally:
                 try:
                     cursor.execute("ROLLBACK")
@@ -794,6 +1372,10 @@ def _benchmark(
     improvement = max(0.0, (baseline_ms - candidate_ms) / baseline_ms * 100) if baseline_ms else 0.0
     return {
         "mode": "EXPLAIN_ANALYZE",
+        "statementClass": "READ_ONLY_SELECT",
+        "planPreflight": "READ_ONLY",
+        "transactionReadOnly": True,
+        "runnerPolicyRevision": READ_ONLY_RUNNER_POLICY_REVISION,
         "cacheProfile": "ALTERNATING_WARM",
         "measuredRuns": settings.clone_measured_runs,
         "warmupRuns": settings.clone_warmup_runs,
@@ -877,6 +1459,17 @@ def _evaluate(payload: InternalCloneIndexEvaluationRequest) -> dict[str, Any]:
         _create_job_database(settings, baseline_database)
         created_databases.append(baseline_database)
         _grant_runner_connect(settings, baseline_database)
+
+        # PostgreSQL performs the authoritative parse/plan under the exact
+        # low-privilege runner policy before a candidate database or real index
+        # is created.  EXPLAIN here deliberately omits ANALYZE.
+        _preflight_read_only_query(
+            settings,
+            baseline_database,
+            query,
+            bind_values,
+        )
+
         _create_job_database(settings, candidate_database)
         created_databases.append(candidate_database)
         _grant_runner_connect(settings, candidate_database)
@@ -931,6 +1524,24 @@ def _evaluate(payload: InternalCloneIndexEvaluationRequest) -> dict[str, Any]:
             exc.result_status,  # type: ignore[arg-type]
             exc.reason_code,
             exc.message,
+            validation=validation,
+            clone_ddl_executed=clone_ddl_executed,
+        )
+    except psycopg.errors.ReadOnlySqlTransaction:
+        result = _advice(
+            payload,
+            "UNSAFE",
+            "READ_ONLY_TRANSACTION_VIOLATION",
+            "Sorgu clone runner salt-okunur transaction policy'sini ihlal etti.",
+            validation=validation,
+            clone_ddl_executed=clone_ddl_executed,
+        )
+    except psycopg.errors.InsufficientPrivilege:
+        result = _advice(
+            payload,
+            "UNSAFE",
+            "READ_ONLY_POLICY_REJECTED",
+            "Sorgu clone runner salt-okunur yetki policy'si tarafindan reddedildi.",
             validation=validation,
             clone_ddl_executed=clone_ddl_executed,
         )
@@ -1005,6 +1616,8 @@ async def health() -> dict[str, Any]:
             "roleName": guard["role_name"],
             "postgresVersion": guard["postgres_version"],
             "validationClone": True,
+            "readOnlySelectOnly": True,
+            "runnerPolicyRevision": guard["runner_policy_revision"],
             "sourceDdlExecuted": False,
         }
     except Exception as exc:

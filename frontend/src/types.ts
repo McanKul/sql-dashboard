@@ -284,6 +284,10 @@ export interface QueryRuntimeValidation {
   candidateId: string
   validation?: {
     mode: 'EXPLAIN_ANALYZE'
+    statementClass: 'READ_ONLY_SELECT'
+    planPreflight: 'READ_ONLY'
+    transactionReadOnly: true
+    runnerPolicyRevision: number
     cacheProfile: 'ALTERNATING_WARM'
     measuredRuns: number
     warmupRuns: number

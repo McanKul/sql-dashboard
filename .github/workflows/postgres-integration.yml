@@ -30,8 +30,48 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Build the complete core stack
-        run: docker compose build
+      - name: Generate disposable runtime-validation credentials
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import secrets
+
+          def random_value() -> str:
+              return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+          api_token = "adv_pat_v1_" + random_value()
+          generated = {
+              "ADVISOR_API_TOKEN": api_token,
+              "ADVISOR_AUTH_PRINCIPALS": json.dumps(
+                  [
+                      {
+                          "credential_id": "ci-runtime-validation",
+                          "subject": "ci:postgres-integration",
+                          "token_sha256": hashlib.sha256(
+                              api_token.encode("utf-8")
+                          ).hexdigest(),
+                          "roles": ["admin"],
+                      }
+                  ],
+                  separators=(",", ":"),
+              ),
+              "CLONE_ADMIN_PASSWORD": random_value(),
+              "CLONE_RUNNER_PASSWORD": random_value(),
+              "CLONE_EVALUATOR_TOKEN": random_value(),
+          }
+          for name, value in generated.items():
+              if name != "ADVISOR_AUTH_PRINCIPALS":
+                  print(f"::add-mask::{value}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for name, value in generated.items():
+                  handle.write(f"{name}={value}\n")
+          PY
+
+      - name: Build the complete core and real-validation stack
+        run: docker compose --profile real-validation build
 
       - name: Boot fresh named volumes
         run: docker compose up -d --wait --wait-timeout 240
@@ -77,10 +117,21 @@ jobs:
           echo "role drift was not reconciled: $role_state" >&2
           exit 1
 
+      - name: Prepare the deterministic runtime candidate
+        run: bash scripts/verify.sh
+
+      - name: Boot disposable clone services
+        run: |
+          docker compose --profile real-validation up -d --wait \
+            --wait-timeout 240 clone-db clone-evaluator
+
+      - name: Verify disposable-clone runtime and runner policy
+        run: bash scripts/verify-real-validation.sh
+
       - name: Show service logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail=300
+        run: docker compose --profile real-validation logs --no-color --tail=300
 
       - name: Remove disposable CI volumes
         if: always()
-        run: docker compose down --volumes --remove-orphans
+        run: docker compose --profile real-validation down --volumes --remove-orphans

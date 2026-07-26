@@ -20,13 +20,15 @@ psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   --set=clone_admin="$POSTGRES_USER" \
   --set=runner_password="$CLONE_RUNNER_PASSWORD" <<'SQL'
 SELECT format(
-    'CREATE ROLE clone_runner LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4',
+    'CREATE ROLE clone_runner LOGIN INHERIT PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4',
     :'runner_password'
 )
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'clone_runner')
 \gexec
 
-ALTER ROLE clone_runner PASSWORD :'runner_password';
+ALTER ROLE clone_runner LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
+  NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'runner_password';
+ALTER ROLE clone_runner RESET ALL;
 ALTER ROLE clone_runner SET default_transaction_read_only = on;
 ALTER ROLE clone_runner SET statement_timeout = '10s';
 ALTER ROLE clone_runner SET lock_timeout = '1s';
@@ -35,7 +37,23 @@ ALTER ROLE clone_runner SET idle_in_transaction_session_timeout = '15s';
 ALTER ROLE clone_runner SET temp_file_limit = '256MB';
 ALTER ROLE clone_runner SET row_security = on;
 ALTER ROLE clone_runner SET jit = off;
-GRANT pg_read_all_data TO clone_runner;
+ALTER ROLE clone_runner SET search_path = pg_catalog, public;
+
+-- Membership options are security relevant on PostgreSQL 18. Remove every
+-- existing grant (including grants from another grantor) before installing
+-- the one role membership the runtime runner is allowed to retain.
+SELECT format(
+    'REVOKE %I FROM clone_runner GRANTED BY %I CASCADE',
+    granted_role.rolname,
+    grantor.rolname
+)
+FROM pg_catalog.pg_auth_members AS membership
+JOIN pg_catalog.pg_roles AS granted_role ON granted_role.oid = membership.roleid
+JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = membership.grantor
+WHERE membership.member = 'clone_runner'::pg_catalog.regrole
+\gexec
+GRANT pg_read_all_data TO clone_runner
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
 SQL
 
 template_restored=false
@@ -69,9 +87,97 @@ psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
 -- appdb bir veri kaynagi degil, onceden restore edilmis salt clone template'idir.
 -- Runtime evaluator job database'lerini bu template'ten fiziksel olarak kopyalar.
 REVOKE CONNECT, TEMPORARY ON DATABASE :"clone_database" FROM PUBLIC;
-REVOKE CONNECT ON DATABASE :"clone_database" FROM clone_runner;
+REVOKE CONNECT, TEMPORARY ON DATABASE :"clone_database" FROM clone_runner;
 ALTER DATABASE :"clone_database" WITH IS_TEMPLATE true;
 ALTER DATABASE :"clone_database" SET advisor.validation_clone = 'on';
+
+-- A restored archive can carry legacy PUBLIC ACLs. The runner never needs to
+-- create schemas/objects, invoke dangerous routines, or contact foreign
+-- servers. Generate every identifier/signature from catalogs so restored
+-- object names can never become SQL text by concatenation.
+SELECT format(
+    'REVOKE CREATE ON SCHEMA %I FROM PUBLIC, clone_runner',
+    namespace.nspname
+)
+FROM pg_catalog.pg_namespace AS namespace
+WHERE namespace.nspname NOT LIKE 'pg_temp_%'
+  AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+ORDER BY namespace.oid
+\gexec
+
+WITH dangerous_routines AS (
+    SELECT routine.oid,
+           namespace.nspname,
+           routine.proname,
+           pg_catalog.pg_get_function_identity_arguments(routine.oid) AS identity_arguments
+    FROM pg_catalog.pg_proc AS routine
+    JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = routine.pronamespace
+    JOIN pg_catalog.pg_language AS language ON language.oid = routine.prolang
+    WHERE routine.provolatile = 'v'
+       OR routine.prosecdef
+       OR routine.prokind = 'p'
+       OR (
+           namespace.nspname <> 'pg_catalog'
+           AND namespace.nspname <> 'information_schema'
+           AND language.lanname NOT IN ('sql', 'plpgsql')
+       )
+)
+SELECT format(
+    'REVOKE EXECUTE ON ROUTINE %I.%I(%s) FROM PUBLIC, clone_runner',
+    nspname,
+    proname,
+    identity_arguments
+)
+FROM dangerous_routines
+ORDER BY oid
+\gexec
+
+SELECT format(
+    'REVOKE USAGE ON FOREIGN SERVER %I FROM PUBLIC, clone_runner',
+    server.srvname
+)
+FROM pg_catalog.pg_foreign_server AS server
+ORDER BY server.oid
+\gexec
+
+WITH dangerous_routines AS (
+    SELECT routine.oid,
+           routine.proacl,
+           routine.proowner
+    FROM pg_catalog.pg_proc AS routine
+    JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = routine.pronamespace
+    JOIN pg_catalog.pg_language AS language ON language.oid = routine.prolang
+    WHERE routine.provolatile = 'v'
+       OR routine.prosecdef
+       OR routine.prokind = 'p'
+       OR (
+           namespace.nspname <> 'pg_catalog'
+           AND namespace.nspname <> 'information_schema'
+           AND language.lanname NOT IN ('sql', 'plpgsql')
+       )
+)
+SELECT NOT EXISTS (
+    SELECT 1
+    FROM dangerous_routines AS routine
+    WHERE pg_catalog.has_function_privilege('clone_runner', routine.oid, 'EXECUTE')
+       OR EXISTS (
+           SELECT 1
+           FROM pg_catalog.aclexplode(
+               COALESCE(
+                   routine.proacl,
+                   pg_catalog.acldefault('f', routine.proowner)
+               )
+           ) AS privilege
+           WHERE privilege.grantee = 0
+             AND privilege.privilege_type = 'EXECUTE'
+       )
+) AS dangerous_routines_revoked
+\gset
+\if :dangerous_routines_revoked
+\else
+\echo Clone runner policy error: dangerous routine EXECUTE privilege remains
+\quit 3
+\endif
 
 CREATE SCHEMA IF NOT EXISTS advisor_clone_meta AUTHORIZATION :"clone_admin";
 REVOKE ALL ON SCHEMA advisor_clone_meta FROM PUBLIC;
@@ -80,13 +186,36 @@ CREATE TABLE IF NOT EXISTS advisor_clone_meta.template_manifest (
     initialized_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     postgres_version text NOT NULL DEFAULT current_setting('server_version'),
     archive_restored boolean NOT NULL DEFAULT false,
-    source_ddl_executed boolean NOT NULL DEFAULT false CHECK (NOT source_ddl_executed)
+    source_ddl_executed boolean NOT NULL DEFAULT false CHECK (NOT source_ddl_executed),
+    runner_policy_revision integer NOT NULL DEFAULT 1,
+    dangerous_routines_revoked boolean NOT NULL DEFAULT true
 );
-INSERT INTO advisor_clone_meta.template_manifest(singleton, archive_restored)
-VALUES (true, :'template_restored'::boolean)
+ALTER TABLE advisor_clone_meta.template_manifest
+  ADD COLUMN IF NOT EXISTS runner_policy_revision integer;
+ALTER TABLE advisor_clone_meta.template_manifest
+  ADD COLUMN IF NOT EXISTS dangerous_routines_revoked boolean;
+UPDATE advisor_clone_meta.template_manifest
+SET runner_policy_revision = 1,
+    dangerous_routines_revoked = true
+WHERE runner_policy_revision IS DISTINCT FROM 1
+   OR dangerous_routines_revoked IS DISTINCT FROM true;
+ALTER TABLE advisor_clone_meta.template_manifest
+  ALTER COLUMN runner_policy_revision SET DEFAULT 1,
+  ALTER COLUMN runner_policy_revision SET NOT NULL,
+  ALTER COLUMN dangerous_routines_revoked SET DEFAULT true,
+  ALTER COLUMN dangerous_routines_revoked SET NOT NULL;
+INSERT INTO advisor_clone_meta.template_manifest(
+    singleton,
+    archive_restored,
+    runner_policy_revision,
+    dangerous_routines_revoked
+)
+VALUES (true, :'template_restored'::boolean, 1, true)
 ON CONFLICT (singleton) DO UPDATE
 SET initialized_at = EXCLUDED.initialized_at,
     postgres_version = EXCLUDED.postgres_version,
     archive_restored = EXCLUDED.archive_restored,
-    source_ddl_executed = false;
+    source_ddl_executed = false,
+    runner_policy_revision = EXCLUDED.runner_policy_revision,
+    dangerous_routines_revoked = EXCLUDED.dangerous_routines_revoked;
 SQL

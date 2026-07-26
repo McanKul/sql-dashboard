@@ -211,7 +211,9 @@ PoWA'nın taşımadığı kolon-kolon JOIN kayıtları, `pg_qualstats` reset'iyl
 
 JOIN eşitliği ile aynı tablodaki WHERE equality/range kanıtı en az iki snapshot ve asgari occurrence eşiklerini geçtiğinde iki kolonlu B-tree adayı oluşur. Equality/range kuralı kolon sırasını açıklar; mevcut index prefix'i ve planner faydası canlı kaynakta salt-okunur HypoPG evaluator tarafından doğrulanır. Bu kanıt da ana inceleme skoruna katılmaz.
 
-Gerçek çalışma testi varsayılan olarak kapalıdır. `real-validation` profili tmpfs üzerinde clone template'ten ayrı baseline/candidate veritabanları üretir, gerçek indexi yalnız candidate clone'da kurar ve dönüşümlü `EXPLAIN ANALYZE` medianlarını karşılaştırır. Parametreli replay yalnız exact query/candidate kimliğine bağlı, süresi ve audit metadatası olan server-side sentetik/anonim fixture ile açılır; browser serbest SQL veya bind değeri gönderemez. Her cevap `sourceDdlExecuted=false` ve clone cleanup durumunu taşır. Kurulum ve güvenlik sınırları [2.5–2.7 runbook'undadır](docs/ITERATIONS_2_5_TO_2_7.md).
+Gerçek çalışma testi varsayılan olarak kapalıdır. `real-validation` profili tmpfs üzerinde clone template'ten ayrı baseline/candidate veritabanları üretir, gerçek indexi yalnız candidate clone'da kurar ve dönüşümlü `EXPLAIN ANALYZE` medianlarını karşılaştırır. Çalıştırılabilir kapsam tek bir salt-okunur `SELECT`tir; `WITH` yalnız final komutu `SELECT` olan ve DML/DDL token'ı taşımayan tek statement kapsamında kabul edilir. Yapısal lexical/statement kapısı multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row lock ve açık denylist'teki yan etkili routine adlarını ANALYZE'dan önce reddeder. Bu kapı bütün routine'leri volatility açısından sınıflandırmaz: aktif runner attestation'ı volatile/security-definer routine ve procedure'lere `EXECUTE` verilmediğini ayrıca kanıtlar. Ardından PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) plan preflight'ı `ModifyTable`, `LockRows`, `Foreign Scan` veya `Custom Scan` düğümü bulunmadığını doğrulamadan gerçek çalışma başlamaz; her runner transaction'ı koşulsuz rollback edilir.
+
+Parametreli replay yalnız exact query/candidate kimliğine bağlı, süresi ve audit metadatası olan server-side sentetik/anonim fixture ile açılır; browser serbest SQL veya bind değeri gönderemez. Clone template manifestinde beklenen runner policy revision'ı ve dangerous-routine hardening kanıtı doğrulanır; gerçek rol/ACL durumu job database'deki her runner transaction'ında yeniden ölçülür. Eksik, eski veya uyuşmayan herhangi bir kapı fail-closed sonuç üretir. Kaynak ağı/DSN'i clone evaluator'a verilmez, kaynakta hiçbir replay veya DDL çalışmaz ve her cevap `sourceDdlExecuted=false` ile clone cleanup durumunu taşır. Kurulum ve güvenlik sınırları [2.5–2.7 runbook'undadır](docs/ITERATIONS_2_5_TO_2_7.md).
 
 ## İterasyon 1 kapanış notu — 24 Temmuz 2026
 
@@ -330,6 +332,7 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 - CSV export listeyle aynı filtrelerin tamamını uygular, 200 satır sayfa sınırına
   takılmaz ve server-side cursor ile sabit boyutlu partiler hâlinde akar.
 - Runtime bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar; UI yalnız fixture'ın hazır olup olmadığını görür.
+- Runtime replay tek bir salt-okunur `SELECT` ile sınırlıdır. Yapısal kapı, plain-`EXPLAIN` plan preflight'ı, aktif read-only runner attestation'ı ve template policy revision kontrolünden biri başarısızsa `EXPLAIN ANALYZE` başlamaz; ölçüm transaction'ı daima rollback edilir.
 - Yerel/operator PAT modeli server-side kimlik sağlar fakat SSO değildir.
   İnternet erişimi verilen bir kurulumda TLS, rate limit ve OIDC/BFF veya
   kimlik doğrulayan reverse proxy eklenmeden üretim güvenliği sağlanmış sayılmaz.
@@ -370,7 +373,7 @@ docker compose --profile real-validation up -d --wait clone-db clone-evaluator
 bash scripts/verify-real-validation.sh
 ```
 
-Bu ikinci script operator fixture kaydını, admin-token sınırını, güvenli bind adaptasyonuyla gerçek index kullanımını ve zorunlu clone cleanup'ını doğrular.
+Bu ikinci script operator fixture kaydını, admin-token sınırını, manifest ile canlı runner rol/ACL/routine politikasını, runner'ın DML/DDL/`SELECT INTO`/`nextval` negatif problarını, güvenli bind adaptasyonuyla gerçek index kullanımını, kaynak değişmezliğini ve zorunlu clone cleanup'ını doğrular.
 
 Backend unit testleri:
 

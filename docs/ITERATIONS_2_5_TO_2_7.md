@@ -148,7 +148,7 @@ curl -fsS -X POST \
   'http://127.0.0.1:8000/api/v1/queries/QUERY_ID/runtime-index-validations?window=24h'
 ```
 
-Clone evaluator iki rastgele job database oluşturur. Baseline ve candidate aynı `appdb` template'inden fiziksel kopyadır. Gerçek B-tree yalnız candidate kopyada oluşturulur; warm-up sonrasında baseline/candidate `EXPLAIN ANALYZE` koşuları dönüşümlü yapılır ve median süreler karşılaştırılır. Sonuç ne olursa olsun job database bağlantıları sonlandırılır ve database'ler düşürülür.
+Clone evaluator iki rastgele job database oluşturur. Baseline ve candidate aynı `appdb` template'inden fiziksel kopyadır. Gerçek B-tree yalnız candidate kopyada oluşturulur; warm-up sonrasında yalnız güvenlik kapılarını geçen tek salt-okunur `SELECT` için baseline/candidate `EXPLAIN ANALYZE` koşuları dönüşümlü yapılır ve median süreler karşılaştırılır. Sonuç ne olursa olsun runner transaction'ları rollback edilir, job database bağlantıları sonlandırılır ve database'ler düşürülür. Kaynak veritabanı hiçbir zaman replay veya DDL hedefi değildir.
 
 Her yanıt şu güvenlik alanlarını taşır:
 
@@ -170,14 +170,19 @@ bash scripts/verify-real-validation.sh
 ```
 
 Bu script sentetik fixture kaydı, admin çağrısı, `candidateIndexUsed=true`, kaynak
-index fingerprint'i, clone template manifesti ve job database cleanup'ını birlikte
-assert eder.
+index fingerprint'i, manifest policy revision/dangerous-routine kanıtı, canlı runner
+rol/ACL/routine/foreign-server politikası, doğrudan DML/DDL/`SELECT INTO`/`nextval`
+negatif probları ve job database cleanup'ını birlikte assert eder.
 
 ### Fail-closed replay kapsamı
 
 `EXPLAIN ANALYZE` sorguyu gerçekten çalıştırır. `pg_stat_statements` normalize SQL'i `$1` gibi parametreleri değerleriyle birlikte saklamaz. Bu nedenle bu sürüm:
 
-- multi-statement, DML/DDL ve row-lock SELECT'i reddeder; yalnız tek `SELECT`/`WITH` çalıştırır;
+- yalnız tek bir salt-okunur `SELECT` çalıştırır; `WITH` ancak final komutu `SELECT` olan ve DML/DDL token'ı taşımayan tek statement kapsamında kabul edilir;
+- ilk yapısal lexical/statement kapısında multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row-lock biçimleri ve açık denylist'teki yan etkili routine adlarını reddeder. Lexical kapı sorgudaki bütün routine'leri volatility açısından sınıflandırmaz;
+- job database oluşturmadan önce template manifestindeki beklenen runner policy revision'ını ve dangerous-routine hardening kanıtını doğrular;
+- her runner transaction'ında exact kimlik/rol bayrakları ve üyeliği, aktif/default read-only durumu, timeout'lar, `row_security`, `search_path`, JIT, TEMP/CREATE yokluğu, dangerous routine `EXECUTE` yokluğu ve foreign-server `USAGE` yokluğunu atteste eder. Dangerous kapsamı volatile veya security-definer routine'leri, procedure'leri ve sistem şemaları dışında SQL/PLpgSQL harici dillerde tanımlı routine'leri içerir;
+- doğrulanmış bind'lerle PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) plan preflight'ı çalıştırır ve plandaki `ModifyTable`, `LockRows`, `Foreign Scan` veya `Custom Scan` düğümlerini reddeder; yalnız bu kapıdan sonra `EXPLAIN ANALYZE` çalışabilir. Her runner transaction'ı koşulsuz rollback edilir;
 - client'tan serbest SQL veya bind değeri kabul etmez;
 - fixture'ı exact candidate, server/database/query kimliği ve normalize SQL SHA-256 değeriyle eşleştirir; disabled, expired veya hash'i değişmiş kayıt `REPLAY_FIXTURE_REQUIRED` döndürür;
 - en fazla 16, `$1`'den başlayan bitişik parametre ve aynı sayıda JSON scalar kabul eder; toplam fixture 8 KiB, her string 2.048 karakter ile sınırlıdır;
@@ -197,9 +202,9 @@ api <-> clone-evaluator                (clone_control)
 clone-evaluator <-> clone-db           (clone_data)
 ```
 
-`join-snapshotter` ana `advisor` ağına katılmaz. `api` clone DB credential'ı ve `clone_data` ağı almaz. `clone-evaluator` source/repository DSN'i veya bu ağları almaz. `clone-db` her bağlantıda `advisor.validation_clone=on` marker'ı taşır; evaluator marker, tam admin/runner rolü, template işareti ve bootstrap manifestini DDL/ölçüm öncesinde tekrar doğrular. PostgreSQL container'ına tmpfs bootstrap için yalnız sahiplik ve uid/gid geçiş capability'leri geri verilir; clone evaluator bütün Linux capability'lerini düşürür.
+`join-snapshotter` ana `advisor` ağına katılmaz. `api` clone DB credential'ı ve `clone_data` ağı almaz. `clone-evaluator` source/repository DSN'i veya bu ağları almaz; bu nedenle kaynak hiçbir koşulda runtime test veya DDL hedefi olamaz. `clone-db` her bağlantıda `advisor.validation_clone=on` marker'ı taşır; evaluator beklenen admin/runner kimliğini, template işaretini ve manifestteki runner policy revision/dangerous-routine kanıtını doğrular. Job database'deki gerçek rol/üyelik/ACL/routine/foreign-server durumu her runner transaction'ında ayrıca atteste edilir. Eksik, eski veya uyuşmayan değer işi fail-closed durdurur. PostgreSQL container'ına tmpfs bootstrap için yalnız sahiplik ve uid/gid geçiş capability'leri geri verilir; clone evaluator bütün Linux capability'lerini düşürür.
 
-Local template sentetik demo verisidir. Üretim benzeri testte aynı servisi yalnız önceden hazırlanmış, erişimi kısıtlı ve gerekiyorsa anonimleştirilmiş clone/restore üzerinde kullanın. `real-validation` profili `admin` rollü, server-side hash registry'de doğrulanan Bearer principal ister. Genel kullanıma açmadan TLS, rate limit, audit retention, kaynak veri sınıflandırması ve kapasite sınırı ekleyin. Yerel PAT modeli SSO değildir; ayrıntılar [AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
+Local template sentetik demo verisidir. PostgreSQL archive restore işlemi archive sahibinin seçtiği kodu bootstrap yetkileriyle çalıştırabilir; `--no-owner` ve `--no-privileges` archive'ı sanitize etmez. Bu nedenle üretim benzeri testte yalnız güvenilir kaynaktan alınmış, önceden hazırlanmış, erişimi kısıtlı ve gerekiyorsa anonimleştirilmiş clone/restore kullanın. Clone ağı dış egress'e kapalıdır; plan kapısı foreign/custom scan'i de reddeder. `real-validation` profili `admin` rollü, server-side hash registry'de doğrulanan Bearer principal ister. Genel kullanıma açmadan TLS, rate limit, audit retention, kaynak veri sınıflandırması ve kapasite sınırı ekleyin. Yerel PAT modeli SSO değildir; ayrıntılar [AUTHENTICATION.md](AUTHENTICATION.md) içindedir.
 
 ## Mevcut demo volume'ünü 2.5–2.6'ya geçirme
 
