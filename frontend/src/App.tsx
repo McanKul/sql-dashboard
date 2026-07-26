@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AlertCircle,
@@ -32,12 +32,14 @@ import {
 import { advisorApi, ApiClientError, demoModeEnabled } from './api'
 import type {
   ApiList,
+  CloneQueryEvaluationResult,
   CompositeIndexCandidate,
   DatabaseOption,
   OperationsData,
   OverviewStats,
   PageId,
   QueryDetail,
+  QueryBindValue,
   QueryIndexAdvice,
   QueryListParams,
   QueryPredicate,
@@ -615,34 +617,243 @@ export function CompositeIndexEvaluation({
   )
 }
 
+export function highestBindParameter(statement: string): number {
+  let highest = 0
+  let index = 0
+  let blockCommentDepth = 0
+  let mode: 'normal' | 'single' | 'escape-single' | 'double' | 'line-comment' | 'block-comment' | 'dollar' = 'normal'
+  let dollarTag = ''
+
+  while (index < statement.length) {
+    const current = statement[index]
+    const next = statement[index + 1]
+    if (mode === 'line-comment') {
+      if (current === '\n' || current === '\r') mode = 'normal'
+      index += 1
+      continue
+    }
+    if (mode === 'block-comment') {
+      if (current === '/' && next === '*') { blockCommentDepth += 1; index += 2; continue }
+      if (current === '*' && next === '/') {
+        blockCommentDepth -= 1
+        index += 2
+        if (blockCommentDepth === 0) mode = 'normal'
+        continue
+      }
+      index += 1
+      continue
+    }
+    if (mode === 'single') {
+      if (current === "'" && next === "'") { index += 2; continue }
+      if (current === "'") mode = 'normal'
+      index += 1
+      continue
+    }
+    if (mode === 'escape-single') {
+      if (current === '\\') { index += 2; continue }
+      if (current === "'" && next === "'") { index += 2; continue }
+      if (current === "'") mode = 'normal'
+      index += 1
+      continue
+    }
+    if (mode === 'double') {
+      if (current === '"' && next === '"') { index += 2; continue }
+      if (current === '"') mode = 'normal'
+      index += 1
+      continue
+    }
+    if (mode === 'dollar') {
+      if (statement.startsWith(dollarTag, index)) {
+        index += dollarTag.length
+        mode = 'normal'
+      } else index += 1
+      continue
+    }
+    if (current === '-' && next === '-') { mode = 'line-comment'; index += 2; continue }
+    if (current === '/' && next === '*') { mode = 'block-comment'; blockCommentDepth = 1; index += 2; continue }
+    if (current === "'") {
+      const prefix = statement[index - 1]
+      const beforePrefix = statement[index - 2]
+      const escapePrefixed = (prefix === 'E' || prefix === 'e')
+        && (index < 2 || !/[A-Za-z0-9_$]/.test(beforePrefix))
+      mode = escapePrefixed ? 'escape-single' : 'single'
+      index += 1
+      continue
+    }
+    if (current === '"') { mode = 'double'; index += 1; continue }
+    if (current === '$') {
+      const parameter = statement.slice(index).match(/^\$([1-9][0-9]*)/)
+      if (parameter) {
+        highest = Math.max(highest, Number(parameter[1]))
+        index += parameter[0].length
+        continue
+      }
+      const delimiter = statement.slice(index).match(/^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/)?.[0]
+      if (delimiter) {
+        dollarTag = delimiter
+        mode = 'dollar'
+        index += delimiter.length
+        continue
+      }
+    }
+    index += 1
+  }
+  return highest
+}
+
+export function parseExplainBindValues(input: string, requiredCount: number): { values: QueryBindValue[] } | { error: string } {
+  if (requiredCount === 0) return { values: [] }
+  if (requiredCount > 16) return { error: `Bu sorgu ${requiredCount} bind değeri istiyor; güvenli arayüz sınırı 16.` }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(input)
+  } catch {
+    return { error: 'Bind değerlerini geçerli bir JSON array olarak girin.' }
+  }
+  if (!Array.isArray(parsed)) return { error: 'Bind değerleri bir JSON array olmalı.' }
+  if (parsed.length > 16) return { error: 'En fazla 16 bind değeri gönderebilirsiniz.' }
+  if (parsed.length !== requiredCount) return { error: `Bu sorgu $1–$${requiredCount} için tam ${requiredCount} değer istiyor.` }
+  const scalarValues: QueryBindValue[] = []
+  for (const value of parsed) {
+    if (value !== null && typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+      return { error: 'Her bind değeri string, number, boolean veya null olmalı.' }
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) return { error: 'Sayısal bind değerleri sonlu olmalı.' }
+    if (typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      return { error: 'JavaScript güvenli integer sınırını aşan değerleri hassasiyet kaybını önlemek için JSON string olarak girin.' }
+    }
+    if (typeof value === 'string' && value.length > 2_048) return { error: 'Bir bind string değeri en fazla 2048 karakter olabilir.' }
+    scalarValues.push(value as QueryBindValue)
+  }
+  if (new TextEncoder().encode(JSON.stringify(scalarValues)).length > 8_192) return { error: 'Bind değerlerinin toplam boyutu 8 KB sınırını aşıyor.' }
+  return { values: scalarValues }
+}
+
+function explainStatusLabel(status: CloneQueryEvaluationResult['status']): string {
+  return {
+    RUNTIME_VALIDATED: 'EXPLAIN ANALYZE tamamlandı',
+    UNAVAILABLE: 'Clone doğrulaması kullanılamıyor',
+    UNSAFE: 'Sorgu güvenlik kapısından geçmedi',
+  }[status]
+}
+
+function ExplainRawPlan({ plan, evaluatedAt }: { plan: Record<string, unknown>; evaluatedAt: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const formattedPlan = useMemo(() => expanded ? JSON.stringify(plan, null, 2) : '', [expanded, plan])
+  return (
+    <details className="explain-plan-details" onToggle={(event) => setExpanded(event.currentTarget.open)}>
+      <summary className="explain-plan-heading"><strong>Ham JSON planı</strong><span>{formatDateTime(evaluatedAt)} · {expanded ? 'Gizle' : 'Görüntüle'}</span></summary>
+      {expanded && <pre className="explain-plan"><code>{formattedPlan}</code></pre>}
+    </details>
+  )
+}
+
+export function ExplainAnalyzePanel({
+  statement,
+  state,
+  bindInput,
+  onBindInput,
+  onEvaluate,
+}: {
+  statement: string
+  state: Loadable<CloneQueryEvaluationResult>
+  bindInput: string
+  onBindInput: (value: string) => void
+  onEvaluate: () => void
+}) {
+  const bindCount = highestBindParameter(statement)
+  const result = state.data
+  return (
+    <article className="detail-card explain-analyze-card" aria-live="polite">
+      <div className="detail-card-heading">
+        <div><span className="panel-kicker">Disposable clone</span><h2>Clone’da EXPLAIN ANALYZE</h2></div>
+        <span className="simulation-label"><ShieldAlert size={14} /> Kaynak izole</span>
+      </div>
+      <p className="explain-intro">Bu sorgunun gerçek planını ve çalışma metriklerini geçici clone üzerinde ölçer. Yalnız salt-okunur SELECT kabul edilir.</p>
+      {bindCount > 0 ? (
+        <label className="explain-bind-field">
+          <span>Bind değerleri · $1–${bindCount}</span>
+          <textarea value={bindInput} onChange={(event) => onBindInput(event.target.value)} disabled={state.status === 'loading'} rows={3} spellCheck={false} aria-label="EXPLAIN ANALYZE bind değerleri" placeholder='["paid", 100, null]' />
+          <small className={bindCount > 16 ? 'explain-limit-warning' : ''}>{bindCount > 16 ? `Bu sorgu ${bindCount} değer istiyor; arayüz güvenlik sınırı 16 olduğu için çalıştırılamaz.` : `Sorgudaki sırayla tam ${bindCount} JSON scalar değer girin; en fazla 16 değer.`}</small>
+        </label>
+      ) : <div className="explain-no-binds"><CheckCircle2 size={16} /><span>Bu sorguda bind parametresi yok; <code>bindValues: []</code> gönderilecek.</span></div>}
+      <div className="explain-actions">
+        <div><strong>Read-only çalışma</strong><span>Değerler saklanmaz; normalize SQL sunucudan çözülür ve kaynak veritabanına dokunulmaz.</span></div>
+        <button type="button" className="hypopg-button explain-run-button" onClick={onEvaluate} disabled={state.status === 'loading' || bindCount > 16}>
+          {state.status === 'loading' ? <LoaderCircle className="spin" size={16} /> : <Zap size={16} />}
+          {state.status === 'loading' ? 'Clone hazırlanıyor…' : 'Clone’da EXPLAIN ANALYZE'}
+        </button>
+      </div>
+      {state.status === 'error' && <div className="index-evaluation-error explain-error"><AlertCircle size={17} /><span>{state.error}</span><button type="button" onClick={onEvaluate}>Tekrar dene</button></div>}
+      {state.status === 'success' && result && (
+        <div className={`explain-result ${result.status.toLowerCase()}`}>
+          <div className="index-evaluation-status">
+            {result.status === 'RUNTIME_VALIDATED' ? <CheckCircle2 size={19} /> : <ShieldAlert size={19} />}
+            <div><strong>{explainStatusLabel(result.status)}</strong><span>{result.message}</span><small>{result.reasonCode}</small></div>
+          </div>
+          {result.validation && (
+            <>
+              <div className="explain-metrics">
+                <div><span>Çalışma</span><strong>{formatDuration(result.validation.executionTimeMs)}</strong></div>
+                <div><span>Planlama</span><strong>{formatDuration(result.validation.planningTimeMs)}</strong></div>
+                <div><span>Shared hit / read</span><strong>{formatLargeNumber(result.validation.sharedHitBlocks)} / {formatLargeNumber(result.validation.sharedReadBlocks)}</strong></div>
+                <div><span>Temp read / write</span><strong>{formatLargeNumber(result.validation.tempReadBlocks)} / {formatLargeNumber(result.validation.tempWrittenBlocks)}</strong></div>
+                <div><span>WAL</span><strong>{formatLargeNumber(result.validation.walRecords)} kayıt · {formatBytes(result.validation.walBytes)}</strong></div>
+                <div><span>Runner policy</span><strong>rev. {result.validation.runnerPolicyRevision}</strong><small>PostgreSQL {result.validation.postgresVersion}</small></div>
+              </div>
+              <ExplainRawPlan plan={result.validation.plan ?? result.validation.rawPlan ?? {}} evaluatedAt={result.validation.evaluatedAt} />
+            </>
+          )}
+          <div className="explain-safety-facts">
+            <span><Check size={13} /> {result.executionTarget}</span>
+            <span><Check size={13} /> sourceDdlExecuted=false</span>
+            <span><Check size={13} /> cloneDdlExecuted=false</span>
+            {result.validation && <span><Check size={13} /> transactionReadOnly=true</span>}
+            <span className={result.cloneDestroyed ? '' : 'pending'}>{result.cloneDestroyed ? <Check size={13} /> : <Clock3 size={13} />} cloneDestroyed={String(result.cloneDestroyed)}</span>
+          </div>
+        </div>
+      )}
+    </article>
+  )
+}
+
 function QueryDetailModal({ queryId, window, onClose }: { queryId: string; window: TimeWindow; onClose: () => void }) {
   const [state, setState] = useState<Loadable<QueryDetail>>({ status: 'loading' })
   const [copied, setCopied] = useState(false)
   const [indexAdvice, setIndexAdvice] = useState<Record<string, Loadable<QueryIndexAdvice>>>({})
   const [copiedIndexKey, setCopiedIndexKey] = useState<string | null>(null)
+  const [explainState, setExplainState] = useState<Loadable<CloneQueryEvaluationResult>>({ status: 'idle' })
+  const [bindInput, setBindInput] = useState('[]')
+  const detailControllerRef = useRef<AbortController | null>(null)
+  const explainControllerRef = useRef<AbortController | null>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
 
   const load = () => {
+    detailControllerRef.current?.abort()
     const controller = new AbortController()
+    detailControllerRef.current = controller
     setState({ status: 'loading' })
     setIndexAdvice({})
+    explainControllerRef.current?.abort()
+    setExplainState({ status: 'idle' })
+    setBindInput('[]')
     advisorApi.getQuery(queryId, window, controller.signal).then(({ data }) => {
-      setState({ status: 'success', data })
+      if (!controller.signal.aborted) setState({ status: 'success', data })
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return
       setState({ status: 'error', error: error instanceof Error ? error.message : 'Sorgu detayı alınamadı.' })
     })
-    return controller
   }
 
   useEffect(() => {
-    const controller = load()
+    load()
     closeRef.current?.focus()
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
     document.addEventListener('keydown', onKeyDown)
     document.body.classList.add('modal-open')
     return () => {
-      controller.abort()
+      detailControllerRef.current?.abort()
+      explainControllerRef.current?.abort()
       document.removeEventListener('keydown', onKeyDown)
       document.body.classList.remove('modal-open')
     }
@@ -683,6 +894,33 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
         [key]: { status: 'error', error: error instanceof Error ? error.message : 'Composite HypoPG doğrulaması alınamadı.' },
       }))
     }
+  }
+
+  const evaluateExplainAnalyze = async () => {
+    if (!state.data) return
+    const parsed = parseExplainBindValues(bindInput, highestBindParameter(state.data.fullSql))
+    if ('error' in parsed) {
+      setExplainState({ status: 'error', error: parsed.error })
+      return
+    }
+    explainControllerRef.current?.abort()
+    const controller = new AbortController()
+    explainControllerRef.current = controller
+    setExplainState({ status: 'loading' })
+    try {
+      const { data } = await advisorApi.explainAnalyzeQuery(queryId, window, parsed.values, controller.signal)
+      if (!controller.signal.aborted) setExplainState({ status: 'success', data })
+    } catch (error: unknown) {
+      if (controller.signal.aborted) return
+      setExplainState({ status: 'error', error: error instanceof Error ? error.message : 'Clone EXPLAIN ANALYZE çalıştırılamadı.' })
+    }
+  }
+
+  const updateExplainBindInput = (value: string) => {
+    explainControllerRef.current?.abort()
+    explainControllerRef.current = null
+    setBindInput(value)
+    setExplainState({ status: 'idle' })
   }
 
   const copyIndexSql = async (key: string, statement: string) => {
@@ -730,6 +968,8 @@ function QueryDetailModal({ queryId, window, onClose }: { queryId: string; windo
                   <div className="detail-card-heading"><div><span className="panel-kicker">Normalize edilmiş sorgu</span><h2>SQL</h2></div><button type="button" className="copy-sql-button" onClick={copySql}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? 'Kopyalandı' : 'SQL’i kopyala'}</button></div>
                   <pre><code>{state.data.fullSql}</code></pre>
                 </article>
+
+                <ExplainAnalyzePanel statement={state.data.fullSql} state={explainState} bindInput={bindInput} onBindInput={updateExplainBindInput} onEvaluate={evaluateExplainAnalyze} />
 
                 <article className="detail-card">
                   <div className="detail-card-heading"><div><span className="panel-kicker">{windowLabels[window]}</span><h2>Çalışma süresi eğilimi</h2></div>{state.data.hasComparison

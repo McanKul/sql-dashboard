@@ -79,7 +79,11 @@ docker compose --profile real-validation up -d --wait clone-db clone-evaluator
 bash scripts/verify-real-validation.sh
 ```
 
-İkinci script demo eşitlik sorgusu için audit metadatalı sentetik replay fixture'ı kaydeder; gerçek indexin yalnız disposable candidate clone'da kullanıldığını, kaynağın değişmediğini ve iki job database'in de temizlendiğini doğrular.
+`CLONE_SOURCE_ALIAS`, repository'deki kaynak alias'ıyla birebir aynı olmalıdır
+(demo varsayılanı `test-source`). Evaluator hem request kimliğini hem clone
+manifestindeki alias/database bağını doğrulamadan job database oluşturmaz.
+
+İkinci script dashboard'ın fixture'sız tek-sorgu EXPLAIN ANALYZE yolunu da çalıştırır; ardından demo eşitlik sorgusu için audit metadatalı sentetik replay fixture'ı kaydeder, gerçek indexin yalnız disposable candidate clone'da kullanıldığını, kaynağın değişmediğini ve bütün job database'lerin temizlendiğini doğrular.
 
 ## Erişim adresleri
 
@@ -213,7 +217,9 @@ JOIN eşitliği ile aynı tablodaki WHERE equality/range kanıtı en az iki snap
 
 Gerçek çalışma testi varsayılan olarak kapalıdır. `real-validation` profili tmpfs üzerinde clone template'ten ayrı baseline/candidate veritabanları üretir, gerçek indexi yalnız candidate clone'da kurar ve dönüşümlü `EXPLAIN ANALYZE` medianlarını karşılaştırır. Çalıştırılabilir kapsam tek bir salt-okunur `SELECT`tir; `WITH` yalnız final komutu `SELECT` olan ve DML/DDL token'ı taşımayan tek statement kapsamında kabul edilir. Yapısal lexical/statement kapısı multi-statement, DDL/DML, `SELECT INTO`, DML CTE, row lock ve açık denylist'teki yan etkili routine adlarını ANALYZE'dan önce reddeder. Bu kapı bütün routine'leri volatility açısından sınıflandırmaz: aktif runner attestation'ı volatile/security-definer routine ve procedure'lere `EXECUTE` verilmediğini ayrıca kanıtlar. Ardından PostgreSQL plain `EXPLAIN` (`ANALYZE FALSE`) plan preflight'ı `ModifyTable`, `LockRows`, `Foreign Scan` veya `Custom Scan` düğümü bulunmadığını doğrulamadan gerçek çalışma başlamaz; her runner transaction'ı koşulsuz rollback edilir.
 
-Parametreli replay yalnız exact query/candidate kimliğine bağlı, süresi ve audit metadatası olan server-side sentetik/anonim fixture ile açılır; browser serbest SQL veya bind değeri gönderemez. Clone template manifestinde beklenen runner policy revision'ı ve dangerous-routine hardening kanıtı doğrulanır; gerçek rol/ACL durumu job database'deki her runner transaction'ında yeniden ölçülür. Eksik, eski veya uyuşmayan herhangi bir kapı fail-closed sonuç üretir. Kaynak ağı/DSN'i clone evaluator'a verilmez, kaynakta hiçbir replay veya DDL çalışmaz ve her cevap `sourceDdlExecuted=false` ile clone cleanup durumunu taşır. Kurulum ve güvenlik sınırları [2.5–2.7 runbook'undadır](docs/ITERATIONS_2_5_TO_2_7.md).
+Sorgu detayındaki **Clone'da EXPLAIN ANALYZE** paneli, composite aday veya HypoPG şartı olmadan repository'deki herhangi bir persisted sorguyu tek disposable job database'de bir kez çalıştırır. Browser SQL gönderemez; backend exact sorguyu repository'den alır. Parametreli sorguda kullanıcı en fazla 16 JSON scalar bind değeri girer; değerler yalnız bu istek boyunca bellekte taşınır, repository'ye kaydedilmez ve kaynakta çalıştırılmaz. Gerçek index karşılaştırmasının parametreli replay yolu ise exact query/candidate kimliğine bağlı, süreli ve audit metadatalı server-side sentetik/anonim fixture kullanmaya devam eder.
+
+Clone template manifestinde beklenen runner policy revision'ı ve dangerous-routine hardening kanıtı doğrulanır; gerçek rol/ACL durumu job database'deki her runner transaction'ında yeniden ölçülür. Eksik, eski veya uyuşmayan herhangi bir kapı fail-closed sonuç üretir. Kaynak ağı/DSN'i clone evaluator'a verilmez, kaynakta hiçbir replay veya DDL çalışmaz ve her cevap `sourceDdlExecuted=false` ile clone cleanup durumunu taşır. Kurulum ve güvenlik sınırları [2.5–2.7 runbook'undadır](docs/ITERATIONS_2_5_TO_2_7.md).
 
 ## İterasyon 1 kapanış notu — 24 Temmuz 2026
 
@@ -312,7 +318,7 @@ external PG #N ──────┘                                      │
 configured source/appdb ──salt-okunur──> evaluator:8010 ──iç API──> api:8000
 
 source JOIN outbox ──fetch/ack──> join-snapshotter ──ingest──> repository-db
-api ──iç token──> clone-evaluator:8020 ──gerçek DDL──> disposable clone-db
+api ──iç token──> clone-evaluator:8020 ──read-only replay / opsiyonel gerçek DDL──> disposable clone-db
 ```
 
 Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasına bakın.
@@ -325,14 +331,15 @@ Mimari sınırlar ve rol matrisi için [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 - Kaynak DSN'i yalnız ayrı `evaluator` servisindedir. Bu servis `advisor_evaluator` rolü, read-only transaction, kısa timeout, connection limit, internal network ve token korumalı iç endpoint ile sınırlandırılır; ana API'ye kaynak parolası verilmez.
 - HypoPG fonksiyonlarının PUBLIC yetkileri kaldırılmıştır. Evaluator yalnız sanal index oluşturur ve plain `EXPLAIN` çalıştırır; kopyalanabilir SQL'in kullanıcıya dönmesi gerçek DDL çalıştığı anlamına gelmez.
 - Header gönderilmeyen API isteği `viewer` sayılır ve tam SQL maskelenir. Referans web istemcisi analiz ekranları için demonstrasyon amaçlı `analyst` header'ı gönderir; bu gerçek kullanıcı kimliği değildir.
-- Annotation, CSV export ve disposable-clone runtime testi yalnız server-side
+- Annotation, CSV export ve gerçek-index karşılaştırmalı disposable-clone testi yalnız server-side
   SHA-256 registry'de eşleşen Bearer principal ile açılır. Actor istemci
   body/header'ından değil doğrulanmış `subject` değerinden gelir; API database
   rolünün annotation/audit tablolarına doğrudan write yetkisi yoktur.
 - CSV export listeyle aynı filtrelerin tamamını uygular, 200 satır sayfa sınırına
   takılmaz ve server-side cursor ile sabit boyutlu partiler hâlinde akar.
-- Runtime bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar; UI yalnız fixture'ın hazır olup olmadığını görür.
+- Gerçek-index karşılaştırmasının bind değerleri public API requestinden alınmaz. DBA yalnız sentetik/anonim scalar fixture'ı exact persisted aday ve normalize SQL hash'ine bağlar. Doğrudan dashboard EXPLAIN ANALYZE yolu ise SQL kabul etmeden, kullanıcının geçici JSON scalar bind dizisini yalnız disposable clone isteğine taşır ve saklamaz.
 - Runtime replay tek bir salt-okunur `SELECT` ile sınırlıdır. Yapısal kapı, plain-`EXPLAIN` plan preflight'ı, aktif read-only runner attestation'ı ve template policy revision kontrolünden biri başarısızsa `EXPLAIN ANALYZE` başlamaz; ölçüm transaction'ı daima rollback edilir.
+- Doğrudan dashboard çalıştırıcısı tek-kullanıcılı loopback kurulumda ek admin/Bearer kapısı olmadan açıktır. Referans UI tam SQL görünümü için demonstrasyon `analyst` header'ı gönderir. Web/API portunu başka makinelere açmadan önce bu endpoint'i gerçek kimlik doğrulama, rate limit ve kurum erişim politikası arkasına alın.
 - Yerel/operator PAT modeli server-side kimlik sağlar fakat SSO değildir.
   İnternet erişimi verilen bir kurulumda TLS, rate limit ve OIDC/BFF veya
   kimlik doğrulayan reverse proxy eklenmeden üretim güvenliği sağlanmış sayılmaz.
@@ -373,7 +380,7 @@ docker compose --profile real-validation up -d --wait clone-db clone-evaluator
 bash scripts/verify-real-validation.sh
 ```
 
-Bu ikinci script operator fixture kaydını, admin-token sınırını, manifest ile canlı runner rol/ACL/routine politikasını, runner'ın DML/DDL/`SELECT INTO`/`nextval` negatif problarını, güvenli bind adaptasyonuyla gerçek index kullanımını, kaynak değişmezliğini ve zorunlu clone cleanup'ını doğrular.
+Bu ikinci script dashboard'ın fixture'sız tek-sorgu yolunu, operator fixture kaydını, gerçek-index yolunun admin-token sınırını, manifest ile canlı runner rol/ACL/routine politikasını, runner'ın DML/DDL/`SELECT INTO`/`nextval` negatif problarını, güvenli bind adaptasyonuyla gerçek index kullanımını, kaynak değişmezliğini ve zorunlu clone cleanup'ını doğrular.
 
 Backend unit testleri:
 

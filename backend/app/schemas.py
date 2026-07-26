@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -170,6 +172,49 @@ class CompositeIndexEvaluationRequest(BaseModel):
 
 class RuntimeIndexValidationRequest(CompositeIndexEvaluationRequest):
     pass
+
+
+class QueryExplainAnalyzeRequest(BaseModel):
+    """Caller-controlled scope and bind values for clone-only query replay.
+
+    SQL is deliberately absent from this public contract.  The API resolves
+    the statement text from its persisted query telemetry before contacting
+    the isolated clone evaluator.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    serverId: int = Field(ge=1, strict=True)
+    databaseId: int = Field(ge=1, strict=True)
+    bindValues: list[str | int | float | bool | None] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator("bindValues", mode="before")
+    @classmethod
+    def bind_values_are_bounded_json_scalars(
+        cls,
+        values: object,
+    ) -> object:
+        if not isinstance(values, list):
+            raise ValueError("bindValues bir JSON listesi olmali")
+        for value in values:
+            if type(value) not in {str, int, float, bool, type(None)}:
+                raise ValueError("bindValues yalnizca JSON scalar degerleri icerebilir")
+            if isinstance(value, str) and len(value) > 2_048:
+                raise ValueError("bindValues string degeri en fazla 2048 karakter olabilir")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("bindValues sonlu olmayan sayi iceremez")
+        if len(
+            json.dumps(
+                values,
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ) > 8_192:
+            raise ValueError("bindValues UTF-8 JSON boyutu en fazla 8 KiB olabilir")
+        return values
 
 
 class IndexCandidateSql(BaseModel):

@@ -333,6 +333,7 @@ services:
       ADVISOR_EVALUATOR_PASSWORD: ${CLONE_HYPOPG_PASSWORD:-advisor_dev_clone_hypopg}
       ADVISOR_JOIN_SOURCE_PASSWORD: ${CLONE_JOIN_SOURCE_PASSWORD:-advisor_dev_clone_join}
       CLONE_RUNNER_PASSWORD: ${CLONE_RUNNER_PASSWORD:-advisor_dev_clone_runner}
+      CLONE_SOURCE_ALIAS: ${CLONE_SOURCE_ALIAS:-test-source}
     command:
       - postgres
       - -c
@@ -396,6 +397,7 @@ services:
       CLONE_DATABASE_PASSWORD: ${CLONE_ADMIN_PASSWORD:-advisor_dev_clone_admin}
       CLONE_DATABASE_SSLMODE: ${ADVISOR_CLONE_DATABASE_SSLMODE:-disable}
       CLONE_TEMPLATE_DATABASE: appdb
+      CLONE_SOURCE_ALIAS: ${CLONE_SOURCE_ALIAS:-test-source}
       CLONE_ADMIN_ROLE: clone_admin
       CLONE_RUNNER_ROLE: clone_runner
       CLONE_RUNNER_PASSWORD: ${CLONE_RUNNER_PASSWORD:-advisor_dev_clone_runner}

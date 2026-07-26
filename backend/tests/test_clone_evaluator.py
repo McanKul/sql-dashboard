@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID
 
+import psycopg
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -13,7 +17,9 @@ from app.clone_evaluator import (
     CloneEvaluationStop,
     CloneEvaluatorSettings,
     CloneIndexEvaluationResult,
+    CloneQueryEvaluationResult,
     InternalCloneIndexEvaluationRequest,
+    InternalCloneQueryEvaluationRequest,
     ValidatedCloneIndexCandidate,
     _access_method,
     _aggregate_plan_samples,
@@ -23,14 +29,17 @@ from app.clone_evaluator import (
     _begin_read_only_runner_transaction,
     _decode_explain_row,
     _evaluate,
+    _evaluate_query,
     _guard_clone_connection,
     _production_index_sql,
     _plain_explain_preflight,
+    _query_explain_validation,
     _replay_query,
     _runtime_statement,
     _scan_replay_sql,
     _uses_index,
     _validated_request,
+    _validated_query_request,
 )
 
 
@@ -69,6 +78,18 @@ def _request(**overrides: object) -> InternalCloneIndexEvaluationRequest:
     return InternalCloneIndexEvaluationRequest.model_validate(values)
 
 
+def _query_request(**overrides: object) -> InternalCloneQueryEvaluationRequest:
+    values: dict[str, object] = {
+        "serverAlias": "test-source",
+        "databaseName": "appdb",
+        "queryId": "-42",
+        "normalizedSql": "SELECT count(*) FROM orders WHERE status = 'pending'",
+        "bindValues": [],
+    }
+    values.update(overrides)
+    return InternalCloneQueryEvaluationRequest.model_validate(values)
+
+
 def _settings(**overrides: object) -> CloneEvaluatorSettings:
     values: dict[str, object] = {
         "clone_database_url": (
@@ -85,6 +106,21 @@ def _settings(**overrides: object) -> CloneEvaluatorSettings:
     }
     values.update(overrides)
     return CloneEvaluatorSettings.model_validate(values)
+
+
+def _fake_job_database_creator(
+    recorded: list[str] | None = None,
+):
+    def create(
+        _settings: CloneEvaluatorSettings,
+        database_name: str,
+        tracked_databases: list[str],
+    ) -> None:
+        tracked_databases.append(database_name)
+        if recorded is not None:
+            recorded.append(database_name)
+
+    return create
 
 
 def _runtime_validation(
@@ -128,6 +164,33 @@ def _runtime_validation(
         "tableSizeBytes": 2_097_152,
         "evaluatedAt": "2026-07-25T12:00:00Z",
     }
+
+
+def _query_validation(**overrides: object) -> dict[str, Any]:
+    values: dict[str, object] = {
+        "mode": "EXPLAIN_ANALYZE",
+        "statementClass": "READ_ONLY_SELECT",
+        "planPreflight": "READ_ONLY",
+        "transactionReadOnly": True,
+        "runnerPolicyRevision": 1,
+        "postgresVersion": "18.4",
+        "executionTimeMs": 11.2,
+        "planningTimeMs": 0.4,
+        "sharedHitBlocks": 25,
+        "sharedReadBlocks": 2,
+        "tempReadBlocks": 1,
+        "tempWrittenBlocks": 1,
+        "walRecords": 0,
+        "walBytes": 0,
+        "plan": {
+            "Plan": {"Node Type": "Aggregate"},
+            "Planning Time": 0.4,
+            "Execution Time": 11.2,
+        },
+        "evaluatedAt": "2026-07-26T12:00:00Z",
+    }
+    values.update(overrides)
+    return values
 
 
 def test_read_only_select_is_the_only_runtime_replay_scope() -> None:
@@ -371,6 +434,72 @@ def test_runner_transaction_is_attested_and_runtime_sql_forces_prepare() -> None
     assert cursor.executions[-1][1] is True
 
 
+def test_read_only_explain_analyze_preflights_executes_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy_row = {
+        "transaction_read_only": True,
+        "default_read_only": True,
+        "row_security": True,
+        "statement_timeout_exact": True,
+        "lock_timeout_exact": True,
+        "transaction_timeout_exact": True,
+        "idle_timeout_exact": True,
+        "jit_disabled": True,
+        "standard_strings": True,
+        "search_path": "pg_catalog, public",
+        "role_can_login": True,
+        "role_inherit": True,
+        "role_connection_limit_exact": True,
+        "role_superuser": False,
+        "role_createdb": False,
+        "role_createrole": False,
+        "role_replication": False,
+        "role_bypassrls": False,
+        "read_all_data_membership_exact": True,
+        "temp_revoked": True,
+        "schema_create_revoked": True,
+        "dangerous_routines_revoked": True,
+        "foreign_server_usage_revoked": True,
+    }
+    plain_plan = {"Plan": {"Node Type": "Seq Scan"}}
+    analyzed_plan = {
+        "Plan": {"Node Type": "Seq Scan", "Shared Hit Blocks": 4},
+        "Planning Time": 0.2,
+        "Execution Time": 3.5,
+    }
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {
+            "clone_marker": "on",
+            "database_name": "advisor_query_abc",
+            "role_name": "clone_runner",
+            "postgres_version": "18.4",
+        },
+        policy_row,
+        {"QUERY PLAN": [plain_plan]},
+        {"QUERY PLAN": [analyzed_plan]},
+    ]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    monkeypatch.setattr(clone_module, "_connect", lambda *_args, **_kwargs: connection)
+
+    plan, postgres_version = clone_module._read_only_explain_analyze(
+        _settings(),
+        "advisor_query_abc",
+        "SELECT * FROM orders",
+        (),
+    )
+
+    assert plan == analyzed_plan
+    assert postgres_version == "18.4"
+    executed = [str(call.args[0]) for call in cursor.execute.call_args_list]
+    assert any("ANALYZE FALSE" in statement for statement in executed)
+    assert any("ANALYZE TRUE" in statement for statement in executed)
+    assert executed[-1] == "ROLLBACK"
+
+
 def test_candidate_sql_must_exactly_match_safely_quoted_identifiers() -> None:
     unsafe_looking = _candidate(
         schemaName='pub"lic',
@@ -411,6 +540,67 @@ def test_request_database_must_match_configured_clone_template() -> None:
 
     assert captured.value.result_status == "UNAVAILABLE"
     assert captured.value.reason_code == "DATABASE_NOT_CONFIGURED"
+
+
+def test_request_source_must_match_configured_clone_template() -> None:
+    with pytest.raises(CloneEvaluationStop) as captured:
+        _validated_request(_request(serverAlias="other-source"), _settings())
+
+    assert captured.value.result_status == "UNAVAILABLE"
+    assert captured.value.reason_code == "SOURCE_NOT_CONFIGURED"
+
+    with pytest.raises(CloneEvaluationStop) as captured:
+        _validated_query_request(
+            _query_request(serverAlias="other-source"),
+            _settings(),
+        )
+
+    assert captured.value.result_status == "UNAVAILABLE"
+    assert captured.value.reason_code == "SOURCE_NOT_CONFIGURED"
+
+
+def test_direct_query_request_reuses_database_and_read_only_replay_guards() -> None:
+    payload = _query_request(
+        normalizedSql="SELECT * FROM orders WHERE status = $1",
+        bindValues=["paid"],
+    )
+    assert _validated_query_request(payload, _settings()) == (
+        payload.normalizedSql,
+        ("paid",),
+    )
+
+    with pytest.raises(CloneEvaluationStop) as captured:
+        _validated_query_request(
+            _query_request(databaseName="production"),
+            _settings(),
+        )
+    assert captured.value.result_status == "UNAVAILABLE"
+    assert captured.value.reason_code == "DATABASE_NOT_CONFIGURED"
+
+    with pytest.raises(CloneEvaluationStop) as captured:
+        _validated_query_request(
+            _query_request(normalizedSql="DELETE FROM orders"),
+            _settings(),
+        )
+    assert captured.value.result_status == "UNSAFE"
+    assert captured.value.reason_code == "SELECT_ONLY"
+
+
+def test_direct_query_bind_fixture_limits_match_index_validation() -> None:
+    assert _query_request(bindValues=[None, True, 7, 2.5, "paid"]).bindValues == [
+        None,
+        True,
+        7,
+        2.5,
+        "paid",
+    ]
+    for invalid_values in (
+        [float("inf")],
+        ["x" * 2_049],
+        list(range(17)),
+    ):
+        with pytest.raises(ValidationError):
+            _query_request(bindValues=invalid_values)
 
 
 class _GuardCursor:
@@ -526,6 +716,74 @@ def test_plan_helpers_find_real_index_and_aggregate_repeated_runs() -> None:
     assert aggregate["accessMethod"] == "Seq Scan"
 
 
+def test_direct_query_validation_exposes_complete_raw_plan_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_plan = {
+        "Plan": {
+            "Node Type": "Hash Join",
+            "Shared Hit Blocks": 120,
+            "Shared Read Blocks": 8,
+            "Temp Read Blocks": 3,
+            "Temp Written Blocks": 4,
+            "WAL Records": 0,
+            "WAL Bytes": 0,
+        },
+        "Planning Time": 1.25,
+        "Execution Time": 19.75,
+    }
+    monkeypatch.setattr(
+        clone_module,
+        "_read_only_explain_analyze",
+        lambda *_args: (raw_plan, "18.4"),
+    )
+
+    validation = _query_explain_validation(
+        _settings(),
+        "advisor_query_abc",
+        "SELECT * FROM orders",
+        (),
+    )
+
+    assert validation["statementClass"] == "READ_ONLY_SELECT"
+    assert validation["planPreflight"] == "READ_ONLY"
+    assert validation["transactionReadOnly"] is True
+    assert validation["runnerPolicyRevision"] == 1
+    assert validation["postgresVersion"] == "18.4"
+    assert validation["executionTimeMs"] == 19.75
+    assert validation["planningTimeMs"] == 1.25
+    assert validation["sharedHitBlocks"] == 120
+    assert validation["sharedReadBlocks"] == 8
+    assert validation["tempReadBlocks"] == 3
+    assert validation["tempWrittenBlocks"] == 4
+    assert validation["walRecords"] == 0
+    assert validation["walBytes"] == 0
+    assert validation["plan"] is raw_plan
+
+
+def test_job_database_is_tracked_before_an_ambiguous_create_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"exists": False}
+    cursor.execute.side_effect = [None, psycopg.OperationalError("connection lost")]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    monkeypatch.setattr(clone_module, "_connect", lambda *_args, **_kwargs: connection)
+    monkeypatch.setattr(clone_module, "_guard_clone_connection", lambda *_args, **_kwargs: {})
+    tracked: list[str] = []
+
+    with pytest.raises(psycopg.OperationalError):
+        clone_module._create_job_database(
+            _settings(),
+            "advisor_query_ambiguous",
+            tracked,
+        )
+
+    assert tracked == ["advisor_query_ambiguous"]
+
+
 def test_successful_evaluation_uses_two_disposable_databases_and_cleans_both(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -539,7 +797,7 @@ def test_successful_evaluation_uses_two_disposable_databases_and_cleans_both(
     monkeypatch.setattr(
         clone_module,
         "_create_job_database",
-        lambda _settings, database_name: created.append(database_name),
+        _fake_job_database_creator(created),
     )
     monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
     monkeypatch.setattr(
@@ -586,7 +844,11 @@ def test_failure_after_real_index_still_cleans_every_created_database(
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
     monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
-    monkeypatch.setattr(clone_module, "_create_job_database", lambda *_args: None)
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(),
+    )
     monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
     monkeypatch.setattr(
         clone_module,
@@ -633,7 +895,7 @@ def test_unsafe_database_preflight_stops_before_candidate_clone_or_index(
     monkeypatch.setattr(
         clone_module,
         "_create_job_database",
-        lambda _settings, database_name: created.append(database_name),
+        _fake_job_database_creator(created),
     )
     monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
 
@@ -674,7 +936,11 @@ def test_failure_while_granting_runner_tracks_and_drops_the_created_database(
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
     monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
-    monkeypatch.setattr(clone_module, "_create_job_database", lambda *_args: None)
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(),
+    )
     monkeypatch.setattr(
         clone_module,
         "_grant_runner_connect",
@@ -704,7 +970,11 @@ def test_cleanup_failure_overrides_an_otherwise_validated_result(
     monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
     monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
     monkeypatch.setattr(clone_module, "_preflight_read_only_query", lambda *_args: None)
-    monkeypatch.setattr(clone_module, "_create_job_database", lambda *_args: None)
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(),
+    )
     monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
     monkeypatch.setattr(
         clone_module,
@@ -759,6 +1029,219 @@ def test_parameterized_request_never_creates_a_database(
     assert result.cloneDestroyed is True
     assert created is False
     assert cleanup_names == []
+
+
+def test_direct_query_evaluation_uses_one_clone_without_any_clone_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    created: list[str] = []
+    granted: list[str] = []
+    cleaned: list[str] = []
+
+    monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
+    monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(created),
+    )
+    monkeypatch.setattr(
+        clone_module,
+        "_grant_runner_connect",
+        lambda _settings, database_name: granted.append(database_name),
+    )
+    monkeypatch.setattr(
+        clone_module,
+        "_create_candidate_index",
+        lambda *_args: pytest.fail("direct query path must never create an index"),
+    )
+    monkeypatch.setattr(
+        clone_module,
+        "_query_explain_validation",
+        lambda *_args: _query_validation(),
+    )
+
+    def cleanup(_settings: CloneEvaluatorSettings, names: list[str]) -> bool:
+        cleaned.extend(names)
+        return True
+
+    monkeypatch.setattr(clone_module, "_destroy_job_databases", cleanup)
+
+    result = CloneQueryEvaluationResult.model_validate(
+        _evaluate_query(
+            _query_request(
+                normalizedSql="SELECT * FROM orders WHERE status = $1",
+                bindValues=["paid"],
+            )
+        )
+    )
+
+    assert result.status == "RUNTIME_VALIDATED"
+    assert result.reasonCode == "READ_ONLY_EXPLAIN_ANALYZE_COMPLETED"
+    assert result.queryId == "-42"
+    assert result.executionTarget == "DISPOSABLE_CLONE"
+    assert result.sourceDdlExecuted is False
+    assert result.cloneDdlExecuted is False
+    assert result.cloneDestroyed is True
+    assert result.validation is not None
+    assert result.validation.plan["Plan"]["Node Type"] == "Aggregate"
+    assert len(created) == 1
+    assert created[0].startswith("advisor_query_")
+    assert granted == created
+    assert cleaned == created
+
+
+def test_direct_query_rejection_happens_before_a_clone_is_created(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    created: list[str] = []
+    cleanup_names: list[str] | None = None
+    monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(created),
+    )
+
+    def cleanup(_settings: CloneEvaluatorSettings, names: list[str]) -> bool:
+        nonlocal cleanup_names
+        cleanup_names = names
+        return True
+
+    monkeypatch.setattr(clone_module, "_destroy_job_databases", cleanup)
+
+    result = CloneQueryEvaluationResult.model_validate(
+        _evaluate_query(_query_request(normalizedSql="SELECT * INTO copied FROM orders"))
+    )
+
+    assert result.status == "UNSAFE"
+    assert result.reasonCode == "SELECT_ONLY"
+    assert result.validation is None
+    assert result.cloneDdlExecuted is False
+    assert result.cloneDestroyed is True
+    assert created == []
+    assert cleanup_names == []
+
+
+def test_direct_query_failure_after_clone_creation_is_cleaned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    created: list[str] = []
+    cleaned: list[str] = []
+    monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
+    monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(created),
+    )
+    monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
+    monkeypatch.setattr(
+        clone_module,
+        "_query_explain_validation",
+        lambda *_args: (_ for _ in ()).throw(psycopg.errors.QueryCanceled()),
+    )
+
+    def cleanup(_settings: CloneEvaluatorSettings, names: list[str]) -> bool:
+        cleaned.extend(names)
+        return True
+
+    monkeypatch.setattr(clone_module, "_destroy_job_databases", cleanup)
+
+    result = CloneQueryEvaluationResult.model_validate(
+        _evaluate_query(_query_request())
+    )
+
+    assert result.status == "UNAVAILABLE"
+    assert result.reasonCode == "RUNTIME_QUERY_TIMEOUT"
+    assert result.cloneDdlExecuted is False
+    assert result.cloneDestroyed is True
+    assert len(created) == 1
+    assert cleaned == created
+
+
+def test_direct_query_cleanup_failure_overrides_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    monkeypatch.setattr(clone_module, "get_clone_evaluator_settings", lambda: settings)
+    monkeypatch.setattr(clone_module, "_assert_clone_ready", lambda _settings: {})
+    monkeypatch.setattr(
+        clone_module,
+        "_create_job_database",
+        _fake_job_database_creator(),
+    )
+    monkeypatch.setattr(clone_module, "_grant_runner_connect", lambda *_args: None)
+    monkeypatch.setattr(
+        clone_module,
+        "_query_explain_validation",
+        lambda *_args: _query_validation(),
+    )
+    monkeypatch.setattr(clone_module, "_destroy_job_databases", lambda *_args: False)
+
+    result = CloneQueryEvaluationResult.model_validate(
+        _evaluate_query(_query_request())
+    )
+
+    assert result.status == "UNAVAILABLE"
+    assert result.reasonCode == "CLONE_CLEANUP_FAILED"
+    assert result.sourceDdlExecuted is False
+    assert result.cloneDdlExecuted is False
+    assert result.cloneDestroyed is False
+
+
+def test_direct_query_internal_endpoint_is_registered() -> None:
+    routes = {
+        route.path: route
+        for route in clone_module.app.routes
+        if hasattr(route, "path")
+    }
+    route = routes["/internal/v1/query-explain-analyze"]
+    assert route.methods == {"POST"}
+    assert route.response_model is CloneQueryEvaluationResult
+
+
+def test_cancelled_request_keeps_the_single_evaluator_slot_until_worker_exits() -> None:
+    original_slots = clone_module._evaluation_slots
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def worker(label: str) -> dict[str, Any]:
+        if label == "first":
+            first_started.set()
+            release_first.wait(timeout=2)
+        else:
+            second_started.set()
+        return {"label": label}
+
+    async def scenario() -> None:
+        clone_module._evaluation_slots = asyncio.Semaphore(1)
+        first = asyncio.create_task(
+            clone_module._run_serialized_evaluation(worker, "first")
+        )
+        assert await asyncio.to_thread(first_started.wait, 1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(
+            clone_module._run_serialized_evaluation(worker, "second")
+        )
+        await asyncio.sleep(0.05)
+        assert not second_started.is_set()
+
+        release_first.set()
+        assert await asyncio.wait_for(second, timeout=1) == {"label": "second"}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_first.set()
+        clone_module._evaluation_slots = original_slots
 
 
 def test_internal_token_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

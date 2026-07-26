@@ -3,6 +3,7 @@ import type {
   ApiErrorShape,
   ApiList,
   ApiResult,
+  CloneQueryEvaluationResult,
   DatabaseOption,
   CompositeIndexCandidate,
   IndexTelemetryItem,
@@ -12,6 +13,7 @@ import type {
   QueryDetail,
   QueryFinding,
   QueryIndexAdvice,
+  QueryBindValue,
   QueryPredicate,
   QueryListParams,
   QuerySummary,
@@ -847,6 +849,37 @@ export const advisorApi = {
           serverId: key.serverId,
           databaseId: key.databaseId,
           candidateId: candidate.candidateId,
+        }),
+      },
+    )
+    return asResult(payload, 'api')
+  },
+
+  async explainAnalyzeQuery(id: string, window: TimeWindow, bindValues: QueryBindValue[], signal?: AbortSignal): Promise<ApiResult<CloneQueryEvaluationResult>> {
+    if (demoModeEnabled) return asResult({
+      status: 'UNAVAILABLE',
+      reasonCode: 'DEMO_MODE',
+      message: 'Disposable clone EXPLAIN ANALYZE demo verisinde çalıştırılmaz.',
+      queryId: parseQueryKey(id).queryId,
+      validation: null,
+      executionTarget: 'DISPOSABLE_CLONE',
+      sourceDdlExecuted: false,
+      cloneDdlExecuted: false,
+      cloneDestroyed: true,
+    }, 'demo')
+    const key = parseQueryKey(id)
+    if (key.serverId === undefined || key.databaseId === undefined) {
+      throw new ApiClientError({ path: `/queries/${key.queryId}/explain-analyze`, message: 'EXPLAIN ANALYZE için sunucu ve veritabanı kimliği gerekli.' })
+    }
+    const payload = await request<CloneQueryEvaluationResult>(
+      `/queries/${encodeURIComponent(key.queryId)}/explain-analyze?window=${window}`,
+      {
+        method: 'POST',
+        signal,
+        body: JSON.stringify({
+          serverId: key.serverId,
+          databaseId: key.databaseId,
+          bindValues,
         }),
       },
     )

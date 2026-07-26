@@ -7,7 +7,7 @@ import secrets
 import statistics
 import uuid
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from functools import lru_cache
 from time import perf_counter
@@ -44,6 +44,7 @@ class CloneEvaluatorSettings(BaseSettings):
     clone_database_password: str = "advisor_dev_clone_admin"
     clone_database_sslmode: str | None = None
     clone_template_database: str = "appdb"
+    clone_source_alias: str = Field(default="test-source", min_length=1, max_length=120)
     clone_admin_role: str = "clone_admin"
     clone_runner_role: str = "clone_runner"
     clone_runner_password: str = "advisor_dev_clone_runner"
@@ -76,6 +77,13 @@ class CloneEvaluatorSettings(BaseSettings):
     @classmethod
     def identifiers_are_safe(cls, value: str) -> str:
         return _validated_identifier(value)
+
+    @field_validator("clone_source_alias")
+    @classmethod
+    def source_alias_is_bounded(cls, value: str) -> str:
+        if value != value.strip() or "\x00" in value:
+            raise ValueError("CLONE_SOURCE_ALIAS boslukla baslayamaz/bitemez ve NUL iceremez")
+        return value
 
     @model_validator(mode="after")
     def admin_connection_is_not_the_template(self) -> CloneEvaluatorSettings:
@@ -159,6 +167,34 @@ class InternalCloneIndexEvaluationRequest(BaseModel):
         return values
 
 
+class InternalCloneQueryEvaluationRequest(BaseModel):
+    serverAlias: str = Field(min_length=1, max_length=120)
+    databaseName: str = Field(min_length=1, max_length=63)
+    queryId: str = Field(min_length=1, max_length=32, pattern=r"^-?\d+$")
+    normalizedSql: str = Field(min_length=1, max_length=100_000)
+    bindValues: list[str | int | float | bool | None] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator("bindValues")
+    @classmethod
+    def bind_values_are_small_json_scalars(
+        cls,
+        values: list[str | int | float | bool | None],
+    ) -> list[str | int | float | bool | None]:
+        for value in values:
+            if type(value) not in {str, int, float, bool, type(None)}:
+                raise ValueError("runtime bind values must be JSON scalars")
+            if isinstance(value, str) and len(value) > 2_048:
+                raise ValueError("runtime string bind value is too long")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("runtime numeric bind value must be finite")
+        if len(json.dumps(values, ensure_ascii=False).encode("utf-8")) > 8_192:
+            raise ValueError("runtime bind value payload is too large")
+        return values
+
+
 class RuntimePlanMetrics(BaseModel):
     medianExecutionTimeMs: float
     minExecutionTimeMs: float
@@ -201,6 +237,49 @@ class CloneIndexEvaluationResult(BaseModel):
     sourceDdlExecuted: Literal[False] = False
     cloneDdlExecuted: bool
     cloneDestroyed: bool
+
+
+class QueryExplainAnalyzeValidation(BaseModel):
+    mode: Literal["EXPLAIN_ANALYZE"] = "EXPLAIN_ANALYZE"
+    statementClass: Literal["READ_ONLY_SELECT"] = "READ_ONLY_SELECT"
+    planPreflight: Literal["READ_ONLY"] = "READ_ONLY"
+    transactionReadOnly: Literal[True] = True
+    runnerPolicyRevision: int = Field(ge=1)
+    postgresVersion: str
+    executionTimeMs: float = Field(ge=0)
+    planningTimeMs: float = Field(ge=0)
+    sharedHitBlocks: int = Field(ge=0)
+    sharedReadBlocks: int = Field(ge=0)
+    tempReadBlocks: int = Field(ge=0)
+    tempWrittenBlocks: int = Field(ge=0)
+    walRecords: int = Field(ge=0)
+    walBytes: int = Field(ge=0)
+    plan: dict[str, Any]
+    evaluatedAt: datetime
+
+
+class CloneQueryEvaluationResult(BaseModel):
+    status: Literal["RUNTIME_VALIDATED", "UNAVAILABLE", "UNSAFE"]
+    reasonCode: str
+    message: str
+    queryId: str
+    validation: QueryExplainAnalyzeValidation | None = None
+    executionTarget: Literal["DISPOSABLE_CLONE"] = "DISPOSABLE_CLONE"
+    sourceDdlExecuted: Literal[False] = False
+    cloneDdlExecuted: Literal[False] = False
+    cloneDestroyed: bool
+
+    @model_validator(mode="after")
+    def successful_result_has_validation_and_completed_cleanup(
+        self,
+    ) -> CloneQueryEvaluationResult:
+        if self.status == "RUNTIME_VALIDATED" and (
+            self.validation is None or not self.cloneDestroyed
+        ):
+            raise ValueError(
+                "RUNTIME_VALIDATED requires validation and completed clone cleanup"
+            )
+        return self
 
 
 class CloneEvaluationStop(Exception):
@@ -582,6 +661,12 @@ def _validated_request(
     payload: InternalCloneIndexEvaluationRequest,
     settings: CloneEvaluatorSettings,
 ) -> tuple[str, tuple[str | int | float | bool | None, ...]]:
+    if payload.serverAlias != settings.clone_source_alias:
+        raise CloneEvaluationStop(
+            "UNAVAILABLE",
+            "SOURCE_NOT_CONFIGURED",
+            "Istek, bu disposable clone template'ine baglanan kaynakla eslesmiyor.",
+        )
     if payload.databaseName != settings.clone_template_database:
         raise CloneEvaluationStop(
             "UNAVAILABLE",
@@ -594,6 +679,25 @@ def _validated_request(
             "UNSAFE",
             "CANDIDATE_SQL_MISMATCH",
             "Aday SQL structured identifier'lardan yeniden uretilen guvenli SQL ile eslesmiyor.",
+        )
+    return _replay_query(payload.normalizedSql, payload.bindValues)
+
+
+def _validated_query_request(
+    payload: InternalCloneQueryEvaluationRequest,
+    settings: CloneEvaluatorSettings,
+) -> tuple[str, tuple[str | int | float | bool | None, ...]]:
+    if payload.serverAlias != settings.clone_source_alias:
+        raise CloneEvaluationStop(
+            "UNAVAILABLE",
+            "SOURCE_NOT_CONFIGURED",
+            "Istek, bu disposable clone template'ine baglanan kaynakla eslesmiyor.",
+        )
+    if payload.databaseName != settings.clone_template_database:
+        raise CloneEvaluationStop(
+            "UNAVAILABLE",
+            "DATABASE_NOT_CONFIGURED",
+            "Istek, yapilandirilmis disposable clone template database'i ile eslesmiyor.",
         )
     return _replay_query(payload.normalizedSql, payload.bindValues)
 
@@ -617,6 +721,28 @@ def _advice(
         "ddlTarget": "DISPOSABLE_CLONE",
         "sourceDdlExecuted": False,
         "cloneDdlExecuted": clone_ddl_executed,
+        "cloneDestroyed": clone_destroyed,
+    }
+
+
+def _query_advice(
+    payload: InternalCloneQueryEvaluationRequest,
+    result_status: Literal["RUNTIME_VALIDATED", "UNAVAILABLE", "UNSAFE"],
+    reason_code: str,
+    message: str,
+    *,
+    validation: dict[str, Any] | None = None,
+    clone_destroyed: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": result_status,
+        "reasonCode": reason_code,
+        "message": message,
+        "queryId": payload.queryId,
+        "validation": validation,
+        "executionTarget": "DISPOSABLE_CLONE",
+        "sourceDdlExecuted": False,
+        "cloneDdlExecuted": False,
         "cloneDestroyed": clone_destroyed,
     }
 
@@ -719,14 +845,18 @@ def _assert_clone_ready(settings: CloneEvaluatorSettings) -> dict[str, Any]:
                 expected_role=settings.clone_admin_role,
             )
             cursor.execute(
-                "SELECT archive_restored, source_ddl_executed, "
-                "runner_policy_revision, dangerous_routines_revoked "
+                "SELECT archive_restored, source_ddl_executed, source_alias, "
+                "source_database_name, runner_policy_revision, "
+                "dangerous_routines_revoked "
                 "FROM advisor_clone_meta.template_manifest WHERE singleton"
             )
             manifest = cursor.fetchone()
             if (
                 not manifest
                 or manifest["source_ddl_executed"]
+                or manifest["source_alias"] != settings.clone_source_alias
+                or manifest["source_database_name"]
+                != settings.clone_template_database
                 or int(manifest["runner_policy_revision"] or 0)
                 != READ_ONLY_RUNNER_POLICY_REVISION
                 or not manifest["dangerous_routines_revoked"]
@@ -737,13 +867,25 @@ def _assert_clone_ready(settings: CloneEvaluatorSettings) -> dict[str, Any]:
                     "Disposable clone template manifesti veya salt-okunur runner policy kaniti gecersiz.",
                 )
             guard["archive_restored"] = bool(manifest["archive_restored"])
+            guard["source_alias"] = str(manifest["source_alias"])
+            guard["source_database_name"] = str(manifest["source_database_name"])
             guard["runner_policy_revision"] = int(
                 manifest["runner_policy_revision"]
             )
     return guard
 
 
-def _create_job_database(settings: CloneEvaluatorSettings, database_name: str) -> None:
+def _create_job_database(
+    settings: CloneEvaluatorSettings,
+    database_name: str,
+    tracked_databases: list[str],
+) -> None:
+    """Create one clone and track even an ambiguous CREATE response.
+
+    Tracking starts after the catalog proves the random name is unused but
+    before PostgreSQL receives CREATE DATABASE. If the server commits and the
+    connection then fails, unconditional cleanup still has the exact name.
+    """
     _validated_identifier(database_name)
     admin_database = conninfo_to_dict(settings.clone_database_conninfo).get("dbname") or "postgres"
     with _connect(settings, admin_database) as connection:
@@ -756,6 +898,7 @@ def _create_job_database(settings: CloneEvaluatorSettings, database_name: str) -
                     "CLONE_DATABASE_COLLISION",
                     "Rastgele uretilen clone database adi zaten var; islem guvenle durduruldu.",
                 )
+            tracked_databases.append(database_name)
             cursor.execute(
                 sql.SQL("CREATE DATABASE {} WITH TEMPLATE {} OWNER {}").format(
                     sql.Identifier(database_name),
@@ -1121,8 +1264,8 @@ def _begin_read_only_runner_transaction(
                NOT EXISTS (
                    SELECT 1
                      FROM pg_namespace namespace
-                    WHERE namespace.nspname NOT LIKE 'pg_temp_%%'
-                      AND namespace.nspname NOT LIKE 'pg_toast_temp_%%'
+                    WHERE left(namespace.nspname, 8) <> 'pg_temp_'
+                      AND left(namespace.nspname, 14) <> 'pg_toast_temp_'
                       AND has_schema_privilege(
                           current_user, namespace.oid, 'CREATE'
                       )
@@ -1238,17 +1381,17 @@ def _uses_index(plan: dict[str, Any], index_name: str) -> bool:
     return any(str(node.get("Index Name") or "") == index_name for node in _walk_plan(plan["Plan"]))
 
 
-def _explain_analyze_once(
+def _read_only_explain_analyze(
     settings: CloneEvaluatorSettings,
     database_name: str,
     query: str,
     bind_values: tuple[str | int | float | bool | None, ...],
-    table_name: str,
-    candidate_index_name: str | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str]:
+    """Execute one attested EXPLAIN ANALYZE and always roll its transaction back."""
+
     with _connect(settings, database_name, runner=True) as connection:
         with connection.cursor() as cursor:
-            _guard_clone_connection(
+            guard = _guard_clone_connection(
                 cursor,
                 settings,
                 expected_role=settings.clone_runner_role,
@@ -1257,12 +1400,12 @@ def _explain_analyze_once(
                 _begin_read_only_runner_transaction(cursor, settings)
                 runtime_statement = _runtime_statement(cursor, query, bind_values)
                 _plain_explain_preflight(cursor, runtime_statement)
-                explain_prefix = sql.SQL(
-                    "EXPLAIN (ANALYZE TRUE, BUFFERS TRUE, WAL TRUE, TIMING TRUE, "
-                    "SUMMARY TRUE, FORMAT JSON) "
-                )
                 cursor.execute(
-                    explain_prefix + runtime_statement,
+                    sql.SQL(
+                        "EXPLAIN (ANALYZE TRUE, BUFFERS TRUE, WAL TRUE, TIMING TRUE, "
+                        "SUMMARY TRUE, FORMAT JSON) "
+                    )
+                    + runtime_statement,
                     prepare=True,
                 )
                 plan = _decode_explain_row(cursor.fetchone())
@@ -1272,6 +1415,24 @@ def _explain_analyze_once(
                     cursor.execute("ROLLBACK")
                 except psycopg.Error:
                     pass
+
+    return plan, str(guard["postgres_version"])
+
+
+def _explain_analyze_once(
+    settings: CloneEvaluatorSettings,
+    database_name: str,
+    query: str,
+    bind_values: tuple[str | int | float | bool | None, ...],
+    table_name: str,
+    candidate_index_name: str | None,
+) -> dict[str, Any]:
+    plan, _postgres_version = _read_only_explain_analyze(
+        settings,
+        database_name,
+        query,
+        bind_values,
+    )
 
     root = plan["Plan"]
     return {
@@ -1283,6 +1444,39 @@ def _explain_analyze_once(
         "tempWrittenBlocks": int(root.get("Temp Written Blocks") or 0),
         "accessMethod": _access_method(plan, table_name),
         "candidateIndexUsed": bool(candidate_index_name and _uses_index(plan, candidate_index_name)),
+    }
+
+
+def _query_explain_validation(
+    settings: CloneEvaluatorSettings,
+    database_name: str,
+    query: str,
+    bind_values: tuple[str | int | float | bool | None, ...],
+) -> dict[str, Any]:
+    plan, postgres_version = _read_only_explain_analyze(
+        settings,
+        database_name,
+        query,
+        bind_values,
+    )
+    root = plan["Plan"]
+    return {
+        "mode": "EXPLAIN_ANALYZE",
+        "statementClass": "READ_ONLY_SELECT",
+        "planPreflight": "READ_ONLY",
+        "transactionReadOnly": True,
+        "runnerPolicyRevision": READ_ONLY_RUNNER_POLICY_REVISION,
+        "postgresVersion": postgres_version,
+        "executionTimeMs": float(plan.get("Execution Time") or 0),
+        "planningTimeMs": float(plan.get("Planning Time") or 0),
+        "sharedHitBlocks": int(root.get("Shared Hit Blocks") or 0),
+        "sharedReadBlocks": int(root.get("Shared Read Blocks") or 0),
+        "tempReadBlocks": int(root.get("Temp Read Blocks") or 0),
+        "tempWrittenBlocks": int(root.get("Temp Written Blocks") or 0),
+        "walRecords": int(root.get("WAL Records") or 0),
+        "walBytes": int(root.get("WAL Bytes") or 0),
+        "plan": plan,
+        "evaluatedAt": datetime.now(timezone.utc),
     }
 
 
@@ -1456,8 +1650,7 @@ def _evaluate(payload: InternalCloneIndexEvaluationRequest) -> dict[str, Any]:
         baseline_database = f"advisor_base_{job_suffix}"
         candidate_database = f"advisor_cand_{job_suffix}"
 
-        _create_job_database(settings, baseline_database)
-        created_databases.append(baseline_database)
+        _create_job_database(settings, baseline_database, created_databases)
         _grant_runner_connect(settings, baseline_database)
 
         # PostgreSQL performs the authoritative parse/plan under the exact
@@ -1470,8 +1663,7 @@ def _evaluate(payload: InternalCloneIndexEvaluationRequest) -> dict[str, Any]:
             bind_values,
         )
 
-        _create_job_database(settings, candidate_database)
-        created_databases.append(candidate_database)
+        _create_job_database(settings, candidate_database, created_databases)
         _grant_runner_connect(settings, candidate_database)
 
         index_details = _create_candidate_index(
@@ -1592,6 +1784,105 @@ def _evaluate(payload: InternalCloneIndexEvaluationRequest) -> dict[str, Any]:
     return result
 
 
+def _evaluate_query(payload: InternalCloneQueryEvaluationRequest) -> dict[str, Any]:
+    settings = get_clone_evaluator_settings()
+    created_databases: list[str] = []
+    validation: dict[str, Any] | None = None
+    result = _query_advice(
+        payload,
+        "UNAVAILABLE",
+        "CLONE_EVALUATION_NOT_STARTED",
+        "Disposable clone EXPLAIN ANALYZE baslatilamadi.",
+    )
+
+    try:
+        query, bind_values = _validated_query_request(payload, settings)
+        _assert_clone_ready(settings)
+        query_database = f"advisor_query_{uuid.uuid4().hex[:20]}"
+
+        # A direct query evaluation gets one short-lived copy of the immutable
+        # template. No candidate database or index DDL belongs to this path.
+        _create_job_database(settings, query_database, created_databases)
+        _grant_runner_connect(settings, query_database)
+        validation = _query_explain_validation(
+            settings,
+            query_database,
+            query,
+            bind_values,
+        )
+        result = _query_advice(
+            payload,
+            "RUNTIME_VALIDATED",
+            "READ_ONLY_EXPLAIN_ANALYZE_COMPLETED",
+            "Salt-okunur sorgu disposable clone uzerinde EXPLAIN ANALYZE ile calistirildi.",
+            validation=validation,
+        )
+    except CloneEvaluationStop as exc:
+        result = _query_advice(
+            payload,
+            exc.result_status,  # type: ignore[arg-type]
+            exc.reason_code,
+            exc.message,
+            validation=validation,
+        )
+    except psycopg.errors.ReadOnlySqlTransaction:
+        result = _query_advice(
+            payload,
+            "UNSAFE",
+            "READ_ONLY_TRANSACTION_VIOLATION",
+            "Sorgu clone runner salt-okunur transaction policy'sini ihlal etti.",
+            validation=validation,
+        )
+    except psycopg.errors.InsufficientPrivilege:
+        result = _query_advice(
+            payload,
+            "UNSAFE",
+            "READ_ONLY_POLICY_REJECTED",
+            "Sorgu clone runner salt-okunur yetki policy'si tarafindan reddedildi.",
+            validation=validation,
+        )
+    except psycopg.errors.QueryCanceled:
+        result = _query_advice(
+            payload,
+            "UNAVAILABLE",
+            "RUNTIME_QUERY_TIMEOUT",
+            "EXPLAIN ANALYZE clone statement timeout sinirini asti.",
+            validation=validation,
+        )
+    except psycopg.Error:
+        result = _query_advice(
+            payload,
+            "UNAVAILABLE",
+            "CLONE_DATABASE_ERROR",
+            "Disposable clone database islemi basarisiz oldu; kaynak sorgu calistirilmadi.",
+            validation=validation,
+        )
+    except Exception:
+        result = _query_advice(
+            payload,
+            "UNAVAILABLE",
+            "CLONE_EVALUATOR_ERROR",
+            "Disposable clone evaluator beklenmeyen bir hata verdi.",
+            validation=validation,
+        )
+    finally:
+        try:
+            clone_destroyed = _destroy_job_databases(settings, created_databases)
+        except Exception:
+            clone_destroyed = False
+
+    result["cloneDestroyed"] = clone_destroyed
+    if not clone_destroyed:
+        result.update(
+            status="UNAVAILABLE",
+            reasonCode="CLONE_CLEANUP_FAILED",
+            message="Clone database temizligi tamamlanamadi; operator temizligi gerekiyor.",
+            sourceDdlExecuted=False,
+            cloneDdlExecuted=False,
+        )
+    return result
+
+
 def _authorized(token: str | None) -> None:
     expected = get_clone_evaluator_settings().clone_evaluator_token
     if not token or not secrets.compare_digest(token, expected):
@@ -1601,20 +1892,64 @@ def _authorized(token: str | None) -> None:
 app = FastAPI(
     title="PostgreSQL Advisor Disposable Clone Evaluator",
     version="1.0.0-iteration-2.7",
-    description="Internal, isolated real-index and EXPLAIN ANALYZE evaluator.",
+    description="Internal, isolated read-only query and real-index EXPLAIN ANALYZE evaluator.",
 )
 _evaluation_slots = asyncio.Semaphore(1)
+_active_evaluations: set[asyncio.Task[dict[str, Any]]] = set()
+
+
+def _evaluation_finished(operation: asyncio.Task[dict[str, Any]]) -> None:
+    _active_evaluations.discard(operation)
+    if not operation.cancelled():
+        # Consume detached-task exceptions when the HTTP caller has already
+        # disconnected. A still-connected caller awaiting shield receives the
+        # same stored exception normally.
+        operation.exception()
+
+
+async def _run_serialized_evaluation(
+    evaluator: Callable[[Any], dict[str, Any]],
+    payload: Any,
+) -> dict[str, Any]:
+    """Keep the single evaluator slot leased until its worker thread exits.
+
+    Cancelling an HTTP request cannot stop a thread already executing libpq
+    work. The detached task therefore owns the semaphore, while shield only
+    propagates cancellation to the caller.
+    """
+
+    async def run() -> dict[str, Any]:
+        async with _evaluation_slots:
+            return await asyncio.to_thread(evaluator, payload)
+
+    operation = asyncio.create_task(run())
+    _active_evaluations.add(operation)
+    operation.add_done_callback(_evaluation_finished)
+    return await asyncio.shield(operation)
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    if _evaluation_slots.locked():
+        return {
+            "status": "healthy",
+            "busy": True,
+            "validationClone": True,
+            "readOnlySelectOnly": True,
+            "sourceDdlExecuted": False,
+        }
     try:
-        guard = await asyncio.to_thread(_assert_clone_ready, get_clone_evaluator_settings())
+        guard = await _run_serialized_evaluation(
+            _assert_clone_ready,
+            get_clone_evaluator_settings(),
+        )
         return {
             "status": "healthy",
             "databaseName": guard["database_name"],
             "roleName": guard["role_name"],
             "postgresVersion": guard["postgres_version"],
+            "sourceAlias": guard["source_alias"],
+            "sourceDatabaseName": guard["source_database_name"],
             "validationClone": True,
             "readOnlySelectOnly": True,
             "runnerPolicyRevision": guard["runner_policy_revision"],
@@ -1636,5 +1971,16 @@ async def runtime_index_validation(
     x_clone_evaluator_token: str | None = Header(default=None, alias="X-Clone-Evaluator-Token"),
 ) -> dict[str, Any]:
     _authorized(x_clone_evaluator_token)
-    async with _evaluation_slots:
-        return await asyncio.to_thread(_evaluate, payload)
+    return await _run_serialized_evaluation(_evaluate, payload)
+
+
+@app.post(
+    "/internal/v1/query-explain-analyze",
+    response_model=CloneQueryEvaluationResult,
+)
+async def query_explain_analyze(
+    payload: InternalCloneQueryEvaluationRequest,
+    x_clone_evaluator_token: str | None = Header(default=None, alias="X-Clone-Evaluator-Token"),
+) -> dict[str, Any]:
+    _authorized(x_clone_evaluator_token)
+    return await _run_serialized_evaluation(_evaluate_query, payload)

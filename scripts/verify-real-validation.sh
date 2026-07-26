@@ -5,11 +5,14 @@ pass() { printf '[OK] %s\n' "$1"; }
 fail() { printf '[HATA] %s\n' "$1" >&2; exit 1; }
 
 policy_probe_database=""
+policy_probe_cleanup_authorized=false
 response_file=""
+query_response_file=""
 
 cleanup_policy_probe() {
   local target_database="${policy_probe_database:-}"
   [[ -n "$target_database" ]] || return 0
+  [[ "${policy_probe_cleanup_authorized:-false}" == true ]] || return 0
   [[ "$target_database" =~ ^advisor_policy_probe_[0-9]+_[0-9]+$ ]] || return 1
 
   docker compose --profile real-validation exec -T clone-db \
@@ -40,12 +43,14 @@ SQL
   )" || return 1
   [[ "$remaining" == "0" ]] || return 1
   policy_probe_database=""
+  policy_probe_cleanup_authorized=false
 }
 
 cleanup_artifacts() {
   set +e
   cleanup_policy_probe >/dev/null 2>&1
   [[ -n "${response_file:-}" ]] && rm -f -- "$response_file"
+  [[ -n "${query_response_file:-}" ]] && rm -f -- "$query_response_file"
 }
 trap cleanup_artifacts EXIT
 
@@ -229,7 +234,8 @@ repository_job_count() {
 SELECT count(*)
 FROM pg_database
 WHERE datname LIKE 'advisor_base_%'
-   OR datname LIKE 'advisor_cand_%';
+   OR datname LIKE 'advisor_cand_%'
+   OR datname LIKE 'advisor_query_%';
 SQL
 }
 
@@ -244,7 +250,8 @@ SELECT
     (SELECT count(*)
        FROM pg_database
       WHERE datname LIKE 'advisor_base_%'
-         OR datname LIKE 'advisor_cand_%');
+         OR datname LIKE 'advisor_cand_%'
+         OR datname LIKE 'advisor_query_%');
 SQL
 }
 
@@ -252,12 +259,15 @@ clone_manifest_state() {
   docker compose --profile real-validation exec -T clone-db \
     psql -X --set=ON_ERROR_STOP=1 \
       --username clone_admin --port 5432 --dbname appdb \
-      --tuples-only --no-align --field-separator='|' <<'SQL'
+      --tuples-only --no-align --field-separator='|' \
+      --set=source_alias="$source_alias" <<'SQL'
 SELECT
     count(*) = 1,
     coalesce(bool_and(NOT source_ddl_executed), false),
     coalesce(bool_and(runner_policy_revision = 1), false),
-    coalesce(bool_and(dangerous_routines_revoked), false)
+    coalesce(bool_and(dangerous_routines_revoked), false),
+    coalesce(bool_and(source_alias = :'source_alias'), false),
+    coalesce(bool_and(source_database_name = 'appdb'), false)
 FROM advisor_clone_meta.template_manifest
 WHERE singleton;
 SQL
@@ -468,7 +478,7 @@ clone_cluster_before="$(clone_cluster_state)"
   || fail "Clone cluster/template preflight'i beklenmiyor: ${clone_cluster_before:-bos}"
 
 clone_manifest_before="$(clone_manifest_state)"
-[[ "$clone_manifest_before" == "t|t|t|t" ]] \
+[[ "$clone_manifest_before" == "t|t|t|t|t|t" ]] \
   || fail "Clone template manifest/policy kaniti gecersiz: ${clone_manifest_before:-bos}"
 
 clone_runner_policy_before="$(clone_runner_policy_state)"
@@ -503,6 +513,7 @@ SQL
 )"
 [[ "$policy_probe_exists" == "f" ]] \
   || fail "Disposable policy probe database adi zaten kullanimda"
+policy_probe_cleanup_authorized=true
 
 policy_probe_created=false
 for attempt in $(seq 1 10); do
@@ -641,8 +652,8 @@ with psycopg.connect(**connection_kwargs, autocommit=True) as connection:
             "NOT has_database_privilege(current_user, current_database(), 'TEMPORARY'), "
             "NOT EXISTS ("
             "  SELECT 1 FROM pg_namespace AS namespace "
-            "  WHERE namespace.nspname NOT LIKE 'pg_temp_%' "
-            "    AND namespace.nspname NOT LIKE 'pg_toast_temp_%' "
+            "  WHERE left(namespace.nspname, 8) <> 'pg_temp_' "
+            "    AND left(namespace.nspname, 14) <> 'pg_toast_temp_' "
             "    AND has_schema_privilege(current_user, namespace.oid, 'CREATE')"
             ")"
         ).fetchone()
@@ -714,6 +725,118 @@ if len(value) > 2048:
 print(json.dumps([value], ensure_ascii=False, separators=(",", ":")))
 PY
 )" || fail "Scalar replay fixture JSON'a cevrilemedi"
+
+query_response_file="$(mktemp "${TMPDIR:-/tmp}/advisor-query-explain.XXXXXX")"
+query_endpoint_ok=false
+if docker compose --profile real-validation exec -T \
+  -e ACCEPTANCE_QUERY_ID="$query_id" \
+  -e ACCEPTANCE_SERVER_ID="$server_id" \
+  -e ACCEPTANCE_DATABASE_ID="$database_id" \
+  -e ACCEPTANCE_BIND_VALUE="$fixture_value" \
+  api python - >"$query_response_file" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+query_id = int(os.environ["ACCEPTANCE_QUERY_ID"])
+payload = json.dumps(
+    {
+        "serverId": int(os.environ["ACCEPTANCE_SERVER_ID"]),
+        "databaseId": int(os.environ["ACCEPTANCE_DATABASE_ID"]),
+        "bindValues": [os.environ["ACCEPTANCE_BIND_VALUE"]],
+    },
+    separators=(",", ":"),
+).encode("utf-8")
+request = urllib.request.Request(
+    f"http://127.0.0.1:8000/api/v1/queries/{query_id}/explain-analyze?window=30d",
+    data=payload,
+    headers={
+        "Content-Type": "application/json",
+        "X-Advisor-Role": "analyst",
+    },
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=180) as response:
+        body = response.read()
+        if response.status != 200:
+            raise SystemExit(f"query explain endpoint returned HTTP {response.status}")
+except urllib.error.HTTPError as error:
+    detail = error.read().decode("utf-8", errors="replace")[:1000]
+    print(f"query explain endpoint HTTP {error.code}: {detail}", file=sys.stderr)
+    raise SystemExit(1) from error
+except urllib.error.URLError as error:
+    print(f"query explain endpoint connection failed: {error.reason}", file=sys.stderr)
+    raise SystemExit(1) from error
+
+sys.stdout.buffer.write(body)
+PY
+then
+  query_endpoint_ok=true
+fi
+
+source_index_after_query="$(target_index_state source-db postgres appdb 5432)"
+repository_jobs_after_query="$(repository_job_count)"
+clone_cluster_after_query="$(clone_cluster_state)"
+clone_manifest_after_query="$(clone_manifest_state)"
+clone_index_after_query="$(target_index_state clone-db clone_admin appdb 5432)"
+
+[[ "$source_index_after_query" == "$source_index_before" ]] \
+  || fail "Dashboard EXPLAIN ANALYZE kaynak index katalogunu degistirdi"
+[[ "$repository_jobs_after_query" == "0" ]] \
+  || fail "Dashboard EXPLAIN ANALYZE repository cluster'da job database birakti"
+[[ "$clone_cluster_after_query" == "$clone_cluster_before" ]] \
+  || fail "Dashboard EXPLAIN ANALYZE clone job database birakti"
+[[ "$clone_manifest_after_query" == "$clone_manifest_before" ]] \
+  || fail "Dashboard EXPLAIN ANALYZE clone manifestini degistirdi"
+[[ "$clone_index_after_query" == "$clone_index_before" ]] \
+  || fail "Dashboard EXPLAIN ANALYZE clone template index katalogunu degistirdi"
+[[ "$query_endpoint_ok" == true ]] \
+  || fail "Dashboard query EXPLAIN ANALYZE endpoint cagrisi basarisiz"
+
+query_runtime_summary="$("$python_bin" - "$query_response_file" "$query_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle)
+
+validation = result.get("validation")
+checks = {
+    "queryId": str(result.get("queryId")) == sys.argv[2],
+    "status=RUNTIME_VALIDATED": result.get("status") == "RUNTIME_VALIDATED",
+    "statementClass=READ_ONLY_SELECT": isinstance(validation, dict)
+    and validation.get("statementClass") == "READ_ONLY_SELECT",
+    "planPreflight=READ_ONLY": isinstance(validation, dict)
+    and validation.get("planPreflight") == "READ_ONLY",
+    "transactionReadOnly=true": isinstance(validation, dict)
+    and validation.get("transactionReadOnly") is True,
+    "runnerPolicyRevision=1": isinstance(validation, dict)
+    and validation.get("runnerPolicyRevision") == 1,
+    "plan": isinstance(validation, dict)
+    and isinstance(validation.get("plan"), dict)
+    and isinstance(validation["plan"].get("Plan"), dict),
+    "executionTarget=DISPOSABLE_CLONE": result.get("executionTarget")
+    == "DISPOSABLE_CLONE",
+    "sourceDdlExecuted=false": result.get("sourceDdlExecuted") is False,
+    "cloneDdlExecuted=false": result.get("cloneDdlExecuted") is False,
+    "cloneDestroyed=true": result.get("cloneDestroyed") is True,
+}
+failed = [name for name, accepted in checks.items() if not accepted]
+if failed:
+    raise SystemExit("query runtime acceptance failed: " + ", ".join(failed))
+
+print(
+    "status=RUNTIME_VALIDATED, readOnly=true, execution="
+    f"{validation.get('executionTimeMs')}ms"
+)
+PY
+)" || fail "Dashboard query runtime yaniti kabul sozlesmesini karsilamadi"
+pass "${query_runtime_summary}"
+pass "Dashboard sorgusu tek disposable clone'da, index/DDL olmadan calisti ve temizlendi"
+
 unset ADVISOR_RUNTIME_ACCEPTANCE_SCALAR fixture_value
 
 printf '%s\n' "$fixture_json" | bash scripts/register-runtime-replay-fixture.sh \

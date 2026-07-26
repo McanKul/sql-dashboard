@@ -307,6 +307,39 @@ export interface QueryRuntimeValidation {
   cloneDestroyed: boolean
 }
 
+export type QueryBindValue = string | number | boolean | null
+
+export interface CloneQueryEvaluationResult {
+  status: 'RUNTIME_VALIDATED' | 'UNAVAILABLE' | 'UNSAFE'
+  reasonCode: string
+  message: string
+  queryId: string
+  validation?: {
+    mode: 'EXPLAIN_ANALYZE'
+    statementClass: 'READ_ONLY_SELECT'
+    planPreflight: 'READ_ONLY'
+    transactionReadOnly: true
+    runnerPolicyRevision: number
+    postgresVersion: string
+    executionTimeMs: number
+    planningTimeMs: number
+    sharedHitBlocks: number
+    sharedReadBlocks: number
+    tempReadBlocks: number
+    tempWrittenBlocks: number
+    walRecords: number
+    walBytes: number
+    plan: Record<string, unknown>
+    /** Backward-compatible fallback for an evaluator rolling upgrade. */
+    rawPlan?: Record<string, unknown>
+    evaluatedAt: string
+  } | null
+  executionTarget: 'DISPOSABLE_CLONE'
+  sourceDdlExecuted: false
+  cloneDdlExecuted: false
+  cloneDestroyed: boolean
+}
+
 export interface QueryDetail extends QuerySummary {
   fullSql: string
   firstSeenAt: string

@@ -364,8 +364,8 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
             "REVOKE CREATE ON SCHEMA %I FROM PUBLIC, clone_runner",
             script,
         )
-        self.assertIn("namespace.nspname NOT LIKE 'pg_temp_%'", script)
-        self.assertIn("namespace.nspname NOT LIKE 'pg_toast_temp_%'", script)
+        self.assertIn("left(namespace.nspname, 8) <> 'pg_temp_'", script)
+        self.assertIn("left(namespace.nspname, 14) <> 'pg_toast_temp_'", script)
         self.assertEqual(script.count("routine.provolatile = 'v'"), 2)
         self.assertEqual(script.count("routine.prosecdef"), 2)
         self.assertEqual(script.count("routine.prokind = 'p'"), 2)
@@ -395,7 +395,10 @@ printf '%s\\n' "$MOCK_ROTATED_STATE" > "$MOCK_STATE"
         )
         self.assertIn("runner_policy_revision integer NOT NULL DEFAULT 1", script)
         self.assertIn("dangerous_routines_revoked boolean NOT NULL DEFAULT true", script)
-        self.assertIn("VALUES (true, :'template_restored'::boolean, 1, true)", script)
+        self.assertIn("source_alias text NOT NULL", script)
+        self.assertIn("source_database_name text NOT NULL", script)
+        self.assertIn(":'source_alias'", script)
+        self.assertIn(":'clone_database'", script)
         self.assertIn(
             "runner_policy_revision = EXCLUDED.runner_policy_revision",
             script,

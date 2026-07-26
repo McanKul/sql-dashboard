@@ -13,7 +13,9 @@ from fastapi.responses import StreamingResponse
 from app.config import WINDOW_INTERVALS, get_settings
 from app.clone_evaluator import (
     CloneIndexEvaluationResult,
+    CloneQueryEvaluationResult,
     InternalCloneIndexEvaluationRequest,
+    InternalCloneQueryEvaluationRequest,
     ValidatedCloneIndexCandidate,
     _production_index_sql,
 )
@@ -28,6 +30,7 @@ from app.schemas import (
     InternalIndexEvaluationRequest,
     IoResponse,
     PredicateResponse,
+    QueryExplainAnalyzeRequest,
     RuntimeIndexValidationRequest,
 )
 from app.security import (
@@ -38,7 +41,7 @@ from app.security import (
     request_role,
 )
 from app.services.evaluator import evaluate_index_candidate
-from app.services.clone_evaluator import validate_index_on_clone
+from app.services.clone_evaluator import explain_query_on_clone, validate_index_on_clone
 
 
 router = APIRouter(prefix="/api/v1")
@@ -526,6 +529,40 @@ async def query_detail(
         }
     )
     return item
+
+
+@router.post(
+    "/queries/{query_id}/explain-analyze",
+    response_model=CloneQueryEvaluationResult,
+)
+async def explain_query_runtime(
+    query_id: int,
+    payload: QueryExplainAnalyzeRequest,
+    window: Window = "24h",
+) -> dict[str, object]:
+    """Run one persisted read-only query only on the disposable clone.
+
+    This loopback, single-user endpoint intentionally has no admin dependency.
+    Its body cannot carry SQL: query identity and scope are resolved against
+    repository telemetry before the internal token-protected call is made.
+    """
+    query = await repository.query_by_id(
+        query_id=query_id,
+        window=window,
+        server_id=payload.serverId,
+        database_id=payload.databaseId,
+    )
+    if query is None:
+        raise HTTPException(status_code=404, detail="Sorgu secili pencerede bulunamadi.")
+
+    clone_request = InternalCloneQueryEvaluationRequest(
+        serverAlias=str(query.get("server_alias") or f"server-{payload.serverId}"),
+        databaseName=str(query.get("database_name") or f"db-{payload.databaseId}"),
+        queryId=str(query_id),
+        normalizedSql=str(query["sql_text"]),
+        bindValues=payload.bindValues,
+    )
+    return await explain_query_on_clone(clone_request)
 
 
 @router.get("/queries/{query_id}/predicates", response_model=PredicateResponse)
