@@ -1,6 +1,6 @@
 # PostgreSQL Sorgu Performansı ve Öneri Motoru
 
-Güncel sürüm: `1.1.0`. Değişiklikler [CHANGELOG.md](CHANGELOG.md), güvenli
+Güncel sürüm: `1.1.1`. Değişiklikler [CHANGELOG.md](CHANGELOG.md), güvenli
 yükseltme ve geri dönüş adımları [upgrade/rollback runbook'unda](docs/UPGRADE_ROLLBACK.md).
 
 PDF v1.1'de tarif edilen ilk iterasyonun çalışan referans uygulamasıdır. Tek bir Docker/OrbStack hostu üzerinde **iki ayrı PostgreSQL sunucu süreci** çalışır: demo kaynak instance `5432`, PoWA repository instance `5433`. PoWA Collector istatistikleri kaynaktan repository'ye taşır; FastAPI yalnız repository'yi okur ve React arayüzü sonuçları gösterir. Aynı repository/collector, `scripts/register-source.sh` ile birden fazla gerçek PostgreSQL kaynağı izleyebilir.

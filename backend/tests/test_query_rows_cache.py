@@ -303,7 +303,7 @@ async def test_identical_cold_misses_share_one_refresh(
 
 
 @pytest.mark.asyncio
-async def test_different_windows_do_not_scan_repository_concurrently(
+async def test_different_windows_read_precomputed_snapshots_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = cache_repository(FakeClock())
@@ -322,8 +322,8 @@ async def test_different_windows_do_not_scan_repository_concurrently(
     first = asyncio.create_task(repository.query_rows(window="1h"))
     await first_started.wait()
     second = asyncio.create_task(repository.query_rows(window="24h"))
-    await asyncio.sleep(0)
-    assert started_windows == ["1h"]
+    await wait_until(lambda: started_windows == ["1h", "24h"])
+    assert started_windows == ["1h", "24h"]
 
     first_release.set()
     await asyncio.gather(first, second)
@@ -641,12 +641,15 @@ async def test_snapshot_loader_uses_tagged_bounded_query(
     with pytest.raises(QueryMetricsSnapshotTooLarge):
         await repository._load_query_metrics_snapshot("1h")
 
-    assert connection.cursor_names == [None, "advisor_query_metrics_cache_refresh"]
+    assert connection.cursor_names == [None, "advisor_query_metrics_snapshot_read"]
     assert "SET LOCAL application_name" in connection.control_cursor.query
-    assert "advisor-query-metrics-cache-refresh" in cursor.query
+    assert "advisor-query-metrics-snapshot-read" in cursor.query
+    assert "advisor.query_metrics_snapshot_1h" in cursor.query
+    assert "advisor.query_metrics(" not in cursor.query
+    assert "advisor.query_annotations" in cursor.query
     assert "pg_column_size(metrics)" in cursor.query
     assert "LIMIT %s" in cursor.query
-    assert cursor.params == ("1 hour", 3)
+    assert cursor.params == (3,)
     assert cursor.fetch_sizes == [3, 1]
 
 

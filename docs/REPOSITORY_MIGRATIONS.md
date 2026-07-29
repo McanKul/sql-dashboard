@@ -87,6 +87,17 @@ release bilgisini ve tablo yazma maliyeti sinyalini ekler. Bu migration uygulama
 `1.1.0` ile birlikte yükseltilir; geri dönüş sınırı
 [upgrade/rollback runbook'undadır](UPGRADE_ROLLBACK.md).
 
+`0015`, dört sabit dashboard penceresi için kalıcı query-metrics materialized
+snapshot'ları ve yenileme durum tablosunu ekler. İlk population worker tarafından
+migration dışında yapılır. Sonraki yenilemeler `CONCURRENTLY` çalıştığından
+hesaplama tamamlanana kadar önceki atomik sonuç okunur; API request yolu
+`advisor.query_metrics(interval)` çağırmaz.
+
+`0016`, overview trendlerini database scope'ta bir kez hesaplayan ve aynı bucket
+satırlarından server/global toplamlarını türeten dört kalıcı materialized
+snapshot ekler. Böylece global, server ve database overview yolları cold API
+başlangıcında dahi `advisor.query_trend(...)` çalıştırmaz.
+
 ## Yeni migration ekleme
 
 1. Mevcut migration dosyalarını değiştirmeyin. Özellikle

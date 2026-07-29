@@ -54,7 +54,7 @@ class FakePool:
 
 
 @pytest.mark.asyncio
-async def test_global_trend_uses_preaggregated_two_argument_helper(
+async def test_global_trend_reads_precomputed_fleet_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cursor = FakeCursor()
@@ -66,14 +66,13 @@ async def test_global_trend_uses_preaggregated_two_argument_helper(
     assert rows[0]["calls"] == 3
     tag_query, tag_params = cursor.executions[0]
     assert "SET LOCAL application_name" in tag_query
-    assert "advisor-global-trend-cache-refresh" in tag_query
+    assert "advisor-global-trend-snapshot-read" in tag_query
     assert tag_params == []
     query, params = cursor.executions[1]
-    assert "advisor.query_trend(" in query
-    assert "now() - %s::interval" in query
-    assert "advisor.query_deltas" not in query
-    assert "advisor-global-trend-cache-refresh" in query
-    assert params == ["1 hour", "5 minutes", 100_001]
+    assert "advisor.global_trend_snapshot_1h" in query
+    assert "advisor.query_trend(" not in query
+    assert "advisor-global-trend-snapshot-read" in query
+    assert params == [None, None, 100_001]
 
 
 @pytest.mark.asyncio
@@ -100,7 +99,7 @@ async def test_query_trend_pushes_complete_scope_into_five_argument_helper(
 
 
 @pytest.mark.asyncio
-async def test_server_trend_uses_four_argument_scope_helper(
+async def test_server_trend_reads_precomputed_server_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cursor = FakeCursor()
@@ -110,11 +109,12 @@ async def test_server_trend_uses_four_argument_scope_helper(
     await repository.trend(window="1h", server_id=7)
 
     tag_query, tag_params = cursor.executions[0]
-    assert "advisor-global-trend-cache-refresh" in tag_query
+    assert "advisor-global-trend-snapshot-read" in tag_query
     assert tag_params == []
     query, params = cursor.executions[1]
-    assert "now() - %s::interval, %s::interval, %s, %s)" in query
-    assert params == ["1 hour", "5 minutes", 7, None, 100_001]
+    assert "advisor.global_trend_snapshot_1h" in query
+    assert "advisor.query_trend(" not in query
+    assert params == [7, None, 100_001]
 
 
 @pytest.mark.asyncio

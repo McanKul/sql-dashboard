@@ -558,6 +558,10 @@ class WorkloadConfig:
     duration_seconds: int
     workers: int
     interval_seconds: float
+    interval_jitter_ratio: float
+    traffic_phase_seconds: int
+    traffic_min_interval_multiplier: float
+    traffic_max_interval_multiplier: float
     report_interval_seconds: int
     random_seed: int
     statement_timeout_ms: int
@@ -598,6 +602,39 @@ class WorkloadConfig:
         interval_seconds = _number(
             values, defaults, "WORKLOAD_INTERVAL_SECONDS", 0, 60
         )
+        interval_jitter_ratio = _number(
+            values,
+            {"WORKLOAD_INTERVAL_JITTER_RATIO": "0"},
+            "WORKLOAD_INTERVAL_JITTER_RATIO",
+            0,
+            0.95,
+        )
+        traffic_phase_seconds = _integer(
+            values,
+            {"WORKLOAD_TRAFFIC_PHASE_SECONDS": "0"},
+            "WORKLOAD_TRAFFIC_PHASE_SECONDS",
+            0,
+            3_600,
+        )
+        traffic_min_interval_multiplier = _number(
+            values,
+            {"WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER": "1"},
+            "WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER",
+            0.1,
+            5,
+        )
+        traffic_max_interval_multiplier = _number(
+            values,
+            {"WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER": "1"},
+            "WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER",
+            0.1,
+            5,
+        )
+        if traffic_min_interval_multiplier > traffic_max_interval_multiplier:
+            raise ValueError(
+                "WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER cannot exceed "
+                "WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER"
+            )
         report_interval_seconds = _integer(
             values, defaults, "WORKLOAD_REPORT_INTERVAL_SECONDS", 1, 300
         )
@@ -703,6 +740,10 @@ class WorkloadConfig:
             duration_seconds=duration_seconds,
             workers=workers,
             interval_seconds=interval_seconds,
+            interval_jitter_ratio=interval_jitter_ratio,
+            traffic_phase_seconds=traffic_phase_seconds,
+            traffic_min_interval_multiplier=traffic_min_interval_multiplier,
+            traffic_max_interval_multiplier=traffic_max_interval_multiplier,
             report_interval_seconds=report_interval_seconds,
             random_seed=random_seed,
             statement_timeout_ms=statement_timeout_ms,
@@ -1332,6 +1373,34 @@ def worker_seed(base_seed: int, worker_id: int) -> int:
     return (base_seed + worker_id * 1_000_003) % (2**63)
 
 
+def traffic_phase_interval_multiplier(
+    config: WorkloadConfig, elapsed_seconds: float
+) -> float:
+    if config.traffic_phase_seconds == 0:
+        return 1.0
+    phase_index = max(0, int(elapsed_seconds // config.traffic_phase_seconds))
+    phase_seed = (
+        config.random_seed ^ ((phase_index + 1) * 0x9E37_79B9_7F4A_7C15)
+    ) % (2**63)
+    return random.Random(phase_seed).uniform(
+        config.traffic_min_interval_multiplier,
+        config.traffic_max_interval_multiplier,
+    )
+
+
+def traffic_interval_seconds(
+    config: WorkloadConfig, rng: random.Random, elapsed_seconds: float
+) -> float:
+    if config.interval_seconds == 0:
+        return 0.0
+    jitter_multiplier = rng.uniform(
+        1 - config.interval_jitter_ratio,
+        1 + config.interval_jitter_ratio,
+    )
+    phase_multiplier = traffic_phase_interval_multiplier(config, elapsed_seconds)
+    return min(60.0, config.interval_seconds * jitter_multiplier * phase_multiplier)
+
+
 ROLE_SHARES: dict[str, dict[str, float]] = {
     "quick": {READER_ROLE: 0.50, REPORTER_ROLE: 0.30, WRITER_ROLE: 0.20},
     "normal": {READER_ROLE: 0.50, REPORTER_ROLE: 0.30, WRITER_ROLE: 0.20},
@@ -1699,6 +1768,7 @@ def run_worker(
     deadline: float,
 ) -> None:
     rng = random.Random(worker_seed(config.random_seed, worker_id))
+    traffic_started_at = time.monotonic()
     reconnect_delay = 0.25
     while not stop_event.is_set() and time.monotonic() < deadline:
         try:
@@ -1774,8 +1844,13 @@ def run_worker(
                             metrics.record_erp_fingerprint(erp_ordinal)
 
                     remaining = deadline - time.monotonic()
-                    if config.interval_seconds > 0 and remaining > 0:
-                        stop_event.wait(min(config.interval_seconds, remaining))
+                    interval_seconds = traffic_interval_seconds(
+                        config,
+                        rng,
+                        max(0.0, time.monotonic() - traffic_started_at),
+                    )
+                    if interval_seconds > 0 and remaining > 0:
+                        stop_event.wait(min(interval_seconds, remaining))
         except (psycopg.OperationalError, OSError) as exc:
             metrics.record_connection_error(getattr(exc, "sqlstate", None))
             remaining = deadline - time.monotonic()
@@ -1817,6 +1892,14 @@ def _heartbeat_payload(
             if math.isinf(remaining_seconds)
             else round(max(0, remaining_seconds), 3)
         ),
+        "traffic": {
+            "baseIntervalSeconds": config.interval_seconds,
+            "intervalJitterRatio": config.interval_jitter_ratio,
+            "phaseSeconds": config.traffic_phase_seconds,
+            "phaseIntervalMultiplier": round(
+                traffic_phase_interval_multiplier(config, elapsed_seconds), 3
+            ),
+        },
         "totals": snapshot["totals"],
         "categories": snapshot["categories"],
     }
@@ -1862,6 +1945,15 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
             "workers": config.workers,
             "roleWorkers": role_workers,
             "randomSeed": config.random_seed,
+            "intervalSeconds": config.interval_seconds,
+            "intervalJitterRatio": config.interval_jitter_ratio,
+            "trafficPhaseSeconds": config.traffic_phase_seconds,
+            "trafficMinIntervalMultiplier": (
+                config.traffic_min_interval_multiplier
+            ),
+            "trafficMaxIntervalMultiplier": (
+                config.traffic_max_interval_multiplier
+            ),
             "dataBounds": bounds.__dict__,
             "sqlTemplateCount": len(SQL_TEMPLATES),
             "erpTableCount": config.erp_table_count,
@@ -1962,6 +2054,15 @@ def run(config: WorkloadConfig) -> tuple[dict[str, object], int]:
         "workers": config.workers,
         "roleWorkers": role_workers,
         "randomSeed": config.random_seed,
+        "intervalSeconds": config.interval_seconds,
+        "intervalJitterRatio": config.interval_jitter_ratio,
+        "trafficPhaseSeconds": config.traffic_phase_seconds,
+        "trafficMinIntervalMultiplier": (
+            config.traffic_min_interval_multiplier
+        ),
+        "trafficMaxIntervalMultiplier": (
+            config.traffic_max_interval_multiplier
+        ),
         "dataBounds": bounds.__dict__,
         "sqlTemplateCount": len(SQL_TEMPLATES),
         "erpTableCount": config.erp_table_count,

@@ -95,15 +95,18 @@ jobs:
 
       - name: Verify health and migration idempotency
         run: |
-          curl --fail --silent --show-error \
-            http://127.0.0.1:8000/api/v1/health \
-            | python -c '
-          import json, sys
-          health = json.load(sys.stdin)
-          assert health["status"] == "healthy", health
-          assert health["repository"] == "healthy", health
-          assert health["collector"] == "healthy", health
-          '
+          health_ready=false
+          for attempt in $(seq 1 18); do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8000/api/v1/health \
+              | python -c 'import json, sys; health = json.load(sys.stdin); assert health["status"] == "healthy", health; assert health["repository"] == "healthy", health; assert health["collector"] == "healthy", health'; then
+              health_ready=true
+              break
+            fi
+            printf 'collector health attempt=%s is not ready yet\n' "$attempt"
+            sleep 10
+          done
+          test "$health_ready" = true
           docker compose run --rm repository-migrate
           bash scripts/verify-temporal-reliability.sh
           docker compose exec -T repository-db \
@@ -118,7 +121,7 @@ jobs:
             psql -X --set=ON_ERROR_STOP=1 --username postgres --dbname powa --file=- \
             < sql/tests/join_outbox_guardrail_integration.sql
 
-      - name: Verify a persisted 0013 database upgrades to 0014
+      - name: Verify a persisted 0013 database upgrades through 0016
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -170,7 +173,7 @@ jobs:
               release record;
           BEGIN
               SELECT * INTO STRICT release FROM advisor.release_info();
-              IF release.current_migration <> '0014' OR release.applied_count <> 14 THEN
+              IF release.current_migration <> '0016' OR release.applied_count <> 16 THEN
                   RAISE EXCEPTION 'unexpected upgraded release state: %', row_to_json(release);
               END IF;
               IF NOT has_function_privilege(
@@ -206,6 +209,27 @@ jobs:
 
       - name: Prepare the deterministic runtime candidate
         run: bash scripts/verify.sh
+
+      - name: Refresh the disposable 30d runtime replay snapshot
+        run: |
+          docker compose exec -T query-metrics-snapshot-worker python - <<'PY'
+          import time
+
+          from app.config import get_settings
+          from app.snapshot_worker import open_connection, refresh_snapshot
+
+
+          settings = get_settings()
+          with open_connection(settings) as connection:
+              for _ in range(30):
+                  if refresh_snapshot(connection, "30d"):
+                      break
+                  time.sleep(2)
+              else:
+                  raise SystemExit(
+                      "30d query metrics snapshot advisory lock could not be acquired"
+                  )
+          PY
 
       - name: Boot disposable clone services
         run: |

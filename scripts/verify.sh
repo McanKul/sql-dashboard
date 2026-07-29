@@ -978,6 +978,27 @@ collector_state="$(docker compose exec -T repository-db psql -U postgres -p 5433
 [[ "$collector_state" == "HEALTHY|0" ]] || fail "Collector sagligi beklenmiyor: ${collector_state}"
 pass "Collector gecikmesi ve hata durumu saglikli"
 
+docker compose exec -T query-metrics-snapshot-worker python - <<'PY'
+import time
+
+from app.config import get_settings
+from app.snapshot_worker import open_connection, refresh_snapshot
+
+
+settings = get_settings()
+with open_connection(settings) as connection:
+    for window in ("1h", "24h"):
+        for _ in range(30):
+            if refresh_snapshot(connection, window):
+                break
+            time.sleep(2)
+        else:
+            raise SystemExit(
+                f"{window} query metrics snapshot advisory lock could not be acquired"
+            )
+PY
+pass "Dashboard 1h/24h persistent query snapshot'lari test deltasi sonrasi yenilendi"
+
 curl -fsS -H 'X-Advisor-Role: analyst' \
   "${api_url}/api/v1/queries?window=1h&pageSize=10" >"${verify_tmp_dir}/queries-authorized.json"
 curl -fsS "${api_url}/api/v1/queries?window=1h&pageSize=10" >"${verify_tmp_dir}/queries-viewer.json"

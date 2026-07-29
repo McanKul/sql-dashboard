@@ -1,0 +1,23 @@
+{
+	email ops@trades.engineer
+	admin off
+}
+
+trades.engineer, trades.164-92-171-43.sslip.io {
+	encode zstd gzip
+
+	basic_auth {
+		{$DASHBOARD_BASIC_AUTH_USER} {$DASHBOARD_BASIC_AUTH_HASH}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		-Server
+	}
+
+	reverse_proxy web:80
+}
