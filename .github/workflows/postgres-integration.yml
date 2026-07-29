@@ -210,6 +210,27 @@ jobs:
       - name: Prepare the deterministic runtime candidate
         run: bash scripts/verify.sh
 
+      - name: Refresh the disposable 30d runtime replay snapshot
+        run: |
+          docker compose exec -T query-metrics-snapshot-worker python - <<'PY'
+          import time
+
+          from app.config import get_settings
+          from app.snapshot_worker import open_connection, refresh_snapshot
+
+
+          settings = get_settings()
+          with open_connection(settings) as connection:
+              for _ in range(30):
+                  if refresh_snapshot(connection, "30d"):
+                      break
+                  time.sleep(2)
+              else:
+                  raise SystemExit(
+                      "30d query metrics snapshot advisory lock could not be acquired"
+                  )
+          PY
+
       - name: Boot disposable clone services
         run: |
           docker compose --profile real-validation up -d --wait \
