@@ -272,11 +272,11 @@ probe="$({ printf '%s\n' "$source_password"; } | docker compose exec -T reposito
               AND current_setting('\''pg_wait_sampling.profile_queries'\'') = '\''top'\''
               AND current_setting('\''pg_wait_sampling.sample_cpu'\'') = '\''off'\'',
             COALESCE(has_function_privilege(
-              current_user, 'advisor_join.capture_and_reset()', 'EXECUTE'
+              current_user, '\''advisor_join.capture_and_reset()'\'', '\''EXECUTE'\''
             ), false),
-            to_regprocedure('advisor_join.assert_outbox_within_limits()') IS NOT NULL,
+            to_regprocedure('\''advisor_join.assert_outbox_within_limits()'\'') IS NOT NULL,
             NOT COALESCE(has_function_privilege(
-              current_user, 'advisor_join.assert_outbox_within_limits()', 'EXECUTE'
+              current_user, '\''advisor_join.assert_outbox_within_limits()'\'', '\''EXECUTE'\''
             ), false),
             NOT COALESCE((
               SELECT has_function_privilege(
