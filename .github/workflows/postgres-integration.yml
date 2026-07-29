@@ -95,15 +95,24 @@ jobs:
 
       - name: Verify health and migration idempotency
         run: |
-          curl --fail --silent --show-error \
-            http://127.0.0.1:8000/api/v1/health \
-            | python -c '
-          import json, sys
-          health = json.load(sys.stdin)
-          assert health["status"] == "healthy", health
-          assert health["repository"] == "healthy", health
-          assert health["collector"] == "healthy", health
-          '
+          health_ready=false
+          for attempt in $(seq 1 18); do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8000/api/v1/health \
+              | python -c '
+            import json, sys
+            health = json.load(sys.stdin)
+            assert health["status"] == "healthy", health
+            assert health["repository"] == "healthy", health
+            assert health["collector"] == "healthy", health
+            '; then
+              health_ready=true
+              break
+            fi
+            printf 'collector health attempt=%s is not ready yet\n' "$attempt"
+            sleep 10
+          done
+          test "$health_ready" = true
           docker compose run --rm repository-migrate
           bash scripts/verify-temporal-reliability.sh
           docker compose exec -T repository-db \
