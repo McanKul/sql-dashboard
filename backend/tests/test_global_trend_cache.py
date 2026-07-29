@@ -67,6 +67,67 @@ async def wait_until(predicate: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_global_trend_loader_reads_persistent_scoped_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def __init__(self) -> None:
+            self.executions: list[tuple[str, list[Any] | tuple[Any, ...]]] = []
+
+        async def __aenter__(self) -> Cursor:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(
+            self, query: str, params: list[Any] | tuple[Any, ...]
+        ) -> None:
+            self.executions.append((query, params))
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return [trend_row(1)]
+
+    class Connection:
+        def __init__(self) -> None:
+            self.control = Cursor()
+            self.data = Cursor()
+            self.cursor_count = 0
+
+        async def __aenter__(self) -> Connection:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        def cursor(self) -> Cursor:
+            self.cursor_count += 1
+            return self.control if self.cursor_count == 1 else self.data
+
+    class Pool:
+        def __init__(self) -> None:
+            self.connection_instance = Connection()
+
+        def connection(self) -> Connection:
+            return self.connection_instance
+
+    fake_pool = Pool()
+    monkeypatch.setattr(powa_module, "pool", fake_pool)
+    repository = cache_repository(FakeClock())
+
+    rows = await repository._load_global_trend_snapshot(
+        "24h", server_id=7, database_id=16_384
+    )
+
+    query, params = fake_pool.connection_instance.data.executions[0]
+    assert rows == [trend_row(1)]
+    assert "advisor.global_trend_snapshot_24h" in query
+    assert "advisor.query_trend(" not in query
+    assert "IS NOT DISTINCT FROM" in query
+    assert params == (7, 16_384, 100_001)
+
+
+@pytest.mark.asyncio
 async def test_global_trend_cold_singleflight_is_shielded_and_deep_copy_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -220,7 +281,7 @@ async def test_global_trend_failure_backoff_serves_stale_without_retry_storm(
 
 
 @pytest.mark.asyncio
-async def test_query_metrics_and_global_trend_share_repository_refresh_lock(
+async def test_precomputed_metrics_and_trend_snapshots_read_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = cache_repository(FakeClock())
@@ -243,8 +304,8 @@ async def test_query_metrics_and_global_trend_share_repository_refresh_lock(
     metrics_request = asyncio.create_task(repository.query_rows(window="24h"))
     await metrics_started.wait()
     trend_request = asyncio.create_task(repository.trend(window="24h"))
-    await asyncio.sleep(0)
-    assert not trend_started.is_set()
+    await wait_until(trend_started.is_set)
+    assert trend_started.is_set()
     assert repository._query_metrics_refresh_lock is repository._repository_refresh_lock
 
     metrics_release.set()

@@ -138,6 +138,44 @@ services:
     restart: "no"
     networks: [advisor]
 
+  query-metrics-snapshot-worker:
+    build:
+      context: ./backend
+    image: postgresql-advisor/api:iteration-2.7
+    command: ["python", "-m", "app.snapshot_worker"]
+    environment:
+      DATABASE_URL: ${ADVISOR_API_DATABASE_URL:-}
+      DATABASE_HOST: ${ADVISOR_API_DATABASE_HOST:-repository-db}
+      DATABASE_PORT: ${ADVISOR_API_DATABASE_PORT:-5433}
+      DATABASE_NAME: ${ADVISOR_API_DATABASE_NAME:-powa_repository}
+      DATABASE_USER: ${ADVISOR_API_DATABASE_USER:-advisor_api}
+      DATABASE_PASSWORD: ${ADVISOR_API_PASSWORD:?Set ADVISOR_API_PASSWORD in .env}
+      DATABASE_SSLMODE: ${ADVISOR_API_DATABASE_SSLMODE:-disable}
+      QUERY_METRICS_SNAPSHOT_POLL_SECONDS: ${QUERY_METRICS_SNAPSHOT_POLL_SECONDS:-15}
+      QUERY_METRICS_SNAPSHOT_1H_REFRESH_SECONDS: ${QUERY_METRICS_SNAPSHOT_1H_REFRESH_SECONDS:-900}
+      QUERY_METRICS_SNAPSHOT_24H_REFRESH_SECONDS: ${QUERY_METRICS_SNAPSHOT_24H_REFRESH_SECONDS:-3600}
+      QUERY_METRICS_SNAPSHOT_7D_REFRESH_SECONDS: ${QUERY_METRICS_SNAPSHOT_7D_REFRESH_SECONDS:-21600}
+      QUERY_METRICS_SNAPSHOT_30D_REFRESH_SECONDS: ${QUERY_METRICS_SNAPSHOT_30D_REFRESH_SECONDS:-43200}
+      QUERY_METRICS_SNAPSHOT_STATEMENT_TIMEOUT_SECONDS: ${QUERY_METRICS_SNAPSHOT_STATEMENT_TIMEOUT_SECONDS:-1800}
+      QUERY_METRICS_SNAPSHOT_RETRY_SECONDS: ${QUERY_METRICS_SNAPSHOT_RETRY_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      repository-db:
+        condition: service_healthy
+      repository-migrate:
+        condition: service_completed_successfully
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: ${QUERY_METRICS_SNAPSHOT_WORKER_MEMORY_LIMIT:-256m}
+    restart: unless-stopped
+    networks: [advisor]
+
   collector:
     build:
       context: .
@@ -166,6 +204,9 @@ services:
         condition: service_healthy
       repository-migrate:
         condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os,signal; os.kill(1, signal.SIGCONT)\""]
       interval: 15s
@@ -275,6 +316,8 @@ services:
         condition: service_healthy
       repository-migrate:
         condition: service_completed_successfully
+      query-metrics-snapshot-worker:
+        condition: service_started
       collector:
         condition: service_started
       evaluator:
@@ -448,6 +491,10 @@ services:
       WORKLOAD_PROFILE: ${WORKLOAD_PROFILE:-normal}
       WORKLOAD_DURATION_SECONDS: ${WORKLOAD_DURATION_SECONDS:-0}
       WORKLOAD_INTERVAL_SECONDS: ${WORKLOAD_INTERVAL_SECONDS:-0.25}
+      WORKLOAD_INTERVAL_JITTER_RATIO: ${WORKLOAD_INTERVAL_JITTER_RATIO:-0}
+      WORKLOAD_TRAFFIC_PHASE_SECONDS: ${WORKLOAD_TRAFFIC_PHASE_SECONDS:-0}
+      WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER: ${WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER:-1}
+      WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER: ${WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER:-1}
       WORKLOAD_WORKERS: ${WORKLOAD_WORKERS:-6}
       WORKLOAD_REPORT_INTERVAL_SECONDS: ${WORKLOAD_REPORT_INTERVAL_SECONDS:-10}
       WORKLOAD_RANDOM_SEED: ${WORKLOAD_RANDOM_SEED:-20260725}

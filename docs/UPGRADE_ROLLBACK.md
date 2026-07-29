@@ -1,7 +1,7 @@
 # Upgrade ve rollback runbook'u
 
-Bu runbook aynı PostgreSQL major sürümünde SQL Dashboard `1.1.0` ve repository
-şema `0014` için güvenli yükseltme sınırını tanımlar. Üretimde image'ları sürüm
+Bu runbook aynı PostgreSQL major sürümünde SQL Dashboard `1.1.1` ve repository
+şema `0016` için güvenli yükseltme sınırını tanımlar. Üretimde image'ları sürüm
 ve digest ile sabitleyin. Önce staging restore provası yapın.
 
 > **Uyarı:** `dropdb`, `docker compose down --volumes` ve yanlış Compose proje
@@ -53,18 +53,20 @@ docker compose exec -T repository-db \
   -c "SELECT max(version),count(*) FROM advisor_migrations.schema_migrations"
 ```
 
-`1.1.0` için beklenen son sürüm `0014` olmalıdır.
+`1.1.1` için beklenen son sürüm `0016` olmalıdır.
 
 ## 3. Servisleri aç, doğrula ve cutover yap
 
 ```bash
-docker compose up -d collector join-snapshotter evaluator api web
+docker compose up -d collector join-snapshotter evaluator query-metrics-snapshot-worker
+# 1h ve 24h state satırları ready olduktan sonra:
+docker compose up -d api web
 docker compose ps
 curl -fsS http://127.0.0.1:8000/api/v1/health
 bash scripts/verify.sh
 ```
 
-Health yanıtında uygulama `1.1.0`, migration `current=expected=0014` ve
+Health yanıtında uygulama `1.1.1`, migration `current=expected=0016` ve
 `upToDate=true` bekleyin. Collector için yeni snapshot zamanı ilerlemeden ve
 web/API smoke testi geçmeden trafiği açmayın. Dış source bağlantılarını alias,
 database OID ve capability kapsamıyla yeniden doğrulayın.

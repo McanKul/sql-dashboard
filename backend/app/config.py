@@ -24,6 +24,20 @@ WINDOW_BUCKETS: dict[str, str] = {
     "30d": "1 day",
 }
 
+QUERY_METRICS_SNAPSHOT_VIEWS: dict[str, str] = {
+    "1h": "query_metrics_snapshot_1h",
+    "24h": "query_metrics_snapshot_24h",
+    "7d": "query_metrics_snapshot_7d",
+    "30d": "query_metrics_snapshot_30d",
+}
+
+GLOBAL_TREND_SNAPSHOT_VIEWS: dict[str, str] = {
+    "1h": "global_trend_snapshot_1h",
+    "24h": "global_trend_snapshot_24h",
+    "7d": "global_trend_snapshot_7d",
+    "30d": "global_trend_snapshot_30d",
+}
+
 
 PrincipalRole = Literal["analyst", "annotator", "admin"]
 
@@ -91,6 +105,26 @@ class Settings(BaseSettings):
         ge=1024 * 1024,
         le=1024 * 1024 * 1024,
     )
+    # A dedicated worker refreshes persistent materialized snapshots.  API
+    # requests only read those snapshots and therefore never execute the
+    # expensive query_metrics function on a cold process-local cache.
+    query_metrics_snapshot_poll_seconds: float = Field(default=15.0, ge=1, le=300)
+    query_metrics_snapshot_1h_refresh_seconds: int = Field(
+        default=15 * 60, ge=60, le=86_400
+    )
+    query_metrics_snapshot_24h_refresh_seconds: int = Field(
+        default=60 * 60, ge=60, le=7 * 86_400
+    )
+    query_metrics_snapshot_7d_refresh_seconds: int = Field(
+        default=6 * 60 * 60, ge=60, le=30 * 86_400
+    )
+    query_metrics_snapshot_30d_refresh_seconds: int = Field(
+        default=12 * 60 * 60, ge=60, le=30 * 86_400
+    )
+    query_metrics_snapshot_statement_timeout_seconds: int = Field(
+        default=30 * 60, ge=60, le=6 * 60 * 60
+    )
+    query_metrics_snapshot_retry_seconds: int = Field(default=60, ge=5, le=3_600)
     sql_text_visibility: str = "authorized"
     retention_days: int = 90
     log_level: str = "INFO"
