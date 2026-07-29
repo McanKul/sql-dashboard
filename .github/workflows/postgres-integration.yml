@@ -99,13 +99,7 @@ jobs:
           for attempt in $(seq 1 18); do
             if curl --fail --silent --show-error \
               http://127.0.0.1:8000/api/v1/health \
-              | python -c '
-            import json, sys
-            health = json.load(sys.stdin)
-            assert health["status"] == "healthy", health
-            assert health["repository"] == "healthy", health
-            assert health["collector"] == "healthy", health
-            '; then
+              | python -c 'import json, sys; health = json.load(sys.stdin); assert health["status"] == "healthy", health; assert health["repository"] == "healthy", health; assert health["collector"] == "healthy", health'; then
               health_ready=true
               break
             fi
