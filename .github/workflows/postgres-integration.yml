@@ -118,7 +118,7 @@ jobs:
             psql -X --set=ON_ERROR_STOP=1 --username postgres --dbname powa --file=- \
             < sql/tests/join_outbox_guardrail_integration.sql
 
-      - name: Verify a persisted 0013 database upgrades to 0014
+      - name: Verify a persisted 0013 database upgrades through 0016
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -170,7 +170,7 @@ jobs:
               release record;
           BEGIN
               SELECT * INTO STRICT release FROM advisor.release_info();
-              IF release.current_migration <> '0014' OR release.applied_count <> 14 THEN
+              IF release.current_migration <> '0016' OR release.applied_count <> 16 THEN
                   RAISE EXCEPTION 'unexpected upgraded release state: %', row_to_json(release);
               END IF;
               IF NOT has_function_privilege(
