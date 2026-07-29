@@ -137,6 +137,10 @@ class ConfigTests(unittest.TestCase):
             WORKLOAD_DURATION_SECONDS="60",
             WORKLOAD_WORKERS="12",
             WORKLOAD_INTERVAL_SECONDS="0.125",
+            WORKLOAD_INTERVAL_JITTER_RATIO="0.4",
+            WORKLOAD_TRAFFIC_PHASE_SECONDS="30",
+            WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER="0.5",
+            WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER="2.5",
             WORKLOAD_REPORT_INTERVAL_SECONDS="4",
             WORKLOAD_RANDOM_SEED="42",
             WORKLOAD_STATEMENT_TIMEOUT_MS="7000",
@@ -146,6 +150,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.duration_seconds, 60)
         self.assertEqual(config.workers, 12)
         self.assertEqual(config.interval_seconds, 0.125)
+        self.assertEqual(config.interval_jitter_ratio, 0.4)
+        self.assertEqual(config.traffic_phase_seconds, 30)
+        self.assertEqual(config.traffic_min_interval_multiplier, 0.5)
+        self.assertEqual(config.traffic_max_interval_multiplier, 2.5)
         self.assertEqual(config.report_interval_seconds, 4)
         self.assertEqual(config.random_seed, 42)
         self.assertEqual(config.statement_timeout_ms, 7000)
@@ -159,6 +167,12 @@ class ConfigTests(unittest.TestCase):
             {"WORKLOAD_WORKERS": "2"},
             {"WORKLOAD_DURATION_SECONDS": "-1"},
             {"WORKLOAD_INTERVAL_SECONDS": "nan"},
+            {"WORKLOAD_INTERVAL_JITTER_RATIO": "1"},
+            {"WORKLOAD_TRAFFIC_PHASE_SECONDS": "-1"},
+            {
+                "WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER": "3",
+                "WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER": "2",
+            },
             {"WORKLOAD_ERP_TABLE_COUNT": "501"},
             {"WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE": "9"},
             {"WORKLOAD_ERP_ROWS_PER_TABLE": "5001"},
@@ -328,6 +342,31 @@ class RoleAndRandomnessTests(unittest.TestCase):
                 for _ in range(100)
             }
             self.assertEqual(selected, {role})
+
+    def test_variable_traffic_interval_is_bounded_and_phase_based(self) -> None:
+        config = test_config(
+            WORKLOAD_INTERVAL_SECONDS="0.2",
+            WORKLOAD_INTERVAL_JITTER_RATIO="0.25",
+            WORKLOAD_TRAFFIC_PHASE_SECONDS="30",
+            WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER="0.5",
+            WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER="2",
+        )
+        first_phase = workload.traffic_phase_interval_multiplier(config, 5)
+        self.assertEqual(
+            first_phase,
+            workload.traffic_phase_interval_multiplier(config, 29.9),
+        )
+        self.assertNotEqual(
+            first_phase,
+            workload.traffic_phase_interval_multiplier(config, 30),
+        )
+
+        intervals = [
+            workload.traffic_interval_seconds(config, random.Random(seed), 5)
+            for seed in range(20)
+        ]
+        self.assertGreater(len(set(intervals)), 1)
+        self.assertTrue(all(0.075 <= interval <= 0.5 for interval in intervals))
 
 
 class OperationTests(unittest.TestCase):
@@ -528,7 +567,7 @@ class MetricsTests(unittest.TestCase):
             workload._is_connection_failure(connection_error, connection)
         )
 
-    def test_start_and_final_use_utc_timestamps_without_changing_heartbeat(self) -> None:
+    def test_start_final_and_heartbeat_have_stable_metadata(self) -> None:
         emitted: list[dict[str, object]] = []
         config = test_config()
 
@@ -574,8 +613,18 @@ class MetricsTests(unittest.TestCase):
                 "profile",
                 "elapsedSeconds",
                 "remainingSeconds",
+                "traffic",
                 "totals",
                 "categories",
+            },
+        )
+        self.assertEqual(
+            heartbeat["traffic"],
+            {
+                "baseIntervalSeconds": config.interval_seconds,
+                "intervalJitterRatio": config.interval_jitter_ratio,
+                "phaseSeconds": config.traffic_phase_seconds,
+                "phaseIntervalMultiplier": 1.0,
             },
         )
 

@@ -488,17 +488,17 @@ async def test_optimize_contract_never_fabricates_wal_or_validation(
 
 def test_release_contract_reports_expected_migration() -> None:
     payload = _release_payload({
-        "current_migration": "0014",
-        "applied_count": 14,
-        "latest_applied_at": datetime(2026, 7, 26, tzinfo=timezone.utc),
+        "current_migration": "0016",
+        "applied_count": 16,
+        "latest_applied_at": datetime(2026, 7, 30, tzinfo=timezone.utc),
     })
-    assert payload["applicationVersion"] == "1.1.0"
-    assert payload["migration"]["expected"] == "0014"
+    assert payload["applicationVersion"] == "1.1.1"
+    assert payload["migration"]["expected"] == "0016"
     assert payload["migration"]["upToDate"] is True
 
 
 def test_backend_versions_and_scoped_openapi_contract_are_aligned() -> None:
-    assert api_app.version == evaluator_app.version == clone_app.version == "1.1.0"
+    assert api_app.version == evaluator_app.version == clone_app.version == "1.1.1"
     schema = api_app.openapi()
     for path in ("/api/v1/system-health", "/api/v1/operations"):
         parameters = {

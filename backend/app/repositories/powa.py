@@ -13,7 +13,15 @@ from time import monotonic
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
-from app.config import WINDOW_BUCKETS, WINDOW_INTERVALS, get_settings
+from psycopg.errors import ObjectNotInPrerequisiteState
+
+from app.config import (
+    GLOBAL_TREND_SNAPSHOT_VIEWS,
+    QUERY_METRICS_SNAPSHOT_VIEWS,
+    WINDOW_BUCKETS,
+    WINDOW_INTERVALS,
+    get_settings,
+)
 from app.db import pool
 
 
@@ -42,6 +50,14 @@ class QueryMetricsSnapshotTooLarge(RuntimeError):
 
 class QueryMetricsRefreshBackoff(RuntimeError):
     """A failed refresh is inside its bounded repository-protection backoff."""
+
+
+class QueryMetricsSnapshotWarming(RuntimeError):
+    """The persistent snapshot has not completed its first refresh yet."""
+
+
+class GlobalTrendSnapshotWarming(QueryMetricsSnapshotWarming):
+    """The persistent overview trend has not completed its first refresh yet."""
 
 
 class GlobalTrendRefreshBackoff(RuntimeError):
@@ -580,12 +596,11 @@ class PowaRepository:
         self._query_metrics_cache_generation = 0
         self._query_metrics_retry: dict[str, _QueryMetricsRetryState] = {}
         self._query_metrics_cache_lock = asyncio.Lock()
-        # Deliberately shared by query_metrics and global query_trend across
-        # every window. The repository must never run two expensive dashboard
-        # refresh scans concurrently.
+        # Global trends still require expensive live telemetry scans and share
+        # this lock across windows. Query-metrics reloads read precomputed
+        # materialized snapshots and intentionally do not queue behind it.
         self._repository_refresh_lock = asyncio.Lock()
-        # Retain the old private name for compatibility with diagnostics while
-        # making its repository-wide scope explicit above.
+        # Retain the old private name for compatibility with diagnostics.
         self._query_metrics_refresh_lock = self._repository_refresh_lock
         self._query_metrics_refresh_tasks: dict[
             tuple[int, str], asyncio.Task[list[dict[str, Any]]]
@@ -604,39 +619,47 @@ class PowaRepository:
         self._clock = clock
 
     async def _load_query_metrics_snapshot(self, window: str) -> list[dict[str, Any]]:
-        interval = interval_for(window)
+        interval_for(window)
+        view_name = QUERY_METRICS_SNAPSHOT_VIEWS[window]
         async with pool.connection() as connection:
-            # A transaction-local application name remains visible while the
-            # named cursor executes FETCH statements. This lets the benchmark
-            # include stale-while-revalidate work in its measurement boundary.
+            # This is a bounded read of an already-computed materialized
+            # snapshot. Live annotations are overlaid so an annotation mutation
+            # does not have to trigger another full telemetry computation.
             async with connection.cursor() as control_cursor:
                 await control_cursor.execute(
                     "SET LOCAL application_name = "
-                    "'advisor-query-metrics-cache-refresh'"
+                    "'advisor-query-metrics-snapshot-read'"
                 )
 
-            # LIMIT max+1 detects an oversized row set without truncating it
-            # silently. The named cursor keeps libpq from buffering the whole
-            # result, while pg_column_size enforces a second payload-byte cap.
             async with connection.cursor(
-                name="advisor_query_metrics_cache_refresh"
+                name="advisor_query_metrics_snapshot_read"
             ) as cursor:
-                await cursor.execute(
-                    """
-                    /* advisor-query-metrics-cache-refresh */
+                try:
+                    await cursor.execute(
+                        f"""
+                    /* advisor-query-metrics-snapshot-read */
                     SELECT metrics.*,
-                           servers.alias AS server_alias,
+                           COALESCE(annotation.status, 'NEW')
+                               AS _live_review_status,
+                           annotation.note AS _live_note,
+                           annotation.updated_by AS _live_updated_by,
+                           annotation.updated_at AS _live_updated_at,
                            pg_column_size(metrics)
-                             + COALESCE(pg_column_size(servers.alias), 0)
                                AS _cache_row_bytes
-                    FROM advisor.query_metrics(%s::interval) AS metrics
-                    LEFT JOIN "PoWA".powa_servers AS servers
-                      ON servers.id = metrics.server_id
+                    FROM advisor.{view_name} AS metrics
+                    LEFT JOIN advisor.query_annotations AS annotation
+                      ON annotation.server_id = metrics.server_id
+                     AND annotation.database_id = metrics.database_id
+                     AND annotation.query_id = metrics.query_id
                     LIMIT %s
-                    /* advisor-query-metrics-cache-refresh */
+                    /* advisor-query-metrics-snapshot-read */
                     """,
-                    (interval, self._query_list_cache_max_rows + 1),
-                )
+                        (self._query_list_cache_max_rows + 1,),
+                    )
+                except ObjectNotInPrerequisiteState as error:
+                    raise QueryMetricsSnapshotWarming(
+                        f"query metrics snapshot {window} is warming"
+                    ) from error
                 rows: list[dict[str, Any]] = []
                 payload_bytes = 0
                 while True:
@@ -658,6 +681,16 @@ class PowaRepository:
                             raise QueryMetricsSnapshotTooLarge(
                                 "query metrics snapshot configured byte limitini asti"
                             )
+                        row["review_status"] = row.pop(
+                            "_live_review_status", row.get("review_status") or "NEW"
+                        )
+                        row["note"] = row.pop("_live_note", row.get("note"))
+                        row["updated_by"] = row.pop(
+                            "_live_updated_by", row.get("updated_by")
+                        )
+                        row["updated_at"] = row.pop(
+                            "_live_updated_at", row.get("updated_at")
+                        )
                         rows.append(row)
                         if len(rows) > self._query_list_cache_max_rows:
                             raise QueryMetricsSnapshotTooLarge(
@@ -710,8 +743,7 @@ class PowaRepository:
     ) -> list[dict[str, Any]]:
         task_key = (generation, window)
         try:
-            async with self._repository_refresh_lock:
-                loaded_rows = await self._load_query_metrics_snapshot(window)
+            loaded_rows = await self._load_query_metrics_snapshot(window)
             if len(loaded_rows) > self._query_list_cache_max_rows:
                 # Defense in depth for tests/custom repository subclasses that
                 # override the bounded server-cursor loader.
@@ -813,49 +845,40 @@ class PowaRepository:
         server_id: int | None = None,
         database_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        interval = interval_for(window)
-        bucket = WINDOW_BUCKETS[window]
-        if server_id is None:
-            function_sql = "advisor.query_trend(now() - %s::interval, %s::interval)"
-            params: list[Any] = [
-                interval,
-                bucket,
-                self._query_list_cache_max_rows + 1,
-            ]
-        else:
-            function_sql = (
-                "advisor.query_trend("
-                "now() - %s::interval, %s::interval, %s, %s)"
-            )
-            params = [
-                interval,
-                bucket,
-                server_id,
-                database_id,
-                self._query_list_cache_max_rows + 1,
-            ]
+        interval_for(window)
+        view_name = GLOBAL_TREND_SNAPSHOT_VIEWS[window]
         async with pool.connection() as connection:
-            # Keep background SWR work visible to the benchmark so its
-            # repository cost cannot leak beyond the measurement boundary.
             async with connection.cursor() as control_cursor:
                 await control_cursor.execute(
                     "SET LOCAL application_name = "
-                    "'advisor-global-trend-cache-refresh'",
+                    "'advisor-global-trend-snapshot-read'",
                     [],
                 )
             async with connection.cursor() as cursor:
-                await cursor.execute(
-                    f"""
-                    /* advisor-global-trend-cache-refresh */
-                    SELECT bucket_at AS timestamp,
+                try:
+                    await cursor.execute(
+                        f"""
+                    /* advisor-global-trend-snapshot-read */
+                    SELECT timestamp,
                            total_exec_time_ms,
                            calls
-                    FROM {function_sql}
+                    FROM advisor.{view_name}
+                    WHERE server_id IS NOT DISTINCT FROM %s
+                      AND database_id IS NOT DISTINCT FROM %s
+                    ORDER BY timestamp
                     LIMIT %s
-                    /* advisor-global-trend-cache-refresh */
+                    /* advisor-global-trend-snapshot-read */
                     """,
-                    params,
-                )
+                        (
+                            server_id,
+                            database_id,
+                            self._query_list_cache_max_rows + 1,
+                        ),
+                    )
+                except ObjectNotInPrerequisiteState as error:
+                    raise GlobalTrendSnapshotWarming(
+                        f"global trend snapshot {window} is warming"
+                    ) from error
                 rows = [dict(row) for row in await cursor.fetchall()]
         if len(rows) > self._query_list_cache_max_rows:
             raise GlobalTrendSnapshotTooLarge(
@@ -923,15 +946,14 @@ class PowaRepository:
         )
         task_key = (generation, cache_key)
         try:
-            async with self._repository_refresh_lock:
-                if server_id is None:
-                    loaded_rows = await self._load_global_trend_snapshot(window)
-                else:
-                    loaded_rows = await self._load_global_trend_snapshot(
-                        window,
-                        server_id=server_id,
-                        database_id=database_id,
-                    )
+            if server_id is None:
+                loaded_rows = await self._load_global_trend_snapshot(window)
+            else:
+                loaded_rows = await self._load_global_trend_snapshot(
+                    window,
+                    server_id=server_id,
+                    database_id=database_id,
+                )
             if len(loaded_rows) > self._query_list_cache_max_rows:
                 # Defense in depth for tests/custom subclasses that override
                 # the bounded loader.

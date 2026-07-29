@@ -7,12 +7,15 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette import status
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from starlette.responses import Response
 
 from app.api.router import router
 from app.config import get_settings
 from app.db import close_pool, open_pool
-from app.repositories.powa import repository
+from app.repositories.powa import QueryMetricsSnapshotWarming, repository
 from app.version import APPLICATION_VERSION
 
 
@@ -56,6 +59,18 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+@app.exception_handler(QueryMetricsSnapshotWarming)
+async def snapshot_warming(
+    _: Request,
+    __: QueryMetricsSnapshotWarming,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Dashboard verileri ilk kez hazirlaniyor; kisa sure sonra deneyin."},
+        headers={"Retry-After": "30"},
+    )
 
 
 @app.get("/", include_in_schema=False)
