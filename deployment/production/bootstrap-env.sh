@@ -4,6 +4,20 @@ set -Eeuo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$project_dir"
 
+dashboard_domain="${DASHBOARD_DOMAIN:-}"
+acme_email="${ACME_EMAIL:-}"
+basic_auth_user="${DASHBOARD_BASIC_AUTH_USER:-admin}"
+compose_project_name="${COMPOSE_PROJECT_NAME:-postgresql-advisor}"
+credentials_path="${CREDENTIALS_PATH:-${HOME}/.postgresql-advisor-credentials}"
+
+if [[ -z "$dashboard_domain" || -z "$acme_email" ]]; then
+  printf 'DASHBOARD_DOMAIN and ACME_EMAIL are required\n' >&2
+  printf 'usage: DASHBOARD_DOMAIN=dashboard.example.com ACME_EMAIL=ops@example.com %s\n' \
+    "${BASH_SOURCE[0]}" >&2
+  printf 'optional: DASHBOARD_BASIC_AUTH_USER, COMPOSE_PROJECT_NAME, CREDENTIALS_PATH\n' >&2
+  exit 1
+fi
+
 if [[ -e .env ]]; then
   printf 'Refusing to overwrite existing %s/.env\n' "$project_dir" >&2
   exit 1
@@ -18,15 +32,28 @@ command -v openssl >/dev/null 2>&1 || {
   exit 1
 }
 
+# Checked before .env is written: failing later would leave an .env that the
+# guard above refuses to regenerate, losing the admin token permanently.
+credentials_dir="$(dirname -- "$credentials_path")"
+if [[ ! -d "$credentials_dir" || ! -w "$credentials_dir" ]]; then
+  printf 'credentials directory %s must exist and be writable\n' "$credentials_dir" >&2
+  exit 1
+fi
+
 umask 077
 
 random_hex() {
   openssl rand -hex 32
 }
 
-basic_auth_user="trades"
 basic_auth_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
-admin_token="$(openssl rand -base64 32 | tr -d '\n' | tr '/+' '_-')"
+# Must satisfy BEARER_TOKEN_PATTERN in backend/app/security.py, which is
+# fullmatched before any hash comparison.
+admin_token="adv_pat_v1_$(openssl rand -base64 32 | tr -d '\n=' | tr '/+' '_-' | cut -c1-43)"
+if [[ ! "$admin_token" =~ ^adv_pat_v1_[A-Za-z0-9_-]{43}$ ]]; then
+  printf 'generated admin token does not match the API bearer format\n' >&2
+  exit 1
+fi
 admin_token_sha256="$(printf '%s' "$admin_token" | openssl dgst -sha256 -r | awk '{print $1}')"
 basic_auth_hash="$(
   printf '%s\n' "$basic_auth_password" |
@@ -34,13 +61,15 @@ basic_auth_hash="$(
       caddy hash-password
 )"
 principal_json="$(
-  printf '[{"credential_id":"prod-admin","subject":"trades-engineer-admin","token_sha256":"%s","roles":["analyst","annotator","admin"]}]' \
+  printf '[{"credential_id":"prod-admin","subject":"production-admin","token_sha256":"%s","roles":["analyst","annotator","admin"]}]' \
     "$admin_token_sha256"
 )"
 
 {
-  printf 'COMPOSE_PROJECT_NAME=trades-engineer\n'
+  printf 'COMPOSE_PROJECT_NAME=%s\n' "$compose_project_name"
   printf 'COMPOSE_FILE=compose.yaml:compose.production.yaml\n'
+  printf 'DASHBOARD_DOMAIN=%s\n' "$dashboard_domain"
+  printf 'ACME_EMAIL=%s\n' "$acme_email"
   printf 'POSTGRES_ADMIN_PASSWORD=%s\n' "$(random_hex)"
   printf 'POWA_COLLECTOR_PASSWORD=%s\n' "$(random_hex)"
   printf 'ADVISOR_API_PASSWORD=%s\n' "$(random_hex)"
@@ -76,36 +105,20 @@ principal_json="$(
   printf 'QUERY_METRICS_SNAPSHOT_WORKER_MEMORY_LIMIT=256m\n'
   printf 'SOURCE_DB_SHM_SIZE=512mb\n'
   printf 'REPOSITORY_DB_SHM_SIZE=256mb\n'
-  printf 'WORKLOAD_PROFILE=erp\n'
-  printf 'WORKLOAD_DURATION_SECONDS=7200\n'
-  printf 'WORKLOAD_WORKERS=3\n'
-  printf 'WORKLOAD_INTERVAL_SECONDS=0.20\n'
-  printf 'WORKLOAD_INTERVAL_JITTER_RATIO=0.30\n'
-  printf 'WORKLOAD_TRAFFIC_PHASE_SECONDS=45\n'
-  printf 'WORKLOAD_TRAFFIC_MIN_INTERVAL_MULTIPLIER=0.90\n'
-  printf 'WORKLOAD_TRAFFIC_MAX_INTERVAL_MULTIPLIER=3.00\n'
-  printf 'WORKLOAD_STATEMENT_TIMEOUT_MS=30000\n'
-  printf 'WORKLOAD_LOCK_TIMEOUT_MS=1000\n'
-  printf 'WORKLOAD_LOCK_HOLD_MS=30\n'
-  printf 'WORKLOAD_ERP_TABLE_COUNT=500\n'
-  printf 'WORKLOAD_ERP_QUERY_VARIANTS_PER_TABLE=8\n'
-  printf 'WORKLOAD_ERP_ROWS_PER_TABLE=2000\n'
-  printf 'REGISTER_DEMO_SOURCE=true\n'
-  printf 'DEMO_SOURCE_FREQUENCY=60\n'
+  printf 'REGISTER_DEMO_SOURCE=false\n'
   printf 'POWA_SOURCE_SSLMODE=prefer\n'
   printf 'DASHBOARD_BASIC_AUTH_USER=%s\n' "$basic_auth_user"
   printf "DASHBOARD_BASIC_AUTH_HASH='%s'\n" "$basic_auth_hash"
 } > .env
 chmod 0600 .env
 
-credentials_path="${1:-/home/deploy/.trades-engineer-credentials}"
 {
-  printf 'Dashboard URL: https://trades.engineer\n'
+  printf 'Dashboard URL: https://%s\n' "$dashboard_domain"
   printf 'Dashboard basic-auth user: %s\n' "$basic_auth_user"
   printf 'Dashboard basic-auth password: %s\n' "$basic_auth_password"
   printf 'Advisor API admin bearer token: %s\n' "$admin_token"
 } > "$credentials_path"
 chmod 0600 "$credentials_path"
 
-docker compose --profile realistic-load config --quiet
+docker compose config --quiet
 printf 'Created %s/.env and %s\n' "$project_dir" "$credentials_path"
