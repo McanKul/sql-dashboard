@@ -770,6 +770,10 @@ class PowaRepository:
             return loaded_rows
         except asyncio.CancelledError:
             raise
+        except QueryMetricsSnapshotWarming:
+            # Bos snapshot beklenen ilk acilis durumudur; repository hatasi
+            # gibi backoff'u tetiklememelidir.
+            raise
         except Exception:
             async with self._query_metrics_cache_lock:
                 if generation == self._query_metrics_cache_generation:
@@ -979,6 +983,9 @@ class PowaRepository:
                         self._global_trend_cache.popitem(last=False)
             return cached_rows
         except asyncio.CancelledError:
+            raise
+        except QueryMetricsSnapshotWarming:
+            # GlobalTrendSnapshotWarming bu sinifi genisletir.
             raise
         except Exception:
             async with self._global_trend_cache_lock:
