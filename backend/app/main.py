@@ -9,13 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette import status
 from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from app.api.router import router
 from app.config import get_settings
 from app.db import close_pool, open_pool
-from app.repositories.powa import QueryMetricsSnapshotWarming, repository
+from app.repositories.powa import (
+    GlobalTrendRefreshBackoff,
+    GlobalTrendSnapshotTooLarge,
+    QueryMetricsRefreshBackoff,
+    QueryMetricsSnapshotTooLarge,
+    QueryMetricsSnapshotWarming,
+    repository,
+)
 from app.version import APPLICATION_VERSION
 
 
@@ -70,6 +76,38 @@ async def snapshot_warming(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": "Dashboard verileri ilk kez hazirlaniyor; kisa sure sonra deneyin."},
         headers={"Retry-After": "30"},
+    )
+
+
+@app.exception_handler(QueryMetricsRefreshBackoff)
+@app.exception_handler(GlobalTrendRefreshBackoff)
+async def snapshot_refresh_backoff(
+    _: Request,
+    __: QueryMetricsRefreshBackoff | GlobalTrendRefreshBackoff,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Onceki yenileme basarisiz oldu; kisa bir sure sonra deneyin."},
+        headers={"Retry-After": "30"},
+    )
+
+
+@app.exception_handler(QueryMetricsSnapshotTooLarge)
+@app.exception_handler(GlobalTrendSnapshotTooLarge)
+async def snapshot_too_large(
+    _: Request,
+    exc: QueryMetricsSnapshotTooLarge | GlobalTrendSnapshotTooLarge,
+) -> JSONResponse:
+    # Kapasite asimi yeniden denemeyle duzelmez; Retry-After bilinctli olarak yok.
+    logger.error("snapshot_capacity_exceeded", reason=str(exc))
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": (
+                "Snapshot yapilandirilan kapasite sinirini asti; "
+                "QUERY_LIST_CACHE_MAX_ROWS/QUERY_LIST_CACHE_MAX_BYTES degerlerini gozden gecirin."
+            )
+        },
     )
 
 
