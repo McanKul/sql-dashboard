@@ -1,9 +1,9 @@
 {
-	email ops@trades.engineer
+	email {$ACME_EMAIL}
 	admin off
 }
 
-trades.engineer, trades.164-92-171-43.sslip.io {
+{$DASHBOARD_DOMAIN} {
 	encode zstd gzip
 
 	basic_auth {

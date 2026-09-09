@@ -207,6 +207,12 @@ cp .env.example .env
 chmod 600 .env
 ```
 
+TLS'li tek hostluk bir üretim kurulumu için `.env`'i elle doldurmak yerine
+`DASHBOARD_DOMAIN=... ACME_EMAIL=... bash deployment/production/bootstrap-env.sh`
+çalıştırabilirsiniz: bütün parolaları ve API admin bearer token'ını üretir,
+Caddy overlay'ini (`compose.production.yaml`) seçer ve kimlik bilgilerini
+`CREDENTIALS_PATH` altına 0600 izinle yazar. Token yalnız o dosyada durur.
+
 Aynı Docker hostunda birden fazla kurulum varsa her `.env` için benzersiz
 `COMPOSE_PROJECT_NAME` seçin. Normal kurulumda Docker'ın çakışmayan subnet
 atamasını kullanın; deterministik subnet gerçekten gerekiyorsa
