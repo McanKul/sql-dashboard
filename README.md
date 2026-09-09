@@ -3,7 +3,7 @@
 Güncel sürüm: `1.1.1`. Değişiklikler [CHANGELOG.md](CHANGELOG.md), güvenli
 yükseltme ve geri dönüş adımları [upgrade/rollback runbook'unda](docs/UPGRADE_ROLLBACK.md).
 
-PDF v1.1'de tarif edilen ilk iterasyonun çalışan referans uygulamasıdır. Tek bir Docker/OrbStack hostu üzerinde **iki ayrı PostgreSQL sunucu süreci** çalışır: demo kaynak instance `5432`, PoWA repository instance `5433`. PoWA Collector istatistikleri kaynaktan repository'ye taşır; FastAPI yalnız repository'yi okur ve React arayüzü sonuçları gösterir. Aynı repository/collector, `scripts/register-source.sh` ile birden fazla gerçek PostgreSQL kaynağı izleyebilir.
+Tek bir Docker/OrbStack hostu üzerinde **iki ayrı PostgreSQL sunucu süreci** çalışır: demo kaynak instance `5432`, PoWA repository instance `5433`. PoWA Collector istatistikleri kaynaktan repository'ye taşır; FastAPI yalnız repository'yi okur ve React arayüzü sonuçları gösterir. Aynı repository/collector, `scripts/register-source.sh` ile birden fazla gerçek PostgreSQL kaynağı izleyebilir.
 
 > Bu sürüm önce hangi sorguya bakılması gerektiğini gösterir; gerçek CPU ile sampled wait profilini ayırır, JOIN ilişkilerini düşük yetkili snapshotter ile taşır ve iki kolonlu adayları HypoPG ile doğrular. Gerçek `CREATE INDEX` yalnız isteğe bağlı disposable clone profilinde çalışır; izlenen kaynakta otomatik DDL, SQL rewrite veya müdahale yapılmaz.
 
@@ -442,9 +442,6 @@ docker compose down
 
 - [Kurulum ve işletim rehberi](docs/INSTALLATION.md)
 - [Mimari ve güvenlik sınırları](docs/ARCHITECTURE.md)
-- [PDF v1.1 uygunluk ve düzeltme incelemesi](docs/PDF_REVIEW.md)
-- [Güncel veri kullanımı ve İterasyon 1.1 raporu](docs/postgresql_dashboard_veri_kullanimi_raporu.pdf)
-- [İterasyon 1.1 belge boşluk analizi](docs/ITERATION_1_1_GAP_ANALYSIS.md)
 - [İterasyon 2.1-B `pg_qualstats` durum ve işletim notu](docs/ITERATION_2_1_B_PG_QUALSTATS.md)
 - [İterasyon 2.2 HypoPG plan doğrulaması ve dış kaynak runbook'u](docs/ITERATION_2_2_HYPOPG.md)
 - [İterasyon 2.3 `pg_stat_kcache` CPU telemetrisi](docs/ITERATION_2_3_PG_STAT_KCACHE.md)
